@@ -3,7 +3,7 @@ import { MongoClient } from 'mongodb'
 import { v4 as uuidv4 } from 'uuid'
 import fs from 'fs/promises'
 import path from 'path'
-import { createReadStream } from 'fs'
+import crypto from 'crypto'
 
 const MONGO_URL = process.env.MONGO_URL
 const DB_NAME = process.env.DB_NAME || 'clipforge'
@@ -69,9 +69,42 @@ async function seedIfEmpty(db) {
   }
   // index for sessions
   await db.collection('sessions').createIndex({ session_token: 1 }, { unique: true }).catch(()=>{})
+  await db.collection('profiles').createIndex({ email: 1 }, { unique: true, sparse: true }).catch(()=>{})
+  await db.collection('coupon_codes').createIndex({ code: 1 }, { unique: true }).catch(()=>{})
+
+  // seed sample coupons
+  const couponCount = await db.collection('coupon_codes').countDocuments()
+  if (couponCount === 0) {
+    await db.collection('coupon_codes').insertMany([
+      { id: uuidv4(), code: 'LAUNCH25', discount_percent: 25, max_redemptions: 1000, current_redemptions: 0, expires_at: new Date(Date.now() + 90*24*3600*1000), is_active: true, created_at: new Date() },
+      { id: uuidv4(), code: 'CREATOR50', discount_percent: 50, max_redemptions: 100, current_redemptions: 0, expires_at: new Date(Date.now() + 30*24*3600*1000), is_active: true, created_at: new Date() },
+      { id: uuidv4(), code: 'BLACKFRIDAY', discount_percent: 70, max_redemptions: 500, current_redemptions: 0, expires_at: new Date(Date.now() + 365*24*3600*1000), is_active: false, created_at: new Date() },
+    ])
+  }
 }
 
 function strip(doc) { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex')
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex')
+  return `${salt}:${hash}`
+}
+function verifyPassword(password, stored) {
+  if (!stored || !stored.includes(':')) return false
+  const [salt, hash] = stored.split(':')
+  try { return crypto.scryptSync(password, salt, 64).toString('hex') === hash } catch { return false }
+}
+function isAdminProfile(p) { return !!(p && (p.is_admin === true || p.role === 'admin')) }
+async function logActivity(db, userId, action, request, meta = {}) {
+  try {
+    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || 'unknown'
+    await db.collection('logs_activity').insertOne({
+      id: uuidv4(), user_id: userId || null, action_performed: action,
+      ip_address: ip, meta, created_at: new Date(),
+    })
+  } catch {}
+}
 
 function maskCredentials(creds) {
   const masked = {}
@@ -487,6 +520,251 @@ async function handle(request, { params }) {
       if (!translations) return NextResponse.json({ error: 'Translation parse failed', raw: content.slice(0,500) }, { status: 500 })
       await db.collection('translations_cache').updateOne({ key: cacheKey }, { $set: { key: cacheKey, value: translations, language, created_at: new Date() } }, { upsert: true })
       return NextResponse.json({ translations })
+    }
+
+    // ============= EMAIL/PASSWORD AUTH =============
+    if (path_ === '/auth/signup' && method === 'POST') {
+      const body = await request.json()
+      const email = String(body.email || '').toLowerCase().trim()
+      const password = String(body.password || '')
+      const name = String(body.name || '').trim() || email.split('@')[0]
+      if (!email || !email.includes('@')) return NextResponse.json({ error: 'Valid email required' }, { status: 400 })
+      if (password.length < 6) return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 })
+      const existing = await db.collection('profiles').findOne({ email })
+      if (existing && existing.password_hash) return NextResponse.json({ error: 'An account already exists with this email' }, { status: 409 })
+      const isAdmin = ADMIN_EMAILS.has(email)
+      let profile
+      if (existing) {
+        await db.collection('profiles').updateOne({ id: existing.id }, { $set: { password_hash: hashPassword(password), name: existing.name || name, email_verified: false } })
+        profile = await db.collection('profiles').findOne({ id: existing.id })
+      } else {
+        profile = { id: uuidv4(), email, name, password_hash: hashPassword(password), credit_balance_minutes: isAdmin ? 9999 : 30, is_admin: isAdmin, role: isAdmin ? 'admin' : 'user', theme_preference: 'dark', email_verified: false, verification_token: crypto.randomBytes(16).toString('hex'), created_at: new Date() }
+        await db.collection('profiles').insertOne(profile)
+      }
+      await logActivity(db, profile.id, 'user_signup', request, { email })
+      // create session
+      const token = uuidv4()
+      await db.collection('sessions').insertOne({ session_token: token, user_id: profile.id, expires_at: new Date(Date.now()+7*86400000), created_at: new Date() })
+      const verifyLink = `/auth/verify?token=${profile.verification_token}`
+      const res = NextResponse.json({ user: strip({ ...profile, password_hash: undefined, verification_token: undefined }), verification_link: verifyLink })
+      res.headers.set('Set-Cookie', `session_token=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7*86400}; Secure`)
+      return res
+    }
+
+    if (path_ === '/auth/signin' && method === 'POST') {
+      const body = await request.json()
+      const email = String(body.email || '').toLowerCase().trim()
+      const password = String(body.password || '')
+      const profile = await db.collection('profiles').findOne({ email })
+      if (!profile || !profile.password_hash || !verifyPassword(password, profile.password_hash)) {
+        await logActivity(db, null, 'signin_failed', request, { email })
+        return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
+      }
+      // promote to admin if email is in allowlist
+      if (ADMIN_EMAILS.has(email) && !isAdminProfile(profile)) {
+        await db.collection('profiles').updateOne({ id: profile.id }, { $set: { is_admin: true, role: 'admin' } })
+        profile.is_admin = true; profile.role = 'admin'
+      }
+      await logActivity(db, profile.id, 'user_signin', request, { email })
+      const token = uuidv4()
+      await db.collection('sessions').insertOne({ session_token: token, user_id: profile.id, expires_at: new Date(Date.now()+7*86400000), created_at: new Date() })
+      const res = NextResponse.json({ user: strip({ ...profile, password_hash: undefined, verification_token: undefined }) })
+      res.headers.set('Set-Cookie', `session_token=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7*86400}; Secure`)
+      return res
+    }
+
+    if (path_ === '/auth/forgot-password' && method === 'POST') {
+      const body = await request.json()
+      const email = String(body.email || '').toLowerCase().trim()
+      const profile = await db.collection('profiles').findOne({ email })
+      if (!profile) return NextResponse.json({ ok: true }) // don't reveal account existence
+      const resetToken = crypto.randomBytes(24).toString('hex')
+      await db.collection('profiles').updateOne({ id: profile.id }, { $set: { reset_token: resetToken, reset_token_expires: new Date(Date.now()+3600000) } })
+      await logActivity(db, profile.id, 'password_reset_requested', request, { email })
+      // MOCK email — return link in response for dev/demo
+      const resetLink = `/reset-password?token=${resetToken}`
+      return NextResponse.json({ ok: true, reset_link: resetLink, note: 'In production this link would be emailed. Shown here for demo.' })
+    }
+
+    if (path_ === '/auth/reset-password' && method === 'POST') {
+      const body = await request.json()
+      const token = String(body.token || '')
+      const newPassword = String(body.password || '')
+      if (newPassword.length < 6) return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 })
+      const profile = await db.collection('profiles').findOne({ reset_token: token })
+      if (!profile || !profile.reset_token_expires || new Date(profile.reset_token_expires) < new Date()) {
+        return NextResponse.json({ error: 'Invalid or expired reset token' }, { status: 400 })
+      }
+      await db.collection('profiles').updateOne({ id: profile.id }, { $set: { password_hash: hashPassword(newPassword) }, $unset: { reset_token: '', reset_token_expires: '' } })
+      await logActivity(db, profile.id, 'password_reset_completed', request, {})
+      return NextResponse.json({ ok: true })
+    }
+
+    // ============= COUPONS =============
+    // Public validate
+    if (path_ === '/coupons/validate' && method === 'GET') {
+      const url = new URL(request.url)
+      const code = (url.searchParams.get('code') || '').trim().toUpperCase()
+      if (!code) return NextResponse.json({ valid: false, error: 'No code provided' })
+      const c = await db.collection('coupon_codes').findOne({ code })
+      if (!c) return NextResponse.json({ valid: false, error: 'Code not found' })
+      if (!c.is_active) return NextResponse.json({ valid: false, error: 'Code inactive' })
+      if (c.expires_at && new Date(c.expires_at) < new Date()) return NextResponse.json({ valid: false, error: 'Code expired' })
+      if (c.max_redemptions && c.current_redemptions >= c.max_redemptions) return NextResponse.json({ valid: false, error: 'Code fully redeemed' })
+      return NextResponse.json({ valid: true, code: c.code, discount_percent: c.discount_percent })
+    }
+    // Admin CRUD
+    if (path_ === '/admin/coupons' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('coupon_codes').find({}).sort({ created_at: -1 }).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+    if (path_ === '/admin/coupons' && method === 'POST') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const code = String(body.code || `PROMO${Math.random().toString(36).slice(2,7).toUpperCase()}`).toUpperCase()
+      const doc = {
+        id: uuidv4(), code,
+        discount_percent: Math.max(1, Math.min(100, Number(body.discount_percent) || 10)),
+        max_redemptions: Number(body.max_redemptions) || 100,
+        current_redemptions: 0,
+        expires_at: body.expires_at ? new Date(body.expires_at) : new Date(Date.now() + 30*86400000),
+        is_active: body.is_active !== false,
+        created_at: new Date(),
+      }
+      try { await db.collection('coupon_codes').insertOne(doc) } catch (e) {
+        return NextResponse.json({ error: 'Coupon code already exists' }, { status: 409 })
+      }
+      await logActivity(db, user.id, 'coupon_created', request, { code: doc.code })
+      return NextResponse.json(strip(doc))
+    }
+    if (path_.startsWith('/admin/coupons/') && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const body = await request.json()
+      const allowed = ['code','discount_percent','max_redemptions','expires_at','is_active']
+      const updates = {}
+      for (const k of allowed) if (k in body) updates[k] = k === 'expires_at' && body[k] ? new Date(body[k]) : body[k]
+      if (updates.code) updates.code = String(updates.code).toUpperCase()
+      await db.collection('coupon_codes').updateOne({ id }, { $set: updates })
+      const c = await db.collection('coupon_codes').findOne({ id })
+      return NextResponse.json(strip(c))
+    }
+    if (path_.startsWith('/admin/coupons/') && method === 'DELETE') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      await db.collection('coupon_codes').deleteOne({ id: segments[2] })
+      return NextResponse.json({ ok: true })
+    }
+
+    // ============= USERS (admin) =============
+    if (path_ === '/admin/users' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('profiles').find({}).sort({ created_at: -1 }).limit(200).toArray()
+      // strip secrets
+      const safe = list.map(p => { const x = strip(p); delete x.password_hash; delete x.reset_token; delete x.verification_token; return x })
+      // attach clip counts
+      for (const u of safe) {
+        u.clip_count = await db.collection('generated_clips').countDocuments({ user_id: u.id })
+      }
+      return NextResponse.json(safe)
+    }
+    if (path_.startsWith('/admin/users/') && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const body = await request.json()
+      const allowed = ['credit_balance_minutes','is_admin','role','email','name']
+      const updates = {}
+      for (const k of allowed) if (k in body) updates[k] = body[k]
+      if ('is_admin' in updates) updates.role = updates.is_admin ? 'admin' : 'user'
+      if ('role' in updates) updates.is_admin = updates.role === 'admin'
+      await db.collection('profiles').updateOne({ id }, { $set: updates })
+      await logActivity(db, user.id, 'user_updated_by_admin', request, { target_id: id, updates })
+      const p = await db.collection('profiles').findOne({ id })
+      const x = strip(p); delete x.password_hash; delete x.reset_token; delete x.verification_token
+      return NextResponse.json(x)
+    }
+
+    // ============= NEWSLETTERS =============
+    if (path_ === '/admin/newsletters' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('newsletters_sent').find({}).sort({ created_at: -1 }).limit(50).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+    if (path_ === '/admin/newsletters' && method === 'POST') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const totalUsers = await db.collection('profiles').countDocuments()
+      const doc = {
+        id: uuidv4(), subject: String(body.subject || 'Untitled').slice(0,200),
+        body_content: String(body.body_content || ''),
+        total_sent: totalUsers, sent_by: user.id, created_at: new Date(),
+      }
+      await db.collection('newsletters_sent').insertOne(doc)
+      // Also push an in-app notification to all users
+      await db.collection('in_app_notifications').insertOne({
+        id: uuidv4(), broadcast_id: doc.id, subject: doc.subject, body: doc.body_content,
+        created_at: new Date(), expires_at: new Date(Date.now() + 14*86400000),
+      })
+      await logActivity(db, user.id, 'newsletter_sent', request, { subject: doc.subject, total_sent: totalUsers })
+      return NextResponse.json(strip(doc))
+    }
+    // user-facing: latest in-app notifications
+    if (path_ === '/notifications' && method === 'GET') {
+      const list = await db.collection('in_app_notifications').find({ expires_at: { $gt: new Date() } }).sort({ created_at: -1 }).limit(5).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+
+    // ============= ANALYTICS =============
+    if (path_ === '/admin/analytics' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const [totalUsers, totalClips, totalVideos, activeSubs, totalCreditsRaw, totalRevenueRaw] = await Promise.all([
+        db.collection('profiles').countDocuments(),
+        db.collection('generated_clips').countDocuments(),
+        db.collection('videos_processed').countDocuments(),
+        db.collection('user_subscriptions').countDocuments({ status: 'active' }),
+        db.collection('profiles').aggregate([{ $group: { _id: null, total: { $sum: '$credit_balance_minutes' } } }]).toArray(),
+        db.collection('user_subscriptions').aggregate([{ $group: { _id: null, total: { $sum: '$amount_usd' } } }]).toArray(),
+      ])
+      // generate last-14-day time series of clip creation
+      const since = new Date(Date.now() - 14*86400000)
+      const clips = await db.collection('generated_clips').find({ created_at: { $gt: since } }).project({ created_at: 1 }).toArray()
+      const buckets = {}
+      for (let i = 13; i >= 0; i--) {
+        const d = new Date(Date.now() - i*86400000)
+        const k = d.toISOString().slice(0,10)
+        buckets[k] = 0
+      }
+      for (const c of clips) {
+        const k = new Date(c.created_at).toISOString().slice(0,10)
+        if (k in buckets) buckets[k]++
+      }
+      const series = Object.entries(buckets).map(([date, count]) => ({ date, clips: count }))
+      return NextResponse.json({
+        totals: {
+          users: totalUsers,
+          clips: totalClips,
+          videos: totalVideos,
+          active_subscriptions: activeSubs,
+          total_credits_remaining: totalCreditsRaw[0]?.total || 0,
+          total_revenue_usd: totalRevenueRaw[0]?.total || 0,
+        },
+        clips_by_day: series,
+      })
+    }
+    if (path_ === '/admin/activity' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('logs_activity').find({}).sort({ created_at: -1 }).limit(100).toArray()
+      return NextResponse.json(list.map(strip))
     }
 
     return NextResponse.json({ error: 'Not Found', path: path_, method }, { status: 404 })

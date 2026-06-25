@@ -153,6 +153,9 @@ export default function HomePage() {
   const [subtitleLanguage, setSubtitleLanguage] = useState('en')
   const [uiLanguage, setUiLanguage] = useState('en')
   const [memeHook, setMemeHook] = useState(true)
+  const [couponCode, setCouponCode] = useState('')
+  const [couponData, setCouponData] = useState(null) // { valid, discount_percent, code }
+  const [validatingCoupon, setValidatingCoupon] = useState(false)
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
 
@@ -203,8 +206,22 @@ export default function HomePage() {
     const basePerMin = (geo.currency === 'INR' ? selectedPack.price_inr : selectedPack.price_usd) / selectedPack.credit_amount_minutes
     let raw = basePerMin * sliderMinutes[0]
     if (billingCycle === 'year') raw = raw * 12 * 0.8
-    return { symbol, raw, formatted: formatPrice(raw, symbol) }
-  }, [selectedPack, geo, sliderMinutes, billingCycle])
+    const couponDiscount = couponData?.valid ? couponData.discount_percent : 0
+    const discounted = couponDiscount > 0 ? raw * (1 - couponDiscount / 100) : raw
+    return { symbol, raw, discounted, formatted: formatPrice(discounted, symbol), original: formatPrice(raw, symbol), couponDiscount }
+  }, [selectedPack, geo, sliderMinutes, billingCycle, couponData])
+
+  async function validateCoupon() {
+    if (!couponCode.trim()) return
+    setValidatingCoupon(true)
+    try {
+      const r = await fetch(`/api/coupons/validate?code=${encodeURIComponent(couponCode.trim())}`)
+      const data = await r.json()
+      if (data.valid) { setCouponData(data); toast.success(`${data.code} applied: ${data.discount_percent}% off`) }
+      else { setCouponData(null); toast.error('Invalid coupon', { description: data.error }) }
+    } catch { toast.error('Could not validate coupon') }
+    finally { setValidatingCoupon(false) }
+  }
 
   function updateThemeInProfile(next) {
     fetch('/api/profile', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ theme_preference: next }) })
@@ -276,6 +293,9 @@ export default function HomePage() {
             <a href="#workspace" className="hover:text-foreground text-muted-foreground transition-colors">{t.workspace}</a>
             <a href="#pricing" className="hover:text-foreground text-muted-foreground transition-colors">{t.pricing}</a>
             <a href="#styling" className="hover:text-foreground text-muted-foreground transition-colors">{t.styling}</a>
+            <Link href="/calendar" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
+              <Calendar className="h-3.5 w-3.5" /> Calendar
+            </Link>
             <Link href="/admin" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
               <ShieldCheck className="h-3.5 w-3.5" /> {t.admin}
             </Link>
@@ -489,12 +509,33 @@ export default function HomePage() {
               </div>
               <Slider min={300} max={3000} step={100} value={sliderMinutes} onValueChange={setSliderMinutes} />
               <div className="flex justify-between text-xs text-muted-foreground"><span>300 min</span><span>1500 min</span><span>3000 min</span></div>
+
+              {/* Coupon input */}
+              <div className="flex gap-2 items-end pt-1">
+                <div className="flex-1 space-y-1">
+                  <Label className="text-xs">Have a coupon code?</Label>
+                  <Input value={couponCode} onChange={(e)=>setCouponCode(e.target.value.toUpperCase())} placeholder="LAUNCH25" className="font-mono uppercase h-9" />
+                </div>
+                <Button variant="outline" onClick={validateCoupon} disabled={validatingCoupon} className="h-9">
+                  {validatingCoupon ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Apply'}
+                </Button>
+                {couponData?.valid && (
+                  <Button variant="ghost" size="sm" onClick={() => { setCouponData(null); setCouponCode('') }} className="h-9 text-destructive">Remove</Button>
+                )}
+              </div>
+
               {dynamicPrice && selectedPack && (
                 <div className="flex items-center justify-between rounded-xl border border-border bg-background p-4">
                   <div>
                     <div className="text-sm text-muted-foreground">{t.closest_plan} <span className="font-medium text-foreground">{selectedPack.name}</span></div>
-                    <div className="text-2xl font-bold">{dynamicPrice.formatted}<span className="text-sm text-muted-foreground font-normal">/{billingCycle === 'year' ? 'year' : 'mo'}</span></div>
-                    {selectedPack.discount_percentage > 0 && <Badge className="mt-1 bg-emerald-500/15 text-emerald-500 border-transparent">{t.save} {selectedPack.discount_percentage}%</Badge>}
+                    <div className="flex items-baseline gap-2">
+                      <div className="text-2xl font-bold">{dynamicPrice.formatted}<span className="text-sm text-muted-foreground font-normal">/{billingCycle === 'year' ? 'year' : 'mo'}</span></div>
+                      {dynamicPrice.couponDiscount > 0 && <span className="text-sm text-muted-foreground line-through">{dynamicPrice.original}</span>}
+                    </div>
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {selectedPack.discount_percentage > 0 && <Badge className="bg-emerald-500/15 text-emerald-500 border-transparent">{t.save} {selectedPack.discount_percentage}%</Badge>}
+                      {dynamicPrice.couponDiscount > 0 && <Badge className="gradient-bg text-white border-transparent">+{dynamicPrice.couponDiscount}% coupon</Badge>}
+                    </div>
                   </div>
                   <Button size="lg" className="gradient-bg text-white hover:opacity-90" onClick={() => handleBuy(selectedPack)}>{t.buy} {selectedPack.name}</Button>
                 </div>
@@ -534,10 +575,46 @@ export default function HomePage() {
         </div>
       </section>
 
-      <footer className="border-t border-border">
-        <div className="container py-8 flex items-center justify-between text-sm text-muted-foreground">
-          <div>© 2025 ClipForge AI — Built for creators.</div>
-          <Link href="/admin" className="hover:text-foreground flex items-center gap-1"><ShieldCheck className="h-3.5 w-3.5" /> Admin Panel</Link>
+      <footer className="border-t border-border bg-card/30">
+        <div className="container py-10">
+          <div className="grid sm:grid-cols-2 md:grid-cols-4 gap-6 text-sm">
+            <div>
+              <div className="flex items-center gap-2 mb-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg gradient-bg"><Sparkles className="h-4 w-4 text-white" /></div>
+                <span className="font-bold">ClipForge<span className="gradient-text">AI</span></span>
+              </div>
+              <p className="text-xs text-muted-foreground">Turn long videos into viral shorts with AI. Trusted by 50k+ creators.</p>
+            </div>
+            <div>
+              <div className="font-semibold mb-3 text-xs uppercase text-muted-foreground tracking-wide">Product</div>
+              <ul className="space-y-2 text-muted-foreground">
+                <li><a href="#workspace" className="hover:text-foreground">Workspace</a></li>
+                <li><a href="#pricing" className="hover:text-foreground">Pricing</a></li>
+                <li><Link href="/calendar" className="hover:text-foreground">Calendar</Link></li>
+              </ul>
+            </div>
+            <div>
+              <div className="font-semibold mb-3 text-xs uppercase text-muted-foreground tracking-wide">Account</div>
+              <ul className="space-y-2 text-muted-foreground">
+                <li><Link href="/login" className="hover:text-foreground">Sign in</Link></li>
+                <li><Link href="/signup" className="hover:text-foreground">Sign up</Link></li>
+                <li><Link href="/admin" className="hover:text-foreground">Admin</Link></li>
+              </ul>
+            </div>
+            <div>
+              <div className="font-semibold mb-3 text-xs uppercase text-muted-foreground tracking-wide">Legal</div>
+              <ul className="space-y-2 text-muted-foreground">
+                <li><Link href="/terms" className="hover:text-foreground">Terms of Service</Link></li>
+                <li><Link href="/privacy" className="hover:text-foreground">Privacy Policy</Link></li>
+                <li><Link href="/refund" className="hover:text-foreground">Refund Policy</Link></li>
+              </ul>
+            </div>
+          </div>
+          <Separator className="my-6" />
+          <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+            <div>© 2025 ClipForge AI — Built for creators.</div>
+            <div>Made with Gemini AI 3.5 Flash</div>
+          </div>
         </div>
       </footer>
     </div>

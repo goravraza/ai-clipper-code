@@ -11,7 +11,11 @@ import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
-import { ShieldCheck, ArrowLeft, Save, Plus, Trash2, Lock, Coins, Smile, Loader2, Film, Image as ImageIcon, Key, CreditCard, Sparkles, Check, AlertCircle, Eye, EyeOff } from 'lucide-react'
+import { ShieldCheck, ArrowLeft, Save, Plus, Trash2, Lock, Coins, Smile, Loader2, Film, Image as ImageIcon, Key, CreditCard, Sparkles, Check, AlertCircle, Eye, EyeOff, Ticket, Users, Mail, BarChart3 } from 'lucide-react'
+import CouponsTab from './_components/coupons-tab'
+import UsersTab from './_components/users-tab'
+import NewsletterTab from './_components/newsletter-tab'
+import AnalyticsTab from './_components/analytics-tab'
 
 // Catalog of supported integrations (keys + metadata)
 const INTEGRATIONS = [
@@ -166,12 +170,21 @@ export default function AdminPage() {
             </CardContent>
           </Card>
         ) : (
-          <Tabs defaultValue="pricing">
-            <TabsList className="mb-6">
+          <Tabs defaultValue="analytics">
+            <TabsList className="mb-6 flex-wrap h-auto">
+              <TabsTrigger value="analytics"><BarChart3 className="h-3.5 w-3.5 mr-1.5" /> Analytics</TabsTrigger>
               <TabsTrigger value="pricing"><Coins className="h-3.5 w-3.5 mr-1.5" /> Pricing ({pkgs.length})</TabsTrigger>
+              <TabsTrigger value="coupons"><Ticket className="h-3.5 w-3.5 mr-1.5" /> Coupons</TabsTrigger>
+              <TabsTrigger value="users"><Users className="h-3.5 w-3.5 mr-1.5" /> Users</TabsTrigger>
               <TabsTrigger value="memes"><Smile className="h-3.5 w-3.5 mr-1.5" /> Memes ({memes.length})</TabsTrigger>
+              <TabsTrigger value="newsletter"><Mail className="h-3.5 w-3.5 mr-1.5" /> Newsletter</TabsTrigger>
               <TabsTrigger value="integrations"><Key className="h-3.5 w-3.5 mr-1.5" /> Integrations ({integrations.filter(i => i.has_credentials).length}/{INTEGRATIONS.length})</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="analytics"><AnalyticsTab /></TabsContent>
+            <TabsContent value="coupons"><CouponsTab /></TabsContent>
+            <TabsContent value="users"><UsersTab /></TabsContent>
+            <TabsContent value="newsletter"><NewsletterTab /></TabsContent>
 
             <TabsContent value="pricing" className="space-y-4">
               <div className="flex items-center justify-between">
