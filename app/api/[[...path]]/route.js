@@ -25,6 +25,9 @@ async function getDb() {
 
 const DEFAULT_USER_ID = '11111111-1111-1111-1111-111111111111'
 const ADMIN_USER_ID = '22222222-2222-2222-2222-222222222222'
+const ADMIN_EMAILS = new Set([
+  'prathamch37@gmail.com',
+])
 
 async function seedIfEmpty(db) {
   const pkgCount = await db.collection('pricing_packages').countDocuments()
@@ -192,11 +195,15 @@ async function handle(request, { params }) {
       const email = data.email
       if (!email) return NextResponse.json({ error: 'No email returned' }, { status: 400 })
       let profile = await db.collection('profiles').findOne({ email })
+      const shouldBeAdmin = ADMIN_EMAILS.has(email.toLowerCase())
       if (!profile) {
-        profile = { id: uuidv4(), email, name: data.name || email.split('@')[0], picture: data.picture || null, credit_balance_minutes: 30, is_admin: false, theme_preference: 'dark', created_at: new Date() }
+        profile = { id: uuidv4(), email, name: data.name || email.split('@')[0], picture: data.picture || null, credit_balance_minutes: shouldBeAdmin ? 9999 : 30, is_admin: shouldBeAdmin, theme_preference: 'dark', created_at: new Date() }
         await db.collection('profiles').insertOne(profile)
       } else {
-        await db.collection('profiles').updateOne({ id: profile.id }, { $set: { name: data.name || profile.name, picture: data.picture || profile.picture, last_login_at: new Date() } })
+        const updates = { name: data.name || profile.name, picture: data.picture || profile.picture, last_login_at: new Date() }
+        // promote to admin if email is in allowlist (never demote)
+        if (shouldBeAdmin && !profile.is_admin) updates.is_admin = true
+        await db.collection('profiles').updateOne({ id: profile.id }, { $set: updates })
         profile = await db.collection('profiles').findOne({ id: profile.id })
       }
       const token = data.session_token || uuidv4()
