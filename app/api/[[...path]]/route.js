@@ -154,21 +154,127 @@ async function getUser(request, db, opts = {}) {
   return await db.collection('profiles').findOne({ id: DEFAULT_USER_ID })
 }
 
-async function callLLM(messages, { json = false, temperature = 0.7 } = {}) {
-  if (!LLM_KEY) throw new Error('LLM key not configured')
-  const body = { model: LLM_MODEL, messages, temperature }
-  if (json) body.response_format = { type: 'json_object' }
-  const r = await fetch(LLM_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'authorization': `Bearer ${LLM_KEY}` },
-    body: JSON.stringify(body),
-  })
-  if (!r.ok) {
-    const txt = await r.text()
-    throw new Error(`LLM error ${r.status}: ${txt.slice(0,200)}`)
+async function callLLM(messages, { json = false, temperature = 0.7, db = null } = {}) {
+  // Prefer admin-configured Gemini key from integrations table; fall back to OpenAI; then Emergent gateway
+  let userGeminiKey = null
+  let userGeminiModel = 'gemini-2.0-flash'
+  let userOpenAIKey = null
+  let userOpenAIModel = 'gpt-4o-mini'
+  let userAnthropicKey = null
+  if (db) {
+    try {
+      const integ = await db.collection('integration_credentials').find({ is_active: { $ne: false } }).toArray()
+      for (const i of integ) {
+        if (i.provider === 'gemini' && i.credentials?.api_key) {
+          userGeminiKey = i.credentials.api_key
+          if (i.credentials.model) userGeminiModel = i.credentials.model
+        }
+        if (i.provider === 'openai' && i.credentials?.api_key) {
+          userOpenAIKey = i.credentials.api_key
+          if (i.credentials.model) userOpenAIModel = i.credentials.model
+        }
+        if (i.provider === 'anthropic' && i.credentials?.api_key) userAnthropicKey = i.credentials.api_key
+      }
+    } catch {}
   }
-  const data = await r.json()
-  return data.choices?.[0]?.message?.content || ''
+
+  const errors = []
+
+  // 1) Try Gemini direct
+  if (userGeminiKey) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(userGeminiModel)}:generateContent?key=${encodeURIComponent(userGeminiKey)}`
+      const promptText = messages.map(m => m.content).join('\n\n')
+      const body = { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature, ...(json ? { responseMimeType: 'application/json' } : {}) } }
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      if (r.ok) {
+        const data = await r.json()
+        return data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+      }
+      const txt = await r.text()
+      errors.push(`Gemini ${r.status}: ${txt.slice(0,150)}`)
+    } catch (e) { errors.push(`Gemini error: ${e.message}`) }
+  }
+
+  // 2) Fallback to OpenAI direct
+  if (userOpenAIKey) {
+    try {
+      const body = { model: userOpenAIModel, messages, temperature }
+      if (json) body.response_format = { type: 'json_object' }
+      const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', 'authorization': `Bearer ${userOpenAIKey}` }, body: JSON.stringify(body) })
+      if (r.ok) {
+        const data = await r.json()
+        return data.choices?.[0]?.message?.content || ''
+      }
+      const txt = await r.text()
+      errors.push(`OpenAI ${r.status}: ${txt.slice(0,150)}`)
+    } catch (e) { errors.push(`OpenAI error: ${e.message}`) }
+  }
+
+  // 3) Fallback to Anthropic
+  if (userAnthropicKey) {
+    try {
+      const promptText = messages.map(m => m.content).join('\n\n')
+      const body = { model: 'claude-3-5-sonnet-20241022', max_tokens: 2048, messages: [{ role: 'user', content: promptText }] }
+      const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': userAnthropicKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify(body) })
+      if (r.ok) {
+        const data = await r.json()
+        return data.content?.[0]?.text || ''
+      }
+      const txt = await r.text()
+      errors.push(`Anthropic ${r.status}: ${txt.slice(0,150)}`)
+    } catch (e) { errors.push(`Anthropic error: ${e.message}`) }
+  }
+
+  // 4) Final fallback: Emergent gateway
+  if (LLM_KEY) {
+    try {
+      const body = { model: LLM_MODEL, messages, temperature }
+      if (json) body.response_format = { type: 'json_object' }
+      const r = await fetch(LLM_URL, { method: 'POST', headers: { 'content-type': 'application/json', 'authorization': `Bearer ${LLM_KEY}` }, body: JSON.stringify(body) })
+      if (r.ok) {
+        const data = await r.json()
+        return data.choices?.[0]?.message?.content || ''
+      }
+      const txt = await r.text()
+      errors.push(`Emergent ${r.status}: ${txt.slice(0,150)}`)
+    } catch (e) { errors.push(`Emergent error: ${e.message}`) }
+  }
+
+  if (errors.length === 0) throw new Error('No LLM key configured. Add Gemini, OpenAI, or Anthropic API key in Admin → Integrations.')
+  throw new Error(`All LLM providers failed:\n${errors.join('\n')}`)
+}
+
+function extractYouTubeId(url) {
+  if (!url) return null
+  const m = String(url).match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/)|youtu\.be\/)([\w-]{11})/)
+  return m ? m[1] : null
+}
+function extractInstagramShortcode(url) {
+  if (!url) return null
+  const m = String(url).match(/instagram\.com\/(?:p|reel|tv)\/([\w-]+)/)
+  return m ? m[1] : null
+}
+async function thumbnailForUrl(url) {
+  const ytId = extractYouTubeId(url)
+  if (ytId) return `https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`
+  return null
+}
+async function metadataForUrl(url) {
+  const ytId = extractYouTubeId(url)
+  if (ytId) {
+    try {
+      const r = await fetch(`https://www.youtube.com/oembed?url=https%3A//www.youtube.com/watch%3Fv%3D${ytId}&format=json`)
+      if (r.ok) {
+        const d = await r.json()
+        return { title: d.title, author: d.author_name, thumbnail: d.thumbnail_url || `https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`, source_type: 'youtube' }
+      }
+    } catch {}
+    return { title: null, thumbnail: `https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`, source_type: 'youtube' }
+  }
+  if (extractInstagramShortcode(url)) return { source_type: 'instagram', thumbnail: null }
+  if (/tiktok\.com/.test(url)) return { source_type: 'tiktok', thumbnail: null }
+  return { source_type: 'other', thumbnail: null }
 }
 
 function safeJsonParse(text) {
@@ -385,7 +491,7 @@ async function handle(request, { params }) {
       const langName = body.language_name || language
       const prompt = `You are an auto-captioning AI for a short-form vertical video.\n\nClip title: "${clip.clip_title}"\nDuration: ${duration} seconds.\nHook: "${clip.hook_text || ''}"\nLanguage: ${langName}\n\nGenerate 6-10 short, punchy subtitle captions that would naturally appear in this clip, each 2-6 words long, in ${langName}. Distribute timestamps evenly across the ${duration} seconds.\n\nReturn ONLY valid JSON in this exact shape (no markdown, no commentary):\n{\n  "captions": [\n    { "start_time": 0.0, "end_time": 2.5, "text": "string" }\n  ]\n}\nMake the captions feel authentic to the title's topic. Use sentence-case (not ALL CAPS).`
       let content = ''
-      try { content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.6 }) }
+      try { content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.6, db }) }
       catch (e) { return NextResponse.json({ error: 'AI failed: ' + e.message }, { status: 500 }) }
       const parsed = safeJsonParse(content)
       if (!parsed?.captions) return NextResponse.json({ error: 'AI returned unparseable response', raw: content.slice(0,500) }, { status: 500 })
@@ -458,10 +564,13 @@ async function handle(request, { params }) {
       const body = await request.json()
       const url = body.url || ''
       const topic = body.topic || ''
-      const prompt = `You are an expert short-form video editor. A creator just uploaded this video URL: "${url}"${topic ? ` (topic hint: ${topic})` : ''}.\n\nImagine you have already watched it. Generate exactly 3 highly-engaging 30-60 second clip suggestions that would perform well on TikTok / Reels / YouTube Shorts.\n\nReturn ONLY valid JSON, no markdown, no commentary, in this shape:\n{\n  "clips": [\n    {\n      "clip_title": "a punchy curiosity-gap title (under 60 chars)",\n      "start_time_seconds": integer between 30 and 1800,\n      "end_time_seconds": integer (start + 30 to 60),\n      "virality_score": integer 70-99,\n      "hook_text": "a 4-8 word scroll-stopping opener",\n      "why": "one short sentence on why this will go viral"\n    }\n  ]\n}\nMake the three titles dramatically different in angle. Sort by virality_score descending.`
+      const meta = await metadataForUrl(url)
+      const titleHint = meta.title ? `\nVideo title: "${meta.title}"` : ''
+      const authorHint = meta.author ? `\nCreator: ${meta.author}` : ''
+      const prompt = `You are an expert short-form video editor. A creator just uploaded this video URL: "${url}"${titleHint}${authorHint}${topic ? `\nTopic hint: ${topic}` : ''}\n\nImagine you have already watched it. Generate exactly 3 highly-engaging 30-60 second clip suggestions that would perform well on TikTok / Reels / YouTube Shorts.\n\nReturn ONLY valid JSON, no markdown, no commentary, in this shape:\n{\n  "clips": [\n    {\n      "clip_title": "a punchy curiosity-gap title (under 60 chars)",\n      "start_time_seconds": integer between 30 and 1800,\n      "end_time_seconds": integer (start + 30 to 60),\n      "virality_score": integer 70-99,\n      "hook_text": "a 4-8 word scroll-stopping opener",\n      "why": "one short sentence on why this will go viral"\n    }\n  ]\n}\nMake the three titles dramatically different in angle. Sort by virality_score descending.`
       let content = ''
       try {
-        content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.9 })
+        content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.9, db })
       } catch (e) {
         return NextResponse.json({ error: 'AI failed: ' + e.message }, { status: 500 })
       }
@@ -469,22 +578,30 @@ async function handle(request, { params }) {
       if (!parsed?.clips || !Array.isArray(parsed.clips)) {
         return NextResponse.json({ error: 'AI returned unparseable response', raw: content.slice(0, 500) }, { status: 500 })
       }
-      // create video + clips in DB
       const videoId = uuidv4()
-      await db.collection('videos_processed').insertOne({ id: videoId, user_id: user.id, original_url: url, status: 'completed', created_at: new Date() })
+      await db.collection('videos_processed').insertOne({
+        id: videoId, user_id: user.id, original_url: url,
+        source_type: meta.source_type || 'other',
+        status: 'completed', title: meta.title || null, thumbnail_url: meta.thumbnail || null,
+        created_at: new Date(),
+      })
       const created = []
       for (let i = 0; i < parsed.clips.length; i++) {
         const c = parsed.clips[i]
         const start = Math.max(0, Number(c.start_time_seconds) || (60 + i * 200))
         const endRaw = Number(c.end_time_seconds) || (start + 45)
         const end = Math.min(start + 60, Math.max(start + 30, endRaw))
+        // Prefer the real video thumbnail; fall back to pool
+        const thumb = meta.thumbnail || THUMB_POOL[Math.floor(Math.random() * THUMB_POOL.length)]
         const doc = {
           id: uuidv4(), video_id: videoId, user_id: user.id,
           clip_title: (c.clip_title || `Viral Clip ${i+1}`).slice(0, 90),
           start_time_seconds: start, end_time_seconds: end,
           virality_score: Math.min(99, Math.max(50, Number(c.virality_score) || 80)),
           storage_url_mp4: `https://cdn.clipforge.ai/clips/${videoId}-${i+1}.mp4`,
-          thumbnail_url: THUMB_POOL[Math.floor(Math.random() * THUMB_POOL.length)],
+          thumbnail_url: thumb,
+          source_video_url: url,
+          source_type: meta.source_type || 'other',
           is_scheduled: false, scheduled_time: null,
           hook_type: c.hook_text ? 'text' : 'none',
           hook_text: (c.hook_text || '').slice(0, 120),
@@ -496,7 +613,8 @@ async function handle(request, { params }) {
         await db.collection('generated_clips').insertOne(doc)
         created.push(strip(doc))
       }
-      return NextResponse.json({ video_id: videoId, clips: created })
+      await logActivity(db, user.id, 'ai_analyze_completed', request, { url, clips: created.length, source: meta.source_type })
+      return NextResponse.json({ video_id: videoId, source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clips: created })
     }
 
     // POST /api/ai/translate  body: { language: 'es', strings: { key: 'English text', ... } }
@@ -514,7 +632,7 @@ async function handle(request, { params }) {
 
       const prompt = `Translate each value in this JSON object to ${langName}. Keep the JSON keys exactly the same. Return ONLY valid JSON, no markdown.\n\n${JSON.stringify(strings)}`
       let content = ''
-      try { content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.2 }) }
+      try { content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.2, db }) }
       catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }) }
       const translations = safeJsonParse(content)
       if (!translations) return NextResponse.json({ error: 'Translation parse failed', raw: content.slice(0,500) }, { status: 500 })
