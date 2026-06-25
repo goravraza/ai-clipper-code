@@ -530,7 +530,7 @@ async function handle(request, { params }) {
     }
 
     // ============= UPLOAD =============
-    // POST /api/upload  multipart form: { file, kind: 'meme_video' | 'meme_thumbnail' }
+    // POST /api/upload  multipart form: { file, kind: 'meme_video' | 'meme_thumbnail' | 'workspace_video' }
     if (path_ === '/upload' && method === 'POST') {
       const form = await request.formData()
       const file = form.get('file')
@@ -538,6 +538,31 @@ async function handle(request, { params }) {
       if (!file || typeof file === 'string') return NextResponse.json({ error: 'No file' }, { status: 400 })
       const ext = (file.name?.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '')
       const id = uuidv4()
+
+      // ============= WORKSPACE VIDEO UPLOAD \u2014 kicks off full processing =============
+      if (kind === 'workspace_video') {
+        const user = await getUser(request, db)
+        const originalsDir = '/app/data/uploads/originals/' + id
+        await fs.mkdir(originalsDir, { recursive: true })
+        const filename = `video.${ext}`
+        const fullPath = path.join(originalsDir, filename)
+        const buffer = Buffer.from(await file.arrayBuffer())
+        await fs.writeFile(fullPath, buffer)
+
+        await db.collection('videos_processed').insertOne({
+          id, user_id: user.id, original_url: `local:${file.name}`,
+          source_type: 'upload', title: file.name, thumbnail_url: null,
+          status: 'queued', progress: 0,
+          created_at: new Date(), updated_at: new Date(),
+        })
+        await logActivity(db, user.id, 'video_uploaded', request, { filename: file.name, size: buffer.length })
+
+        const { processVideoInBackground } = await import('@/lib/video-processor')
+        processVideoInBackground({ videoId: id, localFile: fullPath, userId: user.id, db, callLLM }).catch(e => console.error('bg fail', e))
+
+        return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length })
+      }
+
       const subdir = kind === 'meme_thumbnail' ? 'thumbs' : 'memes'
       const dir = path.join(UPLOAD_DIR, subdir)
       await fs.mkdir(dir, { recursive: true })
@@ -559,62 +584,37 @@ async function handle(request, { params }) {
 
     // POST /api/ai/analyze  body: { url, topic? }
     // Uses Gemini to imagine 3 viral 30-60s clip moments for the given video URL.
+    // POST /api/ai/analyze  — starts REAL video processing in background
     if (path_ === '/ai/analyze' && method === 'POST') {
       const user = await getUser(request, db)
       const body = await request.json()
       const url = body.url || ''
-      const topic = body.topic || ''
+      if (!url) return NextResponse.json({ error: 'url required' }, { status: 400 })
       const meta = await metadataForUrl(url)
-      const titleHint = meta.title ? `\nVideo title: "${meta.title}"` : ''
-      const authorHint = meta.author ? `\nCreator: ${meta.author}` : ''
-      const prompt = `You are an expert short-form video editor. A creator just uploaded this video URL: "${url}"${titleHint}${authorHint}${topic ? `\nTopic hint: ${topic}` : ''}\n\nImagine you have already watched it. Generate exactly 3 highly-engaging 30-60 second clip suggestions that would perform well on TikTok / Reels / YouTube Shorts.\n\nReturn ONLY valid JSON, no markdown, no commentary, in this shape:\n{\n  "clips": [\n    {\n      "clip_title": "a punchy curiosity-gap title (under 60 chars)",\n      "start_time_seconds": integer between 30 and 1800,\n      "end_time_seconds": integer (start + 30 to 60),\n      "virality_score": integer 70-99,\n      "hook_text": "a 4-8 word scroll-stopping opener",\n      "why": "one short sentence on why this will go viral"\n    }\n  ]\n}\nMake the three titles dramatically different in angle. Sort by virality_score descending.`
-      let content = ''
-      try {
-        content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.9, db })
-      } catch (e) {
-        return NextResponse.json({ error: 'AI failed: ' + e.message }, { status: 500 })
-      }
-      const parsed = safeJsonParse(content)
-      if (!parsed?.clips || !Array.isArray(parsed.clips)) {
-        return NextResponse.json({ error: 'AI returned unparseable response', raw: content.slice(0, 500) }, { status: 500 })
-      }
       const videoId = uuidv4()
       await db.collection('videos_processed').insertOne({
         id: videoId, user_id: user.id, original_url: url,
         source_type: meta.source_type || 'other',
-        status: 'completed', title: meta.title || null, thumbnail_url: meta.thumbnail || null,
-        created_at: new Date(),
+        title: meta.title || null, thumbnail_url: meta.thumbnail || null,
+        status: 'queued', progress: 0,
+        created_at: new Date(), updated_at: new Date(),
       })
-      const created = []
-      for (let i = 0; i < parsed.clips.length; i++) {
-        const c = parsed.clips[i]
-        const start = Math.max(0, Number(c.start_time_seconds) || (60 + i * 200))
-        const endRaw = Number(c.end_time_seconds) || (start + 45)
-        const end = Math.min(start + 60, Math.max(start + 30, endRaw))
-        // Prefer the real video thumbnail; fall back to pool
-        const thumb = meta.thumbnail || THUMB_POOL[Math.floor(Math.random() * THUMB_POOL.length)]
-        const doc = {
-          id: uuidv4(), video_id: videoId, user_id: user.id,
-          clip_title: (c.clip_title || `Viral Clip ${i+1}`).slice(0, 90),
-          start_time_seconds: start, end_time_seconds: end,
-          virality_score: Math.min(99, Math.max(50, Number(c.virality_score) || 80)),
-          storage_url_mp4: `https://cdn.clipforge.ai/clips/${videoId}-${i+1}.mp4`,
-          thumbnail_url: thumb,
-          source_video_url: url,
-          source_type: meta.source_type || 'other',
-          is_scheduled: false, scheduled_time: null,
-          hook_type: c.hook_text ? 'text' : 'none',
-          hook_text: (c.hook_text || '').slice(0, 120),
-          hook_meme_id: null,
-          subtitle_language: 'en',
-          ai_rationale: (c.why || '').slice(0, 200),
-          created_at: new Date(),
-        }
-        await db.collection('generated_clips').insertOne(doc)
-        created.push(strip(doc))
-      }
-      await logActivity(db, user.id, 'ai_analyze_completed', request, { url, clips: created.length, source: meta.source_type })
-      return NextResponse.json({ video_id: videoId, source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clips: created })
+      await logActivity(db, user.id, 'ai_analyze_started', request, { url })
+
+      // Fire-and-forget background pipeline (yt-dlp + transcribe + AI + ffmpeg)
+      const { processVideoInBackground } = await import('@/lib/video-processor')
+      processVideoInBackground({ videoId, url, userId: user.id, db, callLLM }).catch(e => console.error('bg fail', e))
+
+      return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title })
+    }
+
+    // GET /api/videos/:id  — poll processing status
+    if (path_.startsWith('/videos/') && method === 'GET') {
+      const id = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const clips = await db.collection('generated_clips').find({ video_id: id }).sort({ virality_score: -1 }).toArray()
+      return NextResponse.json({ ...strip(v), clips: clips.map(strip) })
     }
 
     // POST /api/ai/translate  body: { language: 'es', strings: { key: 'English text', ... } }

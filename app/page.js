@@ -154,8 +154,9 @@ export default function HomePage() {
   const [uiLanguage, setUiLanguage] = useState('en')
   const [memeHook, setMemeHook] = useState(true)
   const [couponCode, setCouponCode] = useState('')
-  const [couponData, setCouponData] = useState(null) // { valid, discount_percent, code }
+  const [couponData, setCouponData] = useState(null)
   const [validatingCoupon, setValidatingCoupon] = useState(false)
+  const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
 
@@ -250,6 +251,7 @@ export default function HomePage() {
   async function handleIngest() {
     if (!urlInput) return toast.error('Paste a video URL first')
     setIsIngesting(true)
+    setProcessing({ status: 'queued', progress: 0 })
     try {
       const r = await fetch('/api/ai/analyze', {
         method: 'POST', headers: { 'content-type':'application/json' },
@@ -257,20 +259,75 @@ export default function HomePage() {
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'AI failed')
-      toast.success(`AI generated ${data.clips.length} viral clips`, { description: `Top score: ${data.clips[0]?.virality_score}` })
-      // refresh clips
-      const fresh = await fetch('/api/clips').then(r => r.json())
-      setClips(fresh)
-      setUrlInput('')
+      const videoId = data.video_id
+      toast.info('Processing started \u2014 downloading, transcribing, then cutting with FFmpeg', { description: 'This usually takes 1\u20133 minutes for short videos.' })
+
+      // Poll status until done
+      const startTs = Date.now()
+      while (Date.now() - startTs < 8 * 60 * 1000) {
+        await new Promise(r => setTimeout(r, 2500))
+        const sr = await fetch(`/api/videos/${videoId}`)
+        const sd = await sr.json()
+        setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
+        if (sd.status === 'completed') {
+          toast.success(`\u2705 ${sd.clip_count || sd.clips?.length || 0} real clips ready!`, { description: `From: ${sd.title || urlInput.slice(0,50)}` })
+          // refresh clips
+          const fresh = await fetch('/api/clips').then(r => r.json())
+          setClips(fresh)
+          setUrlInput('')
+          break
+        }
+        if (sd.status === 'failed') {
+          toast.error('Processing failed', { description: sd.error_message || 'unknown error' })
+          break
+        }
+      }
     } catch (e) { toast.error('Ingestion failed', { description: e.message }) }
-    finally { setIsIngesting(false) }
+    finally { setIsIngesting(false); setTimeout(()=>setProcessing(null), 3000) }
   }
 
   function handleDrop(e) {
     e.preventDefault(); setIsDragging(false)
     const files = Array.from(e.dataTransfer.files || [])
     if (!files.length) return
-    toast.success(`Uploading ${files[0].name}`, { description: 'Local upload accepted (mock)' })
+    handleFileUpload(files[0])
+  }
+
+  async function handleFileUpload(file) {
+    if (!file) return
+    if (!file.type.startsWith('video/') && !/\.(mp4|mov|webm|mkv)$/i.test(file.name)) {
+      return toast.error('Please drop a video file')
+    }
+    setIsIngesting(true)
+    setProcessing({ status: 'uploading', progress: 0 })
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      form.append('kind', 'workspace_video')
+      toast.info(`Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)\u2026`)
+      const r = await fetch('/api/upload', { method: 'POST', body: form })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Upload failed')
+      const videoId = data.video_id
+      const startTs = Date.now()
+      while (Date.now() - startTs < 10 * 60 * 1000) {
+        await new Promise(r => setTimeout(r, 2500))
+        const sr = await fetch(`/api/videos/${videoId}`)
+        const sd = await sr.json()
+        setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
+        if (sd.status === 'completed') {
+          toast.success(`\u2705 ${sd.clip_count || sd.clips?.length || 0} real clips ready!`, { description: `From: ${sd.title}` })
+          const fresh = await fetch('/api/clips').then(r => r.json())
+          setClips(fresh)
+          break
+        }
+        if (sd.status === 'failed') {
+          toast.error('Processing failed', { description: sd.error_message?.slice(0,200) })
+          break
+        }
+      }
+    } catch (e) { toast.error('Upload failed', { description: e.message }) }
+    finally { setIsIngesting(false); setTimeout(()=>setProcessing(null), 3000) }
   }
 
   const fontObj = FONTS.find(f => f.name === subtitleFont) || FONTS[0]
@@ -399,15 +456,42 @@ export default function HomePage() {
                   <Instagram className="h-4 w-4 text-pink-500" /> Reels <span>•</span>
                   <Music2 className="h-4 w-4 text-foreground" /> TikTok
                 </div>
+
+                {/* PROCESSING PROGRESS */}
+                {processing && (
+                  <div className="rounded-xl border border-primary/40 bg-primary/5 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 text-sm font-semibold">
+                        <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                        {processing.status === 'queued' && 'Queued for processing\u2026'}
+                        {processing.status === 'downloading' && 'Downloading video via yt-dlp\u2026'}
+                        {processing.status === 'downloaded' && 'Download complete'}
+                        {processing.status === 'transcribing' && 'Parsing auto-captions\u2026'}
+                        {processing.status === 'analyzing' && 'AI analyzing transcript for viral moments\u2026'}
+                        {processing.status === 'cutting' && 'FFmpeg cutting clips\u2026'}
+                        {processing.status === 'completed' && '\u2705 Clips ready below!'}
+                        {processing.status === 'failed' && '\u274c Processing failed'}
+                      </div>
+                      <Badge variant="secondary">{processing.progress}%</Badge>
+                    </div>
+                    <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
+                      <div className="h-full gradient-bg transition-all duration-500" style={{ width: `${processing.progress}%` }} />
+                    </div>
+                    {processing.title && <div className="text-xs text-muted-foreground truncate">{processing.title}</div>}
+                  </div>
+                )}
+
                 <div
                   onDragOver={(e)=>{e.preventDefault(); setIsDragging(true)}}
                   onDragLeave={()=>setIsDragging(false)}
                   onDrop={handleDrop}
-                  className={`flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-10 transition-colors ${isDragging ? 'border-primary bg-primary/5' : 'border-border bg-muted/30'}`}
+                  onClick={()=>document.getElementById('workspace-file-input')?.click()}
+                  className={`flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-10 transition-colors cursor-pointer ${isDragging ? 'border-primary bg-primary/5' : 'border-border bg-muted/30 hover:border-primary/50 hover:bg-muted/50'}`}
                 >
                   <Upload className="h-8 w-8 text-muted-foreground" />
-                  <div className="text-sm font-medium">{t.or_drop}</div>
-                  <div className="text-xs text-muted-foreground">{t.file_hint}</div>
+                  <div className="text-sm font-medium">Drop a video here, or click to choose</div>
+                  <div className="text-xs text-muted-foreground">MP4, MOV, WebM — the AI will transcribe & cut viral clips with FFmpeg</div>
+                  <input id="workspace-file-input" type="file" accept="video/*" className="hidden" onChange={(e)=>handleFileUpload(e.target.files?.[0])} />
                 </div>
               </CardContent>
             </Card>
@@ -639,7 +723,18 @@ function ClipCard({ clip, memes, t, onUpdate }) {
     toast.success(`Scheduled to ${platform.replace('_',' ')}`, { description: new Date(scheduledTime).toLocaleString() })
   }
 
-  function download() { toast.success('Downloading MP4', { description: `${clip.clip_title} (1080x1920)` }) }
+  function download() {
+    if (clip.storage_url_mp4 && clip.storage_url_mp4.startsWith('/api/files/')) {
+      // real file — trigger browser download
+      const a = document.createElement('a')
+      a.href = clip.storage_url_mp4
+      a.download = `${clip.clip_title.replace(/[^a-z0-9]+/gi, '_')}.mp4`
+      document.body.appendChild(a); a.click(); a.remove()
+      toast.success('Downloading MP4', { description: clip.clip_title })
+    } else {
+      toast.error('This clip has no rendered MP4 yet', { description: 'Use a YouTube URL in the workspace to generate a real clip.' })
+    }
+  }
 
   const score = clip.virality_score
   const scoreColor = score >= 90 ? 'bg-emerald-500' : score >= 80 ? 'bg-amber-500' : 'bg-orange-500'
@@ -888,88 +983,47 @@ function TrimCropButton({ clip, onUpdate }) {
 
 function PreviewButton({ clip, memes }) {
   const [open, setOpen] = useState(false)
-  const [playing, setPlaying] = useState(false)
-  const [tick, setTick] = useState(0)
-  const duration = (clip.trim_end ?? (clip.end_time_seconds - clip.start_time_seconds)) - (clip.trim_start ?? 0)
   const aspect = clip.crop_aspect || '9:16'
   const aspectMeta = CROP_ASPECTS.find(a => a.value === aspect) || CROP_ASPECTS[0]
-  const captions = clip.captions || []
-  const currentCaption = playing ? captions.find(c => tick >= c.start_time && tick < c.end_time) : null
-  const hookMeme = clip.hook_meme_id ? memes.find(m => m.id === clip.hook_meme_id) : null
-  const inHook = playing && tick < (hookMeme?.duration_seconds || (clip.hook_type === 'text' && clip.hook_text ? 2.5 : 0))
-
-  useEffect(() => {
-    if (!playing) return
-    const i = setInterval(() => setTick(t => {
-      const next = t + 0.1
-      if (next > duration + (hookMeme?.duration_seconds || 0) + 1) { setPlaying(false); return 0 }
-      return next
-    }), 100)
-    return () => clearInterval(i)
-  }, [playing, duration, hookMeme])
+  const isRealClip = clip.storage_url_mp4 && clip.storage_url_mp4.startsWith('/api/files/')
 
   return (
-    <Dialog open={open} onOpenChange={(o)=>{ setOpen(o); if (!o) { setPlaying(false); setTick(0) } }}>
+    <Dialog open={open} onOpenChange={setOpen}>
       <Button size="sm" variant="outline" className="flex-1 h-8 px-2 text-xs gap-1" onClick={()=>setOpen(true)}>
         <Play className="h-3.5 w-3.5" /> Preview
       </Button>
       <DialogContent className="max-w-md p-0 overflow-hidden bg-zinc-950 border-border">
         <DialogHeader className="px-4 pt-4 pb-2">
-          <DialogTitle className="text-white text-sm">Preview · {clip.clip_title}</DialogTitle>
-          <DialogDescription className="text-xs text-zinc-400">{duration.toFixed(1)}s final · {aspect} · {captions.length > 0 ? `${captions.length} captions` : 'no captions yet'}</DialogDescription>
+          <DialogTitle className="text-white text-sm flex items-center gap-2">
+            {clip.clip_title}
+            {isRealClip && <Badge className="bg-emerald-500/20 text-emerald-400 border-transparent text-[10px]">REAL MP4</Badge>}
+          </DialogTitle>
+          <DialogDescription className="text-xs text-zinc-400">
+            {clip.end_time_seconds - clip.start_time_seconds}s · {aspect} · virality {clip.virality_score}
+          </DialogDescription>
         </DialogHeader>
         <div className="flex justify-center px-4 pb-4">
-          <div className={`relative max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800`} style={{aspectRatio: aspect.replace(':','/'), width: aspect === '16:9' ? '100%' : aspect === '1:1' ? '60%' : '45%'}}>
-            {/* main image or meme during hook phase */}
-            {inHook && hookMeme ? (
+          <div className="relative max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800" style={{aspectRatio: aspect.replace(':','/'), width: aspect === '16:9' ? '100%' : aspect === '1:1' ? '60%' : '45%'}}>
+            {isRealClip ? (
+              // eslint-disable-next-line jsx-a11y/media-has-caption
+              <video src={clip.storage_url_mp4} controls autoPlay className="absolute inset-0 h-full w-full object-cover bg-black" />
+            ) : (
               <>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={hookMeme.thumbnail_url} alt="" className="absolute inset-0 h-full w-full object-cover" />
-                <div className="absolute top-2 left-2 right-2 text-center text-white text-[10px] uppercase tracking-wider bg-primary/80 rounded px-2 py-0.5 font-bold">3s Meme Hook · {hookMeme.name}</div>
-              </>
-            ) : (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={clip.thumbnail_url} alt="" className="absolute inset-0 h-full w-full object-cover" />
-            )}
-            <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-black/40" />
-
-            {/* text hook overlay during first ~2.5s */}
-            {playing && clip.hook_type === 'text' && clip.hook_text && tick < 2.5 && !inHook && (
-              <div className="absolute inset-x-4 top-1/3 text-center text-white text-xl font-black uppercase leading-tight" style={{fontFamily:'Impact, sans-serif', WebkitTextStroke:'1.5px #facc15', textShadow:'0 0 12px #facc1588'}}>
-                {clip.hook_text}
-              </div>
-            )}
-
-            {/* live caption */}
-            {currentCaption && (
-              <div className="absolute bottom-12 left-3 right-3 text-center text-white font-black uppercase leading-tight" style={{fontFamily:'Impact, sans-serif', fontSize:'16px', WebkitTextStroke:'1.5px #000', textShadow:'0 1px 4px rgba(0,0,0,0.8)'}}>
-                {currentCaption.text}
-              </div>
-            )}
-
-            {/* progress bar */}
-            <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/20">
-              <div className="h-full gradient-bg transition-all" style={{ width: `${Math.min(100, (tick / (duration + (hookMeme?.duration_seconds || 0))) * 100)}%` }} />
-            </div>
-
-            {/* play button */}
-            {!playing && (
-              <button onClick={() => { setTick(0); setPlaying(true) }} className="absolute inset-0 flex items-center justify-center group">
-                <div className="h-16 w-16 rounded-full bg-white/90 group-hover:scale-110 transition-transform flex items-center justify-center">
-                  <Play className="h-7 w-7 text-black ml-1" fill="currentColor" />
+                <img src={clip.thumbnail_url} alt="" className="absolute inset-0 h-full w-full object-cover" />
+                <div className="absolute inset-0 flex items-center justify-center text-white text-sm bg-black/60 text-center p-4">
+                  No rendered MP4 for this demo clip.<br/>Paste a YouTube URL to generate real ones.
                 </div>
-              </button>
+              </>
             )}
-            {playing && (
-              <button onClick={() => setPlaying(false)} className="absolute top-3 right-3 h-8 w-8 rounded-full bg-black/60 backdrop-blur flex items-center justify-center text-white">
-                <Pause className="h-4 w-4" />
-              </button>
-            )}
-
-            {/* virality badge */}
-            <Badge className="absolute top-3 left-3 bg-emerald-500 text-white border-transparent gap-1"><Flame className="h-3 w-3" /> {clip.virality_score}</Badge>
+            <Badge className="absolute top-3 left-3 bg-emerald-500 text-white border-transparent gap-1 z-10"><Flame className="h-3 w-3" /> {clip.virality_score}</Badge>
           </div>
         </div>
+        {clip.ai_rationale && (
+          <div className="px-4 pb-4 text-xs text-zinc-400 italic">
+            "<span className="text-zinc-300">{clip.ai_rationale}</span>"
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   )
