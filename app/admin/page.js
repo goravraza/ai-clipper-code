@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { toast } from 'sonner'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
@@ -11,7 +11,7 @@ import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
-import { ShieldCheck, ArrowLeft, Save, Plus, Trash2, Lock, Coins, Smile } from 'lucide-react'
+import { ShieldCheck, ArrowLeft, Save, Plus, Trash2, Lock, Coins, Smile, Upload, Loader2, Film, Image as ImageIcon } from 'lucide-react'
 
 export default function AdminPage() {
   const [profile, setProfile] = useState(null)
@@ -51,11 +51,11 @@ export default function AdminPage() {
   async function removeMeme(id) { await fetch(`/api/memes/${id}`, { method:'DELETE' }); setMemes(prev => prev.filter(x => x.id !== id)); toast.success('Meme removed') }
   async function createMeme() {
     const r = await fetch('/api/memes', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({
-      name:'New Meme Hook', category:'reaction', video_url:'https://example.com/meme.mp4',
+      name:'New Meme Hook', category:'reaction', video_url:'',
       thumbnail_url:'https://images.unsplash.com/photo-1611605698335-8b1569810432?w=400&q=80',
       duration_seconds:3, is_active:true,
     }) })
-    const created = await r.json(); setMemes(prev => [created, ...prev]); toast.success('New meme added')
+    const created = await r.json(); setMemes(prev => [created, ...prev]); toast.success('New meme added — upload video below')
   }
 
   if (loading) return <div className="min-h-screen flex items-center justify-center text-muted-foreground">Loading admin…</div>
@@ -66,17 +66,9 @@ export default function AdminPage() {
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border bg-card/30 backdrop-blur">
         <div className="container flex h-16 items-center justify-between">
-          <Link href="/" className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
-            <ArrowLeft className="h-4 w-4" /> Back to workspace
-          </Link>
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5 text-primary" />
-            <span className="font-semibold">Admin Console</span>
-          </div>
-          <div className="flex items-center gap-2 text-xs">
-            <span className="text-muted-foreground">Impersonate admin</span>
-            <Switch checked={useAdmin} onCheckedChange={setUseAdmin} />
-          </div>
+          <Link href="/" className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /> Back to workspace</Link>
+          <div className="flex items-center gap-2"><ShieldCheck className="h-5 w-5 text-primary" /><span className="font-semibold">Admin Console</span></div>
+          <div className="flex items-center gap-2 text-xs"><span className="text-muted-foreground">Impersonate admin</span><Switch checked={useAdmin} onCheckedChange={setUseAdmin} /></div>
         </div>
       </header>
 
@@ -85,10 +77,7 @@ export default function AdminPage() {
           <Card className="max-w-md mx-auto text-center">
             <CardContent className="py-12 space-y-4">
               <Lock className="h-10 w-10 text-muted-foreground mx-auto" />
-              <div>
-                <div className="text-lg font-semibold">Admin access required</div>
-                <p className="text-sm text-muted-foreground mt-1">Your profile <code className="text-foreground">is_admin</code> flag is false. Toggle “Impersonate admin” above to view the dashboard.</p>
-              </div>
+              <div><div className="text-lg font-semibold">Admin access required</div><p className="text-sm text-muted-foreground mt-1">Your profile <code className="text-foreground">is_admin</code> flag is false. Toggle “Impersonate admin” above to view the dashboard.</p></div>
               <Badge variant="outline">Logged in as: {profile?.email}</Badge>
             </CardContent>
           </Card>
@@ -101,28 +90,18 @@ export default function AdminPage() {
 
             <TabsContent value="pricing" className="space-y-4">
               <div className="flex items-center justify-between">
-                <div>
-                  <h1 className="text-3xl font-bold">Pricing Packages</h1>
-                  <p className="text-muted-foreground text-sm">Edit prices, credit allocations and active flags. Changes go live instantly.</p>
-                </div>
+                <div><h1 className="text-3xl font-bold">Pricing Packages</h1><p className="text-muted-foreground text-sm">Edit prices, credit allocations and active flags.</p></div>
                 <Button onClick={createPkg} className="gradient-bg text-white"><Plus className="h-4 w-4 mr-1" /> New package</Button>
               </div>
-              <div className="grid gap-4">
-                {pkgs.map(pkg => <PkgRow key={pkg.id} pkg={pkg} onSave={savePkg} onDelete={removePkg} />)}
-              </div>
+              <div className="grid gap-4">{pkgs.map(pkg => <PkgRow key={pkg.id} pkg={pkg} onSave={savePkg} onDelete={removePkg} />)}</div>
             </TabsContent>
 
             <TabsContent value="memes" className="space-y-4">
               <div className="flex items-center justify-between">
-                <div>
-                  <h1 className="text-3xl font-bold">Meme Hook Library</h1>
-                  <p className="text-muted-foreground text-sm">Upload 2-3 second meme videos that creators can prepend to their clips as viral intro hooks.</p>
-                </div>
+                <div><h1 className="text-3xl font-bold">Meme Hook Library</h1><p className="text-muted-foreground text-sm">Upload 2-3 second meme videos that creators prepend to clips as viral intro hooks.</p></div>
                 <Button onClick={createMeme} className="gradient-bg text-white"><Plus className="h-4 w-4 mr-1" /> New meme</Button>
               </div>
-              <div className="grid gap-4">
-                {memes.map(m => <MemeRow key={m.id} meme={m} onSave={saveMeme} onDelete={removeMeme} />)}
-              </div>
+              <div className="grid gap-4">{memes.map(m => <MemeRow key={m.id} meme={m} onSave={saveMeme} onDelete={removeMeme} />)}</div>
             </TabsContent>
           </Tabs>
         )}
@@ -168,8 +147,29 @@ function PkgRow({ pkg, onSave, onDelete }) {
 
 function MemeRow({ meme, onSave, onDelete }) {
   const [local, setLocal] = useState(meme)
+  const [uploading, setUploading] = useState(null) // 'video' | 'thumb' | null
+  const videoRef = useRef(null)
+  const thumbRef = useRef(null)
   const dirty = JSON.stringify(local) !== JSON.stringify(meme)
   function update(k, v) { setLocal(prev => ({ ...prev, [k]: v })) }
+
+  async function uploadFile(file, kind) {
+    if (!file) return
+    setUploading(kind === 'meme_video' ? 'video' : 'thumb')
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      form.append('kind', kind)
+      const r = await fetch('/api/upload', { method: 'POST', body: form })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Upload failed')
+      if (kind === 'meme_video') update('video_url', data.url)
+      else update('thumbnail_url', data.url)
+      toast.success('File uploaded')
+    } catch (e) { toast.error('Upload failed', { description: e.message }) }
+    finally { setUploading(null) }
+  }
+
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -185,7 +185,7 @@ function MemeRow({ meme, onSave, onDelete }) {
                 <Badge variant="outline">{local.category}</Badge>
                 <Badge variant={local.is_active ? 'default' : 'secondary'}>{local.is_active ? 'Active' : 'Hidden'}</Badge>
               </CardTitle>
-              <div className="text-xs text-muted-foreground mt-0.5 truncate">{local.video_url}</div>
+              <div className="text-xs text-muted-foreground mt-0.5 truncate">{local.video_url || <em>no video uploaded</em>}</div>
             </div>
           </div>
           <div className="flex gap-2 shrink-0">
@@ -199,8 +199,27 @@ function MemeRow({ meme, onSave, onDelete }) {
         <Field label="Name"><Input value={local.name} onChange={e => update('name', e.target.value)} /></Field>
         <Field label="Category"><Input value={local.category} onChange={e => update('category', e.target.value)} placeholder="reaction, hype, sfx…" /></Field>
         <Field label="Duration (s)"><Input type="number" value={local.duration_seconds} onChange={e => update('duration_seconds', Number(e.target.value))} /></Field>
-        <Field label="Video URL" className="md:col-span-2"><Input value={local.video_url} onChange={e => update('video_url', e.target.value)} placeholder="https://…meme.mp4" /></Field>
-        <Field label="Thumbnail URL"><Input value={local.thumbnail_url} onChange={e => update('thumbnail_url', e.target.value)} placeholder="https://…thumb.jpg" /></Field>
+
+        <Field label="Video file" className="md:col-span-2">
+          <div className="flex gap-2">
+            <Input value={local.video_url} onChange={e => update('video_url', e.target.value)} placeholder="https:// or upload…" className="text-xs" />
+            <input ref={videoRef} type="file" accept="video/*" className="hidden" onChange={(e) => uploadFile(e.target.files?.[0], 'meme_video')} />
+            <Button type="button" variant="outline" size="icon" onClick={() => videoRef.current?.click()} disabled={uploading === 'video'}>
+              {uploading === 'video' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Film className="h-4 w-4" />}
+            </Button>
+          </div>
+        </Field>
+
+        <Field label="Thumbnail">
+          <div className="flex gap-2">
+            <Input value={local.thumbnail_url} onChange={e => update('thumbnail_url', e.target.value)} placeholder="URL or upload" className="text-xs" />
+            <input ref={thumbRef} type="file" accept="image/*" className="hidden" onChange={(e) => uploadFile(e.target.files?.[0], 'meme_thumbnail')} />
+            <Button type="button" variant="outline" size="icon" onClick={() => thumbRef.current?.click()} disabled={uploading === 'thumb'}>
+              {uploading === 'thumb' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+            </Button>
+          </div>
+        </Field>
+
         <div className="md:col-span-6 flex items-center justify-end gap-3">
           <Label className="text-xs text-muted-foreground">Active (visible to users)</Label>
           <Switch checked={local.is_active} onCheckedChange={v => update('is_active', v)} />
