@@ -55,6 +55,19 @@ async function seedIfEmpty(db) {
     })
   }
 
+  // seed memes library
+  const memeCount = await db.collection('memes').countDocuments()
+  if (memeCount === 0) {
+    await db.collection('memes').insertMany([
+      { id: uuidv4(), name: 'POV: You opened TikTok', category: 'reaction', video_url: 'https://media.tenor.com/mock/pov-tiktok.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1611605698335-8b1569810432?w=400&q=80', duration_seconds: 3, is_active: true, created_at: new Date() },
+      { id: uuidv4(), name: 'Wait For It...', category: 'suspense', video_url: 'https://media.tenor.com/mock/wait-for-it.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1535378917042-10a22c95931a?w=400&q=80', duration_seconds: 3, is_active: true, created_at: new Date() },
+      { id: uuidv4(), name: 'Plot Twist Drum Roll', category: 'reveal', video_url: 'https://media.tenor.com/mock/plot-twist.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1614680376573-df3480f0c6ff?w=400&q=80', duration_seconds: 3, is_active: true, created_at: new Date() },
+      { id: uuidv4(), name: 'When The Beat Drops', category: 'hype', video_url: 'https://media.tenor.com/mock/beat-drop.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=400&q=80', duration_seconds: 3, is_active: true, created_at: new Date() },
+      { id: uuidv4(), name: 'Bro Just Said What?!', category: 'shock', video_url: 'https://media.tenor.com/mock/bro-said-what.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1633265486064-086b219458ec?w=400&q=80', duration_seconds: 3, is_active: true, created_at: new Date() },
+      { id: uuidv4(), name: 'Vine Boom Sound Effect', category: 'sfx', video_url: 'https://media.tenor.com/mock/vine-boom.mp4', thumbnail_url: 'https://images.unsplash.com/photo-1518972559570-7cc1309f3229?w=400&q=80', duration_seconds: 2, is_active: true, created_at: new Date() },
+    ])
+  }
+
   // seed sample clips
   const clipCount = await db.collection('generated_clips').countDocuments()
   if (clipCount === 0) {
@@ -79,6 +92,10 @@ async function seedIfEmpty(db) {
         thumbnail_url: 'https://images.unsplash.com/photo-1593697909683-bccb1b9e68a4?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2ODl8MHwxfHNlYXJjaHwzfHxwb2RjYXN0JTIwY3JlYXRvcnxlbnwwfHx8fDE3ODIzNzQ5NDJ8MA&ixlib=rb-4.1.0&q=85',
         is_scheduled: false,
         scheduled_time: null,
+        hook_type: 'text',
+        hook_text: 'You won\u2019t believe this\u2026',
+        hook_meme_id: null,
+        subtitle_language: 'en',
         created_at: new Date(),
       },
       {
@@ -93,6 +110,10 @@ async function seedIfEmpty(db) {
         thumbnail_url: 'https://images.unsplash.com/photo-1581368135153-a506cf13b1e1?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2ODl8MHwxfHNlYXJjaHw0fHxwb2RjYXN0JTIwY3JlYXRvcnxlbnwwfHx8fDE3ODIzNzQ5NDJ8MA&ixlib=rb-4.1.0&q=85',
         is_scheduled: false,
         scheduled_time: null,
+        hook_type: 'none',
+        hook_text: '',
+        hook_meme_id: null,
+        subtitle_language: 'en',
         created_at: new Date(),
       },
       {
@@ -107,6 +128,10 @@ async function seedIfEmpty(db) {
         thumbnail_url: 'https://images.pexels.com/photos/7600898/pexels-photo-7600898.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940',
         is_scheduled: false,
         scheduled_time: null,
+        hook_type: 'none',
+        hook_text: '',
+        hook_meme_id: null,
+        subtitle_language: 'en',
         created_at: new Date(),
       },
     ])
@@ -223,12 +248,54 @@ async function handle(request, { params }) {
     if (path.startsWith('/clips/') && method === 'PUT') {
       const id = segments[1]
       const body = await request.json()
-      const allowed = ['clip_title','is_scheduled','scheduled_time']
+      const allowed = ['clip_title','is_scheduled','scheduled_time','hook_type','hook_text','hook_meme_id','subtitle_language']
       const updates = {}
       for (const k of allowed) if (k in body) updates[k] = body[k]
       await db.collection('generated_clips').updateOne({ id }, { $set: updates })
       const c = await db.collection('generated_clips').findOne({ id })
       return NextResponse.json(strip(c))
+    }
+
+    // GET /api/memes
+    if (path === '/memes' && method === 'GET') {
+      const list = await db.collection('memes').find({}).sort({ created_at: -1 }).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+
+    // POST /api/memes (admin)
+    if (path === '/memes' && method === 'POST') {
+      const body = await request.json()
+      const doc = {
+        id: uuidv4(),
+        name: body.name || 'Untitled Meme',
+        category: body.category || 'general',
+        video_url: body.video_url || '',
+        thumbnail_url: body.thumbnail_url || '',
+        duration_seconds: Number(body.duration_seconds) || 3,
+        is_active: body.is_active !== false,
+        created_at: new Date(),
+      }
+      await db.collection('memes').insertOne(doc)
+      return NextResponse.json(strip(doc))
+    }
+
+    // PUT /api/memes/:id
+    if (path.startsWith('/memes/') && method === 'PUT') {
+      const id = segments[1]
+      const body = await request.json()
+      const allowed = ['name','category','video_url','thumbnail_url','duration_seconds','is_active']
+      const updates = {}
+      for (const k of allowed) if (k in body) updates[k] = body[k]
+      await db.collection('memes').updateOne({ id }, { $set: updates })
+      const m = await db.collection('memes').findOne({ id })
+      return NextResponse.json(strip(m))
+    }
+
+    // DELETE /api/memes/:id
+    if (path.startsWith('/memes/') && method === 'DELETE') {
+      const id = segments[1]
+      await db.collection('memes').deleteOne({ id })
+      return NextResponse.json({ ok: true })
     }
 
     // POST /api/videos  — ingest URL (mock)
