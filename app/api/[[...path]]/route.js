@@ -70,6 +70,19 @@ async function seedIfEmpty(db) {
 
 function strip(doc) { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
 
+function maskCredentials(creds) {
+  const masked = {}
+  for (const [k, v] of Object.entries(creds || {})) {
+    if (typeof v === 'string' && v.length > 8) masked[k] = `${v.slice(0,4)}\u2022\u2022\u2022\u2022${v.slice(-4)}`
+    else if (typeof v === 'string' && v.length > 0) masked[k] = '\u2022\u2022\u2022\u2022'
+    else masked[k] = v
+  }
+  return masked
+}
+function isMaskedValue(v) {
+  return typeof v === 'string' && (v.includes('\u2022\u2022\u2022\u2022') || v === '****')
+}
+
 function parseCookies(cookieHeader) {
   const out = {}
   if (!cookieHeader) return out
@@ -266,11 +279,85 @@ async function handle(request, { params }) {
     if (path_.startsWith('/clips/') && method === 'PUT') {
       const id = segments[1]
       const body = await request.json()
-      const allowed = ['clip_title','is_scheduled','scheduled_time','hook_type','hook_text','hook_meme_id','subtitle_language']
+      const allowed = ['clip_title','is_scheduled','scheduled_time','hook_type','hook_text','hook_meme_id','subtitle_language','trim_start','trim_end','crop_aspect','subtitle_font','subtitle_font_size','subtitle_stroke_color','subtitle_stroke_width','captions']
       const updates = {}; for (const k of allowed) if (k in body) updates[k] = body[k]
       await db.collection('generated_clips').updateOne({ id }, { $set: updates })
       const c = await db.collection('generated_clips').findOne({ id })
       return NextResponse.json(strip(c))
+    }
+
+    // ============= INTEGRATIONS (admin manages API keys for AI + payment providers) =============
+    if (path_ === '/admin/integrations' && method === 'GET') {
+      const list = await db.collection('integration_credentials').find({}).toArray()
+      // Mask secrets in response
+      const masked = list.map(strip).map(item => ({
+        ...item,
+        credentials: maskCredentials(item.credentials || {}),
+        has_credentials: Object.keys(item.credentials || {}).length > 0,
+      }))
+      return NextResponse.json(masked)
+    }
+    // POST /api/admin/integrations  body: { provider, credentials, is_active }
+    if (path_ === '/admin/integrations' && method === 'POST') {
+      const body = await request.json()
+      const provider = body.provider
+      if (!provider) return NextResponse.json({ error: 'provider required' }, { status: 400 })
+      const existing = await db.collection('integration_credentials').findOne({ provider })
+      if (existing) {
+        // merge credentials, never wipe unless explicit
+        const merged = { ...(existing.credentials || {}), ...(body.credentials || {}) }
+        // filter out empty strings so masked placeholders don't overwrite real values
+        const cleaned = {}
+        for (const [k, v] of Object.entries(merged)) {
+          if (v !== '' && v !== null && v !== undefined && !isMaskedValue(v)) cleaned[k] = v
+          else if (existing.credentials?.[k] && isMaskedValue(v)) cleaned[k] = existing.credentials[k]
+        }
+        await db.collection('integration_credentials').updateOne({ provider }, { $set: { credentials: cleaned, is_active: body.is_active !== false, updated_at: new Date() } })
+      } else {
+        const cleaned = {}
+        for (const [k, v] of Object.entries(body.credentials || {})) {
+          if (v !== '' && v !== null && v !== undefined && !isMaskedValue(v)) cleaned[k] = v
+        }
+        await db.collection('integration_credentials').insertOne({
+          id: uuidv4(), provider, credentials: cleaned, is_active: body.is_active !== false,
+          created_at: new Date(), updated_at: new Date(),
+        })
+      }
+      const updated = await db.collection('integration_credentials').findOne({ provider })
+      return NextResponse.json({ ...strip(updated), credentials: maskCredentials(updated.credentials || {}), has_credentials: Object.keys(updated.credentials || {}).length > 0 })
+    }
+    if (path_.startsWith('/admin/integrations/') && method === 'DELETE') {
+      const provider = segments[2]
+      await db.collection('integration_credentials').deleteOne({ provider })
+      return NextResponse.json({ ok: true })
+    }
+
+    // ============= AUTO CAPTIONS =============
+    // POST /api/ai/captions  body: { clip_id, language? }
+    if (path_ === '/ai/captions' && method === 'POST') {
+      const body = await request.json()
+      const clipId = body.clip_id
+      const language = body.language || 'en'
+      if (!clipId) return NextResponse.json({ error: 'clip_id required' }, { status: 400 })
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'clip not found' }, { status: 404 })
+      const duration = clip.end_time_seconds - clip.start_time_seconds
+      const langName = body.language_name || language
+      const prompt = `You are an auto-captioning AI for a short-form vertical video.\n\nClip title: "${clip.clip_title}"\nDuration: ${duration} seconds.\nHook: "${clip.hook_text || ''}"\nLanguage: ${langName}\n\nGenerate 6-10 short, punchy subtitle captions that would naturally appear in this clip, each 2-6 words long, in ${langName}. Distribute timestamps evenly across the ${duration} seconds.\n\nReturn ONLY valid JSON in this exact shape (no markdown, no commentary):\n{\n  "captions": [\n    { "start_time": 0.0, "end_time": 2.5, "text": "string" }\n  ]\n}\nMake the captions feel authentic to the title's topic. Use sentence-case (not ALL CAPS).`
+      let content = ''
+      try { content = await callLLM([{ role: 'user', content: prompt }], { json: true, temperature: 0.6 }) }
+      catch (e) { return NextResponse.json({ error: 'AI failed: ' + e.message }, { status: 500 }) }
+      const parsed = safeJsonParse(content)
+      if (!parsed?.captions) return NextResponse.json({ error: 'AI returned unparseable response', raw: content.slice(0,500) }, { status: 500 })
+      // normalise timestamps
+      const captions = parsed.captions.slice(0, 12).map(c => ({
+        start_time: Math.max(0, Number(c.start_time) || 0),
+        end_time: Math.min(duration, Number(c.end_time) || (Number(c.start_time) + 2)),
+        text: String(c.text || '').slice(0, 80),
+      }))
+      await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { captions, captions_language: language, captions_generated_at: new Date() } })
+      const updated = await db.collection('generated_clips').findOne({ id: clipId })
+      return NextResponse.json(strip(updated))
     }
 
     // ============= MEMES =============

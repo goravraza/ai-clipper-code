@@ -8,6 +8,7 @@ import {
   Flame, TrendingUp, Zap, Settings2, Type, Palette, Wand2, Coins,
   Youtube, Instagram, Music2, ShieldCheck, ChevronRight, Loader2, Play,
   Languages, Smile, Pencil, Check, LogIn, LogOut, User as UserIcon,
+  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -18,6 +19,7 @@ import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle, DrawerTrigger, DrawerFooter, DrawerDescription } from '@/components/ui/drawer'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
@@ -25,6 +27,13 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
 import Link from 'next/link'
+
+const CROP_ASPECTS = [
+  { value: '9:16', label: 'Vertical 9:16', tw: 'aspect-[9/16]' },
+  { value: '1:1', label: 'Square 1:1', tw: 'aspect-square' },
+  { value: '4:5', label: 'Portrait 4:5', tw: 'aspect-[4/5]' },
+  { value: '16:9', label: 'Landscape 16:9', tw: 'aspect-video' },
+]
 
 export const FONTS = [
   { name: 'Montserrat Bold', css: 'Montserrat, system-ui, sans-serif', weight: 900 },
@@ -139,6 +148,8 @@ export default function HomePage() {
   const [isDragging, setIsDragging] = useState(false)
   const [subtitleFont, setSubtitleFont] = useState('Montserrat Bold')
   const [strokeColor, setStrokeColor] = useState('#facc15')
+  const [strokeWidth, setStrokeWidth] = useState([2])
+  const [fontSize, setFontSize] = useState([22])
   const [subtitleLanguage, setSubtitleLanguage] = useState('en')
   const [uiLanguage, setUiLanguage] = useState('en')
   const [memeHook, setMemeHook] = useState(true)
@@ -403,7 +414,7 @@ export default function HomePage() {
                 <div className="relative aspect-[9/16] max-w-[200px] mx-auto rounded-xl overflow-hidden bg-gradient-to-br from-zinc-800 to-zinc-950 flex items-end justify-center p-4">
                   <div className="absolute inset-0 flex items-center justify-center text-zinc-700"><Play className="h-10 w-10" /></div>
                   <div className="relative text-center text-white leading-tight uppercase"
-                    style={{ fontFamily: fontObj.css, fontWeight: fontObj.weight, fontSize: fontObj.name === 'Press Start 2P' ? '14px' : '22px', WebkitTextStroke: `2px ${strokeColor}`, textShadow: `0 0 8px ${strokeColor}55` }}>
+                    style={{ fontFamily: fontObj.css, fontWeight: fontObj.weight, fontSize: `${fontSize[0]}px`, WebkitTextStroke: `${strokeWidth[0]}px ${strokeColor}`, textShadow: `0 0 8px ${strokeColor}55` }}>
                     AI built<br/>this clip!
                   </div>
                 </div>
@@ -413,6 +424,20 @@ export default function HomePage() {
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>{FONTS.map(f => <SelectItem key={f.name} value={f.name}><span style={{ fontFamily: f.css, fontWeight: f.weight }}>{f.name}</span></SelectItem>)}</SelectContent>
                   </Select>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="flex items-center gap-1.5"><AArrowUp className="h-3.5 w-3.5" /> Font size</Label>
+                    <span className="text-xs text-muted-foreground tabular-nums">{fontSize[0]}px</span>
+                  </div>
+                  <Slider min={10} max={48} step={1} value={fontSize} onValueChange={setFontSize} />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="flex items-center gap-1.5"><Pencil className="h-3.5 w-3.5" /> Stroke width</Label>
+                    <span className="text-xs text-muted-foreground tabular-nums">{strokeWidth[0]}px</span>
+                  </div>
+                  <Slider min={0} max={6} step={0.5} value={strokeWidth} onValueChange={setStrokeWidth} />
                 </div>
                 <div className="space-y-2">
                   <Label className="flex items-center gap-1.5"><Languages className="h-3.5 w-3.5" /> {t.subtitle_language}</Label>
@@ -585,6 +610,11 @@ function ClipCard({ clip, memes, t, onUpdate }) {
       <CardContent className="p-3 space-y-2">
         <Input value={title} onChange={(e)=>setTitle(e.target.value)} onBlur={saveTitle} className="font-semibold text-sm h-9" />
         <HookEditor clip={clip} memes={memes} onUpdate={onUpdate} hookLabel={hookLabel} t={t} />
+        <div className="flex gap-1">
+          <CaptionsButton clip={clip} onUpdate={onUpdate} />
+          <TrimCropButton clip={clip} onUpdate={onUpdate} />
+          <PreviewButton clip={clip} memes={memes} />
+        </div>
         <div className="flex gap-2">
           <Button size="sm" variant="outline" className="flex-1" onClick={download}>
             <Download className="h-3.5 w-3.5 mr-1" /> MP4
@@ -624,6 +654,250 @@ function ClipCard({ clip, memes, t, onUpdate }) {
     </Card>
   )
 }
+
+function CaptionsButton({ clip, onUpdate }) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [captions, setCaptions] = useState(clip.captions || [])
+
+  async function generate() {
+    setLoading(true)
+    try {
+      const r = await fetch('/api/ai/captions', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ clip_id: clip.id, language: clip.subtitle_language || 'en' })
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'failed')
+      onUpdate(data); setCaptions(data.captions || [])
+      toast.success(`Generated ${data.captions?.length || 0} captions`)
+    } catch (e) { toast.error('Caption generation failed', { description: e.message }) }
+    finally { setLoading(false) }
+  }
+
+  return (
+    <Drawer open={open} onOpenChange={setOpen}>
+      <DrawerTrigger asChild>
+        <Button size="sm" variant="outline" className="flex-1 h-8 px-2 text-xs gap-1">
+          <Captions className="h-3.5 w-3.5" /> CC
+          {(clip.captions?.length || 0) > 0 && <Badge className="bg-emerald-500/15 text-emerald-600 border-transparent h-4 px-1 text-[10px] ml-0.5">{clip.captions.length}</Badge>}
+        </Button>
+      </DrawerTrigger>
+      <DrawerContent>
+        <div className="mx-auto w-full max-w-2xl">
+          <DrawerHeader>
+            <DrawerTitle>Auto-captions for “{clip.clip_title}”</DrawerTitle>
+            <DrawerDescription>AI-generated timestamped subtitles in {clip.subtitle_language || 'en'}.</DrawerDescription>
+          </DrawerHeader>
+          <div className="px-4 pb-4 space-y-3">
+            {captions.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border bg-muted/30 p-8 text-center">
+                <Captions className="h-8 w-8 text-muted-foreground mx-auto mb-2" />
+                <div className="text-sm font-medium">No captions yet</div>
+                <p className="text-xs text-muted-foreground mt-1">Generate AI captions using Gemini in seconds.</p>
+              </div>
+            ) : (
+              <ScrollArea className="h-72 rounded-md border">
+                <div className="divide-y">
+                  {captions.map((c, i) => (
+                    <div key={i} className="flex items-start gap-3 px-3 py-2">
+                      <span className="text-[11px] font-mono text-muted-foreground tabular-nums shrink-0 mt-0.5">{c.start_time?.toFixed(1)}s</span>
+                      <span className="text-sm flex-1">{c.text}</span>
+                    </div>
+                  ))}
+                </div>
+              </ScrollArea>
+            )}
+          </div>
+          <DrawerFooter>
+            <Button onClick={generate} disabled={loading} className="gradient-bg text-white">
+              {loading ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Sparkles className="h-4 w-4 mr-1" />}
+              {captions.length > 0 ? 'Regenerate captions' : 'Generate captions with AI'}
+            </Button>
+          </DrawerFooter>
+        </div>
+      </DrawerContent>
+    </Drawer>
+  )
+}
+
+function TrimCropButton({ clip, onUpdate }) {
+  const [open, setOpen] = useState(false)
+  const duration = clip.end_time_seconds - clip.start_time_seconds
+  const initialTrim = [
+    clip.trim_start ?? 0,
+    clip.trim_end ?? duration,
+  ]
+  const [trim, setTrim] = useState(initialTrim)
+  const [aspect, setAspect] = useState(clip.crop_aspect || '9:16')
+  const [saving, setSaving] = useState(false)
+
+  async function save() {
+    setSaving(true)
+    try {
+      const r = await fetch(`/api/clips/${clip.id}`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ trim_start: trim[0], trim_end: trim[1], crop_aspect: aspect })
+      })
+      const c = await r.json(); onUpdate(c)
+      toast.success('Trim & crop saved', { description: `${(trim[1] - trim[0]).toFixed(1)}s @ ${aspect}` })
+      setOpen(false)
+    } catch (e) { toast.error('Save failed') }
+    finally { setSaving(false) }
+  }
+
+  const trimmedDuration = (trim[1] - trim[0]).toFixed(1)
+  const aspectMeta = CROP_ASPECTS.find(a => a.value === aspect) || CROP_ASPECTS[0]
+
+  return (
+    <Drawer open={open} onOpenChange={setOpen}>
+      <DrawerTrigger asChild>
+        <Button size="sm" variant="outline" className="flex-1 h-8 px-2 text-xs gap-1">
+          <Scissors className="h-3.5 w-3.5" /> Trim
+        </Button>
+      </DrawerTrigger>
+      <DrawerContent>
+        <div className="mx-auto w-full max-w-2xl">
+          <DrawerHeader>
+            <DrawerTitle>Trim & Crop “{clip.clip_title}”</DrawerTitle>
+            <DrawerDescription>Drag the handles to set the in/out points; pick an aspect ratio for the final crop.</DrawerDescription>
+          </DrawerHeader>
+          <div className="px-4 pb-4 space-y-6">
+            {/* Trim slider */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <Label className="flex items-center gap-1.5"><Scissors className="h-3.5 w-3.5" /> Trim</Label>
+                <span className="text-xs text-muted-foreground tabular-nums">{trim[0].toFixed(1)}s → {trim[1].toFixed(1)}s <span className="ml-1 text-primary font-medium">({trimmedDuration}s final)</span></span>
+              </div>
+              <Slider min={0} max={duration} step={0.1} value={trim} onValueChange={setTrim} minStepsBetweenThumbs={1} />
+              <div className="flex justify-between text-[10px] text-muted-foreground font-mono"><span>0:00</span><span>{Math.floor(duration/60)}:{String(Math.floor(duration%60)).padStart(2,'0')}</span></div>
+            </div>
+
+            {/* Crop aspect */}
+            <div className="space-y-2">
+              <Label className="flex items-center gap-1.5"><Crop className="h-3.5 w-3.5" /> Crop aspect ratio</Label>
+              <div className="grid grid-cols-4 gap-2">
+                {CROP_ASPECTS.map(a => (
+                  <button key={a.value} onClick={() => setAspect(a.value)}
+                    className={`relative rounded-lg border-2 p-3 flex flex-col items-center gap-2 transition-colors ${aspect === a.value ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50'}`}>
+                    <div className={`${a.tw} w-12 bg-muted-foreground/30 rounded-sm`} />
+                    <div className="text-[10px] font-medium">{a.label}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Preview frame */}
+            <div className="flex items-center justify-center bg-zinc-950 rounded-lg p-4">
+              <div className={`${aspectMeta.tw} max-h-48 max-w-full relative overflow-hidden rounded-md border border-border`} style={{aspectRatio: aspect.replace(':','/')}}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={clip.thumbnail_url} alt="" className="h-full w-full object-cover" />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent" />
+                <div className="absolute bottom-2 left-2 right-2 text-white text-xs font-semibold uppercase text-center">{aspectMeta.label}</div>
+              </div>
+            </div>
+          </div>
+          <DrawerFooter>
+            <Button onClick={save} disabled={saving} className="gradient-bg text-white">
+              {saving ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Check className="h-4 w-4 mr-1" />}
+              Save trim & crop
+            </Button>
+          </DrawerFooter>
+        </div>
+      </DrawerContent>
+    </Drawer>
+  )
+}
+
+function PreviewButton({ clip, memes }) {
+  const [open, setOpen] = useState(false)
+  const [playing, setPlaying] = useState(false)
+  const [tick, setTick] = useState(0)
+  const duration = (clip.trim_end ?? (clip.end_time_seconds - clip.start_time_seconds)) - (clip.trim_start ?? 0)
+  const aspect = clip.crop_aspect || '9:16'
+  const aspectMeta = CROP_ASPECTS.find(a => a.value === aspect) || CROP_ASPECTS[0]
+  const captions = clip.captions || []
+  const currentCaption = playing ? captions.find(c => tick >= c.start_time && tick < c.end_time) : null
+  const hookMeme = clip.hook_meme_id ? memes.find(m => m.id === clip.hook_meme_id) : null
+  const inHook = playing && tick < (hookMeme?.duration_seconds || (clip.hook_type === 'text' && clip.hook_text ? 2.5 : 0))
+
+  useEffect(() => {
+    if (!playing) return
+    const i = setInterval(() => setTick(t => {
+      const next = t + 0.1
+      if (next > duration + (hookMeme?.duration_seconds || 0) + 1) { setPlaying(false); return 0 }
+      return next
+    }), 100)
+    return () => clearInterval(i)
+  }, [playing, duration, hookMeme])
+
+  return (
+    <Dialog open={open} onOpenChange={(o)=>{ setOpen(o); if (!o) { setPlaying(false); setTick(0) } }}>
+      <Button size="sm" variant="outline" className="flex-1 h-8 px-2 text-xs gap-1" onClick={()=>setOpen(true)}>
+        <Play className="h-3.5 w-3.5" /> Preview
+      </Button>
+      <DialogContent className="max-w-md p-0 overflow-hidden bg-zinc-950 border-border">
+        <DialogHeader className="px-4 pt-4 pb-2">
+          <DialogTitle className="text-white text-sm">Preview · {clip.clip_title}</DialogTitle>
+          <DialogDescription className="text-xs text-zinc-400">{duration.toFixed(1)}s final · {aspect} · {captions.length > 0 ? `${captions.length} captions` : 'no captions yet'}</DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-center px-4 pb-4">
+          <div className={`relative max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800`} style={{aspectRatio: aspect.replace(':','/'), width: aspect === '16:9' ? '100%' : aspect === '1:1' ? '60%' : '45%'}}>
+            {/* main image or meme during hook phase */}
+            {inHook && hookMeme ? (
+              <>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={hookMeme.thumbnail_url} alt="" className="absolute inset-0 h-full w-full object-cover" />
+                <div className="absolute top-2 left-2 right-2 text-center text-white text-[10px] uppercase tracking-wider bg-primary/80 rounded px-2 py-0.5 font-bold">3s Meme Hook · {hookMeme.name}</div>
+              </>
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={clip.thumbnail_url} alt="" className="absolute inset-0 h-full w-full object-cover" />
+            )}
+            <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-black/40" />
+
+            {/* text hook overlay during first ~2.5s */}
+            {playing && clip.hook_type === 'text' && clip.hook_text && tick < 2.5 && !inHook && (
+              <div className="absolute inset-x-4 top-1/3 text-center text-white text-xl font-black uppercase leading-tight" style={{fontFamily:'Impact, sans-serif', WebkitTextStroke:'1.5px #facc15', textShadow:'0 0 12px #facc1588'}}>
+                {clip.hook_text}
+              </div>
+            )}
+
+            {/* live caption */}
+            {currentCaption && (
+              <div className="absolute bottom-12 left-3 right-3 text-center text-white font-black uppercase leading-tight" style={{fontFamily:'Impact, sans-serif', fontSize:'16px', WebkitTextStroke:'1.5px #000', textShadow:'0 1px 4px rgba(0,0,0,0.8)'}}>
+                {currentCaption.text}
+              </div>
+            )}
+
+            {/* progress bar */}
+            <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/20">
+              <div className="h-full gradient-bg transition-all" style={{ width: `${Math.min(100, (tick / (duration + (hookMeme?.duration_seconds || 0))) * 100)}%` }} />
+            </div>
+
+            {/* play button */}
+            {!playing && (
+              <button onClick={() => { setTick(0); setPlaying(true) }} className="absolute inset-0 flex items-center justify-center group">
+                <div className="h-16 w-16 rounded-full bg-white/90 group-hover:scale-110 transition-transform flex items-center justify-center">
+                  <Play className="h-7 w-7 text-black ml-1" fill="currentColor" />
+                </div>
+              </button>
+            )}
+            {playing && (
+              <button onClick={() => setPlaying(false)} className="absolute top-3 right-3 h-8 w-8 rounded-full bg-black/60 backdrop-blur flex items-center justify-center text-white">
+                <Pause className="h-4 w-4" />
+              </button>
+            )}
+
+            {/* virality badge */}
+            <Badge className="absolute top-3 left-3 bg-emerald-500 text-white border-transparent gap-1"><Flame className="h-3 w-3" /> {clip.virality_score}</Badge>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 
 function HookEditor({ clip, memes, onUpdate, hookLabel, t }) {
   const [hookType, setHookType] = useState(clip.hook_type || 'none')
