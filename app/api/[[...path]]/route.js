@@ -304,7 +304,7 @@ async function handle(request, { params }) {
 
   try {
     // File serving (no DB needed)
-    if (path_.startsWith('/files/') && method === 'GET') {
+    if (path_.startsWith('/files/') && (method === 'GET' || method === 'HEAD')) {
       const sub = segments.slice(1).join('/')
       // Prevent path traversal
       if (sub.includes('..')) return new NextResponse('Bad path', { status: 400 })
@@ -313,8 +313,10 @@ async function handle(request, { params }) {
         const stat = await fs.stat(filePath)
         const ext = path.extname(filePath).slice(1).toLowerCase()
         const mime = { mp4:'video/mp4', webm:'video/webm', mov:'video/quicktime', jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp' }[ext] || 'application/octet-stream'
+        const headers = { 'content-type': mime, 'content-length': String(stat.size), 'cache-control': 'public, max-age=31536000, immutable', 'accept-ranges': 'bytes' }
+        if (method === 'HEAD') return new NextResponse(null, { headers })
         const data = await fs.readFile(filePath)
-        return new NextResponse(data, { headers: { 'content-type': mime, 'content-length': String(stat.size), 'cache-control': 'public, max-age=31536000, immutable' } })
+        return new NextResponse(data, { headers })
       } catch { return new NextResponse('Not found', { status: 404 }) }
     }
 
