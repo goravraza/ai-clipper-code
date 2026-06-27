@@ -8,7 +8,7 @@ import {
   Flame, TrendingUp, Zap, Settings2, Type, Palette, Wand2, Coins,
   Youtube, Instagram, Music2, ShieldCheck, ChevronRight, Loader2, Play,
   Languages, Smile, Pencil, Check, LogIn, LogOut, User as UserIcon,
-  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X,
+  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -862,7 +862,6 @@ function ClipCard({ clip, memes, t, onUpdate }) {
 
   function download() {
     if (clip.storage_url_mp4 && clip.storage_url_mp4.startsWith('/api/files/')) {
-      // real file — trigger browser download
       const a = document.createElement('a')
       a.href = clip.storage_url_mp4
       a.download = `${clip.clip_title.replace(/[^a-z0-9]+/gi, '_')}.mp4`
@@ -871,6 +870,28 @@ function ClipCard({ clip, memes, t, onUpdate }) {
     } else {
       toast.error('This clip has no rendered MP4 yet', { description: 'Use a YouTube URL in the workspace to generate a real clip.' })
     }
+  }
+
+  async function downloadFromR2() {
+    try {
+      let signedUrl = null
+      if (clip.r2_key) {
+        const r = await fetch(`/api/clips/${clip.id}/signed-url`).then(r => r.json())
+        signedUrl = r?.signed_url
+      } else {
+        toast.info('Uploading to Cloudflare R2 (CDN)…')
+        const r = await fetch(`/api/clips/${clip.id}/upload-to-r2`, { method: 'POST' }).then(r => r.json())
+        if (!r.ok) throw new Error(r.error || 'R2 upload failed')
+        signedUrl = r.signed_url
+        toast.success(`Uploaded ${(r.size / 1024 / 1024).toFixed(1)} MB to R2 — link valid 7 days`)
+      }
+      if (signedUrl) {
+        const a = document.createElement('a')
+        a.href = signedUrl; a.target = '_blank'; a.rel = 'noopener'
+        a.download = `${clip.clip_title.replace(/[^a-z0-9]+/gi, '_')}.mp4`
+        document.body.appendChild(a); a.click(); a.remove()
+      }
+    } catch (e) { toast.error('R2 download failed', { description: e.message }) }
   }
 
   const score = clip.virality_score
@@ -928,6 +949,11 @@ function ClipCard({ clip, memes, t, onUpdate }) {
           <Button size="sm" variant="outline" className="flex-1" onClick={download}>
             <Download className="h-3.5 w-3.5 mr-1" /> MP4
           </Button>
+          {clip.storage_url_mp4?.startsWith('/api/files/') && (
+            <Button size="sm" variant="outline" className="flex-1" onClick={downloadFromR2} title="Upload to Cloudflare R2 and get a 7-day shareable signed URL">
+              <Cloud className="h-3.5 w-3.5 mr-1" /> {clip.r2_key ? 'R2 Link' : 'To R2'}
+            </Button>
+          )}
           <Drawer>
             <DrawerTrigger asChild>
               <Button size="sm" className="flex-1 gradient-bg text-white hover:opacity-90">
