@@ -95,6 +95,24 @@ const INTEGRATIONS = [
     ],
     docsUrl: 'https://developer.paypal.com/dashboard/applications',
   },
+  {
+    provider: 'http_proxy', name: 'HTTP Proxy (for YouTube)', category: 'infra', icon: Key,
+    description: 'Residential / datacenter HTTP proxy used by yt-dlp + ffmpeg to bypass YouTube IP blocks. Required for YouTube URL ingestion. Format: http(s)://user:pass@host:port',
+    fields: [
+      { key: 'proxy_url', label: 'Proxy URL', type: 'password', placeholder: 'http://user:pass@host:port' },
+      { key: 'notes', label: 'Provider / notes (optional)', type: 'text', placeholder: 'BrightData, Oxylabs, Smartproxy, etc.' },
+    ],
+    docsUrl: 'https://brightdata.com/proxy-types/residential-proxies',
+  },
+  {
+    provider: 'rapidapi_yt', name: 'RapidAPI YouTube Downloader', category: 'infra', icon: Key,
+    description: 'Fallback YouTube downloader API. Used when no HTTP proxy is configured. Note: returned signed URLs may be IP-locked.',
+    fields: [
+      { key: 'api_key', label: 'RapidAPI Key', type: 'password', placeholder: 'rapidapi key' },
+      { key: 'host', label: 'Host', type: 'text', placeholder: 'youtube-media-downloader.p.rapidapi.com' },
+    ],
+    docsUrl: 'https://rapidapi.com/ytjar/api/youtube-media-downloader',
+  },
 ]
 
 export default function AdminPage() {
@@ -221,6 +239,16 @@ export default function AdminPage() {
                 <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2"><CreditCard className="h-4 w-4" /> Payment Gateways</h2>
                 <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
                   {INTEGRATIONS.filter(i => i.category === 'payment').map(meta => (
+                    <IntegrationCard key={meta.provider} meta={meta} existing={integrations.find(x => x.provider === meta.provider)} onSave={saveIntegration} onDelete={deleteIntegration} />
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2"><Key className="h-4 w-4" /> Infrastructure & Downloaders</h2>
+                <p className="text-xs text-muted-foreground mb-3">Configure HTTP proxy and/or RapidAPI YouTube downloader to enable YouTube URL ingestion. Without one of these configured, YouTube ingestion will fail with 403 (datacenter IP block).</p>
+                <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  {INTEGRATIONS.filter(i => i.category === 'infra').map(meta => (
                     <IntegrationCard key={meta.provider} meta={meta} existing={integrations.find(x => x.provider === meta.provider)} onSave={saveIntegration} onDelete={deleteIntegration} />
                   ))}
                 </div>

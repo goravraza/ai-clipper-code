@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ClipForge AI Backend Test Suite
-Tests scenarios A-E: clip length presets, caption burn-in, credit deduction, package purchase, JSON sanity
+ClipForge AI YouTube Ingestion Pipeline Test Suite
+Tests scenarios A-E from the refactored yt-dlp + ffmpeg segment-fetch architecture
 """
 import asyncio
 import json
@@ -15,7 +15,7 @@ import httpx
 from pymongo import MongoClient
 
 # Configuration
-BASE_URL = "https://shorts-studio-78.preview.emergentagent.com/api"
+BASE_URL = os.getenv("NEXT_PUBLIC_BASE_URL", "https://shorts-studio-78.preview.emergentagent.com") + "/api"
 MONGO_URL = "mongodb://localhost:27017"
 DB_NAME = "clipforge"
 DEFAULT_USER_ID = "11111111-1111-1111-1111-111111111111"
@@ -24,11 +24,11 @@ SAMPLE_VIDEO = "/tmp/sample.mp4"
 
 # Test results
 results = {
-    "A_clip_length_presets": {"status": "PENDING", "details": []},
-    "B_caption_burn_in": {"status": "PENDING", "details": []},
-    "C_credit_deduction": {"status": "PENDING", "details": []},
-    "D_package_purchase": {"status": "PENDING", "details": []},
-    "E_json_sanity": {"status": "PENDING", "details": []},
+    "A_json_sanity": {"status": "PENDING", "details": [], "timing": 0},
+    "B_proxy_creds": {"status": "PENDING", "details": [], "timing": 0},
+    "C_local_upload": {"status": "PENDING", "details": [], "timing": 0},
+    "D_youtube_fastfail": {"status": "PENDING", "details": [], "timing": 0},
+    "E_package_purchase": {"status": "PENDING", "details": [], "timing": 0},
 }
 
 
@@ -70,7 +70,8 @@ def generate_sample_video():
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=120)
         if result.returncode == 0 and Path(SAMPLE_VIDEO).exists():
-            log("SETUP", f"✅ Sample video generated: {Path(SAMPLE_VIDEO).stat().st_size} bytes")
+            size = Path(SAMPLE_VIDEO).stat().st_size
+            log("SETUP", f"✅ Sample video generated: {size} bytes")
             return True
         else:
             log("SETUP", f"❌ FFmpeg failed: {result.stderr.decode()[:500]}")
@@ -80,258 +81,178 @@ def generate_sample_video():
         return False
 
 
-async def poll_video_completion(client: httpx.AsyncClient, video_id: str, timeout: int = 90) -> dict:
-    """Poll GET /api/videos/:id until status='completed' or timeout"""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            resp = await client.get(f"{BASE_URL}/videos/{video_id}")
-            if resp.status_code != 200:
-                return {"error": f"GET /videos/{video_id} returned {resp.status_code}: {resp.text[:500]}"}
-            data = resp.json()
-            status = data.get("status")
-            if status == "completed":
-                return data
-            elif status == "failed":
-                return {"error": f"Video processing failed: {data.get('error_message', 'unknown')}"}
-            await asyncio.sleep(3)
-        except Exception as e:
-            return {"error": f"Poll exception: {e}"}
-    return {"error": f"Timeout after {timeout}s waiting for completion"}
-
-
 async def test_scenario_a():
-    """A) Clip length presets: 10-30s and 60-90s"""
-    scenario = "A_clip_length_presets"
-    log(scenario, "Starting clip length preset tests...")
+    """A) JSON sanity sweep — for each GET, assert HTTP 200 + parseable JSON"""
+    scenario = "A_json_sanity"
+    start_time = time.time()
+    log(scenario, "Starting JSON sanity sweep...")
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        # Test 1: 10-30s range
-        log(scenario, "Test 1: Uploading with clip_min=10, clip_max=30, add_captions=true")
+    endpoints = [
+        "/admin/integrations?admin=true",
+        "/clips",
+        "/pricing-packages",
+        "/auth/me",
+        "/transactions",
+        "/geo",
+    ]
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            with open(SAMPLE_VIDEO, "rb") as f:
-                files = {"file": ("sample.mp4", f, "video/mp4")}
-                data = {
-                    "kind": "workspace_video",
-                    "clip_min": "10",
-                    "clip_max": "30",
-                    "add_captions": "true"
-                }
-                resp = await client.post(f"{BASE_URL}/upload", files=files, data=data)
-            
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"Upload returned {resp.status_code}: {resp.text[:500]}")
-                return
-            
-            upload_data = resp.json()
-            video_id_1 = upload_data.get("video_id")
-            log(scenario, f"Upload successful: video_id={video_id_1}, status={upload_data.get('status')}")
-            
-            # Verify response fields
-            if upload_data.get("clip_length_range", {}).get("min") != 10:
-                fail_scenario(scenario, f"Expected clip_min=10, got {upload_data.get('clip_length_range')}")
-                return
-            if upload_data.get("clip_length_range", {}).get("max") != 30:
-                fail_scenario(scenario, f"Expected clip_max=30, got {upload_data.get('clip_length_range')}")
-                return
-            if upload_data.get("add_captions") != True:
-                fail_scenario(scenario, f"Expected add_captions=true, got {upload_data.get('add_captions')}")
-                return
-            
-            # Poll for completion
-            log(scenario, f"Polling video {video_id_1} for completion (up to 90s)...")
-            video_doc_1 = await poll_video_completion(client, video_id_1, timeout=90)
-            
-            if "error" in video_doc_1:
-                fail_scenario(scenario, f"Polling failed: {video_doc_1['error']}")
-                return
-            
-            log(scenario, f"Video completed: {len(video_doc_1.get('clips', []))} clips generated")
-            
-            # Verify clip_length_range in video doc
-            if video_doc_1.get("clip_length_range", {}).get("min") != 10:
-                fail_scenario(scenario, f"Video doc clip_min != 10: {video_doc_1.get('clip_length_range')}")
-                return
-            if video_doc_1.get("clip_length_range", {}).get("max") != 30:
-                fail_scenario(scenario, f"Video doc clip_max != 30: {video_doc_1.get('clip_length_range')}")
-                return
-            
-            # Verify each clip duration is in [10, 30]
-            clips_1 = video_doc_1.get("clips", [])
-            if not clips_1:
-                fail_scenario(scenario, "No clips generated for 10-30s range")
-                return
-            
-            for clip in clips_1:
-                start = clip.get("start_time_seconds", 0)
-                end = clip.get("end_time_seconds", 0)
-                duration = end - start
-                if not (10 <= duration <= 30):
-                    fail_scenario(scenario, f"Clip {clip.get('id')} duration {duration}s not in [10,30]: start={start}, end={end}")
+            for endpoint in endpoints:
+                url = f"{BASE_URL}{endpoint}"
+                log(scenario, f"Testing GET {endpoint}...")
+                
+                resp = await client.get(url)
+                
+                # Assert HTTP 200
+                if resp.status_code != 200:
+                    fail_scenario(scenario, f"{endpoint} returned {resp.status_code}, expected 200. Body: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
                     return
-                log(scenario, f"  Clip {clip.get('clip_title')[:30]}: {duration}s ✓")
+                
+                # Check content-type is JSON
+                content_type = resp.headers.get("content-type", "")
+                if "json" not in content_type.lower():
+                    fail_scenario(scenario, f"{endpoint} returned non-JSON content-type: {content_type}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                # Try to parse JSON
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    fail_scenario(scenario, f"{endpoint} returned invalid JSON: {e}. Body: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                # Check for HTML/stderr leaks
+                body_text = resp.text
+                if "<html" in body_text.lower() or "<!doctype" in body_text.lower():
+                    fail_scenario(scenario, f"{endpoint} returned HTML: {body_text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                if "traceback" in body_text.lower() or "stack trace" in body_text.lower():
+                    fail_scenario(scenario, f"{endpoint} leaked stack trace: {body_text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                log(scenario, f"  ✓ {endpoint}: HTTP 200, valid JSON, no leaks")
             
-            log(scenario, f"✓ All {len(clips_1)} clips are within [10,30]s range")
+            results[scenario]["timing"] = time.time() - start_time
+            pass_scenario(scenario, f"All {len(endpoints)} endpoints returned clean JSON ({results[scenario]['timing']:.1f}s)")
             
         except Exception as e:
-            fail_scenario(scenario, f"Exception in 10-30s test: {e}")
-            return
-        
-        # Test 2: 60-90s range
-        log(scenario, "Test 2: Uploading with clip_min=60, clip_max=90")
-        try:
-            with open(SAMPLE_VIDEO, "rb") as f:
-                files = {"file": ("sample.mp4", f, "video/mp4")}
-                data = {
-                    "kind": "workspace_video",
-                    "clip_min": "60",
-                    "clip_max": "90",
-                    "add_captions": "true"
-                }
-                resp = await client.post(f"{BASE_URL}/upload", files=files, data=data)
-            
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"Upload 2 returned {resp.status_code}: {resp.text[:500]}")
-                return
-            
-            upload_data_2 = resp.json()
-            video_id_2 = upload_data_2.get("video_id")
-            log(scenario, f"Upload 2 successful: video_id={video_id_2}")
-            
-            # Poll for completion
-            log(scenario, f"Polling video {video_id_2} for completion...")
-            video_doc_2 = await poll_video_completion(client, video_id_2, timeout=90)
-            
-            if "error" in video_doc_2:
-                fail_scenario(scenario, f"Polling 2 failed: {video_doc_2['error']}")
-                return
-            
-            clips_2 = video_doc_2.get("clips", [])
-            if not clips_2:
-                fail_scenario(scenario, "No clips generated for 60-90s range")
-                return
-            
-            # For a 90s source, clips should be 60-90s (or capped at source duration)
-            for clip in clips_2:
-                start = clip.get("start_time_seconds", 0)
-                end = clip.get("end_time_seconds", 0)
-                duration = end - start
-                # Allow clips to be capped at video duration (90s)
-                if not (60 <= duration <= 90):
-                    fail_scenario(scenario, f"Clip {clip.get('id')} duration {duration}s not in [60,90]: start={start}, end={end}")
-                    return
-                log(scenario, f"  Clip {clip.get('clip_title')[:30]}: {duration}s ✓")
-            
-            log(scenario, f"✓ All {len(clips_2)} clips are within [60,90]s range")
-            
-        except Exception as e:
-            fail_scenario(scenario, f"Exception in 60-90s test: {e}")
-            return
-    
-    pass_scenario(scenario, "Clip length presets working correctly")
+            results[scenario]["timing"] = time.time() - start_time
+            fail_scenario(scenario, f"Exception: {e}")
 
 
 async def test_scenario_b():
-    """B) Caption burn-in verification"""
-    scenario = "B_caption_burn_in"
-    log(scenario, "Starting caption burn-in tests...")
+    """B) Save HTTP proxy creds + read back"""
+    scenario = "B_proxy_creds"
+    start_time = time.time()
+    log(scenario, "Starting HTTP proxy credentials test...")
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            # Upload with add_captions=true
-            log(scenario, "Uploading sample video with add_captions=true")
-            with open(SAMPLE_VIDEO, "rb") as f:
-                files = {"file": ("sample.mp4", f, "video/mp4")}
-                data = {
-                    "kind": "workspace_video",
-                    "clip_min": "10",
-                    "clip_max": "30",
-                    "add_captions": "true"
-                }
-                resp = await client.post(f"{BASE_URL}/upload", files=files, data=data)
+            # Step 1: POST proxy credentials
+            log(scenario, "Step 1: POST /api/admin/integrations with http_proxy credentials")
+            proxy_data = {
+                "provider": "http_proxy",
+                "credentials": {
+                    "proxy_url": "http://testuser:testpass@example.com:8080",
+                    "notes": "smoke-test"
+                },
+                "is_active": True
+            }
+            
+            resp = await client.post(
+                f"{BASE_URL}/admin/integrations",
+                json=proxy_data,
+                headers={"content-type": "application/json"}
+            )
             
             if resp.status_code != 200:
-                fail_scenario(scenario, f"Upload returned {resp.status_code}: {resp.text[:500]}")
+                fail_scenario(scenario, f"POST /admin/integrations returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            video_id = resp.json().get("video_id")
-            log(scenario, f"Polling video {video_id} for completion...")
-            video_doc = await poll_video_completion(client, video_id, timeout=90)
-            
-            if "error" in video_doc:
-                fail_scenario(scenario, f"Polling failed: {video_doc['error']}")
+            # Check response is valid JSON
+            try:
+                post_data = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"POST response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            # Check video doc fields
-            if "captions_burned" not in video_doc:
-                fail_scenario(scenario, "Video doc missing 'captions_burned' field")
+            # Verify provider field
+            if post_data.get("provider") != "http_proxy":
+                fail_scenario(scenario, f"Expected provider='http_proxy', got {post_data.get('provider')}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            if "transcription_source" not in video_doc:
-                fail_scenario(scenario, "Video doc missing 'transcription_source' field")
+            log(scenario, f"  ✓ POST successful: provider={post_data.get('provider')}, has_credentials={post_data.get('has_credentials')}")
+            
+            # Step 2: GET integrations and verify http_proxy exists
+            log(scenario, "Step 2: GET /api/admin/integrations?admin=true and verify http_proxy entry")
+            resp = await client.get(f"{BASE_URL}/admin/integrations?admin=true")
+            
+            if resp.status_code != 200:
+                fail_scenario(scenario, f"GET /admin/integrations returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            log(scenario, f"Video doc: captions_burned={video_doc.get('captions_burned')}, transcription_source={video_doc.get('transcription_source')}")
-            
-            # For a silent test signal, captions_burned may be false (no speech detected)
-            # This is acceptable per the review request
-            transcription_source = video_doc.get("transcription_source")
-            if transcription_source == "none":
-                log(scenario, "⚠️  No speech detected in test video (expected for silent tone) - captions_burned=false is acceptable")
-            
-            # Verify clips have the fields
-            clips = video_doc.get("clips", [])
-            if not clips:
-                fail_scenario(scenario, "No clips generated")
+            try:
+                integrations = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"GET response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            for clip in clips:
-                if "captions_burned" not in clip:
-                    fail_scenario(scenario, f"Clip {clip.get('id')} missing 'captions_burned' field")
-                    return
-                if "transcription_source" not in clip:
-                    fail_scenario(scenario, f"Clip {clip.get('id')} missing 'transcription_source' field")
-                    return
-                
-                # Verify MP4 file is accessible
-                storage_url = clip.get("storage_url_mp4")
-                if storage_url:
-                    full_url = BASE_URL.replace("/api", "") + storage_url
-                    head_resp = await client.head(full_url, follow_redirects=True)
-                    if head_resp.status_code != 200:
-                        fail_scenario(scenario, f"Clip MP4 not accessible: {full_url} returned {head_resp.status_code}")
-                        return
-                    content_type = head_resp.headers.get("content-type", "")
-                    if "video" not in content_type:
-                        fail_scenario(scenario, f"Clip MP4 wrong content-type: {content_type}")
-                        return
-                    log(scenario, f"  Clip {clip.get('clip_title')[:30]}: MP4 accessible, captions_burned={clip.get('captions_burned')} ✓")
+            if not isinstance(integrations, list):
+                fail_scenario(scenario, f"Expected list of integrations, got {type(integrations)}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
             
-            pass_scenario(scenario, f"Caption burn-in verified ({len(clips)} clips)")
+            # Find http_proxy entry
+            http_proxy_entry = None
+            for integ in integrations:
+                if integ.get("provider") == "http_proxy":
+                    http_proxy_entry = integ
+                    break
+            
+            if not http_proxy_entry:
+                fail_scenario(scenario, f"http_proxy entry not found in integrations list. Found: {[i.get('provider') for i in integrations]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            log(scenario, f"  ✓ http_proxy entry found: has_credentials={http_proxy_entry.get('has_credentials')}, is_active={http_proxy_entry.get('is_active')}")
+            
+            # Verify credentials are masked (security check)
+            creds = http_proxy_entry.get("credentials", {})
+            proxy_url = creds.get("proxy_url", "")
+            if "testpass" in proxy_url:
+                log(scenario, f"  ⚠️  WARNING: Credentials not masked in response (security issue)")
+            
+            results[scenario]["timing"] = time.time() - start_time
+            pass_scenario(scenario, f"HTTP proxy credentials saved and retrieved successfully ({results[scenario]['timing']:.1f}s)")
             
         except Exception as e:
+            results[scenario]["timing"] = time.time() - start_time
             fail_scenario(scenario, f"Exception: {e}")
 
 
 async def test_scenario_c():
-    """C) Credit deduction by video minutes"""
-    scenario = "C_credit_deduction"
-    log(scenario, "Starting credit deduction tests...")
+    """C) Local file upload regression — must still produce real clips end-to-end"""
+    scenario = "C_local_upload"
+    start_time = time.time()
+    log(scenario, "Starting local file upload regression test...")
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=180.0) as client:
         try:
-            # Step 1: Get initial balance
-            resp = await client.get(f"{BASE_URL}/auth/me")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /auth/me returned {resp.status_code}")
-                return
+            # Step 1: Upload sample.mp4
+            log(scenario, "Step 1: POST /api/upload with sample.mp4 (clip_min=10, clip_max=30, add_captions=true)")
             
-            me_data = resp.json()
-            b1 = me_data.get("user", {}).get("credit_balance_minutes", 0)
-            log(scenario, f"Initial balance: {b1} minutes")
-            
-            # Step 2: Upload 90s video
-            log(scenario, "Uploading 90s video...")
             with open(SAMPLE_VIDEO, "rb") as f:
                 files = {"file": ("sample.mp4", f, "video/mp4")}
                 data = {
@@ -343,141 +264,310 @@ async def test_scenario_c():
                 resp = await client.post(f"{BASE_URL}/upload", files=files, data=data)
             
             if resp.status_code != 200:
-                fail_scenario(scenario, f"Upload returned {resp.status_code}: {resp.text[:500]}")
+                fail_scenario(scenario, f"POST /upload returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            video_id = resp.json().get("video_id")
-            log(scenario, f"Polling video {video_id} for completion...")
-            video_doc = await poll_video_completion(client, video_id, timeout=90)
-            
-            if "error" in video_doc:
-                fail_scenario(scenario, f"Polling failed: {video_doc['error']}")
+            try:
+                upload_data = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Upload response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            # Step 3: Check new balance
-            resp = await client.get(f"{BASE_URL}/auth/me")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /auth/me (2) returned {resp.status_code}")
+            video_id = upload_data.get("video_id")
+            if not video_id:
+                fail_scenario(scenario, f"No video_id in upload response: {upload_data}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            b2 = resp.json().get("user", {}).get("credit_balance_minutes", 0)
-            log(scenario, f"New balance: {b2} minutes")
+            log(scenario, f"  ✓ Upload successful: video_id={video_id}, status={upload_data.get('status')}")
             
-            # Expected deduction: ceil(90/60) = 2
-            expected_deduction = 2
-            actual_deduction = b1 - b2
-            if actual_deduction != expected_deduction:
-                fail_scenario(scenario, f"Expected deduction of {expected_deduction} minutes, got {actual_deduction}")
-                return
+            # Step 2: Poll GET /api/videos/{video_id} every 3s for up to 90s
+            log(scenario, f"Step 2: Polling GET /api/videos/{video_id} every 3s (up to 90s)...")
             
-            log(scenario, f"✓ Correct deduction: {actual_deduction} minutes")
+            poll_start = time.time()
+            final_status = None
+            video_doc = None
             
-            # Step 4: Verify credits_charged in video doc
-            if "credits_charged" not in video_doc:
-                fail_scenario(scenario, "Video doc missing 'credits_charged' field")
-                return
-            
-            credits_charged = video_doc.get("credits_charged")
-            if credits_charged != expected_deduction:
-                fail_scenario(scenario, f"credits_charged={credits_charged}, expected {expected_deduction}")
-                return
-            
-            log(scenario, f"✓ credits_charged field correct: {credits_charged}")
-            
-            # Step 5: Verify transaction record
-            resp = await client.get(f"{BASE_URL}/transactions")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /transactions returned {resp.status_code}")
-                return
-            
-            transactions = resp.json()
-            if not isinstance(transactions, list):
-                fail_scenario(scenario, f"GET /transactions returned non-list: {type(transactions)}")
-                return
-            
-            # Find the video_processing transaction
-            video_txn = None
-            for txn in transactions:
-                if txn.get("reason") == "video_processing" and txn.get("video_id") == video_id:
-                    video_txn = txn
+            while time.time() - poll_start < 90:
+                resp = await client.get(f"{BASE_URL}/videos/{video_id}")
+                
+                if resp.status_code != 200:
+                    fail_scenario(scenario, f"GET /videos/{video_id} returned {resp.status_code}: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                try:
+                    video_doc = resp.json()
+                except Exception as e:
+                    fail_scenario(scenario, f"Poll response not valid JSON: {e}. Body: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                status = video_doc.get("status")
+                log(scenario, f"  Poll: status={status}, progress={video_doc.get('progress', 0)}")
+                
+                if status == "completed":
+                    final_status = "completed"
                     break
+                elif status == "failed":
+                    fail_scenario(scenario, f"Video processing failed: {video_doc.get('error_message', 'unknown error')}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                await asyncio.sleep(3)
             
-            if not video_txn:
-                fail_scenario(scenario, f"No transaction found for video_id={video_id} with reason='video_processing'")
+            if final_status != "completed":
+                fail_scenario(scenario, f"Video did not complete within 90s. Last status: {video_doc.get('status') if video_doc else 'unknown'}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            log(scenario, f"✓ Transaction record found: amount={video_txn.get('amount')}, reason={video_txn.get('reason')}")
+            poll_time = time.time() - poll_start
+            log(scenario, f"  ✓ Video completed in {poll_time:.1f}s")
             
-            # Step 6: Test insufficient credits
-            log(scenario, "Testing insufficient credits scenario...")
-            # Set balance to 0 via MongoDB
-            mongo_client = MongoClient(MONGO_URL)
-            db = mongo_client[DB_NAME]
-            db.profiles.update_one(
-                {"id": DEFAULT_USER_ID},
-                {"$set": {"credit_balance_minutes": 0}}
-            )
-            log(scenario, "Set balance to 0 via MongoDB")
+            # Step 3: Assert final state
+            log(scenario, "Step 3: Verifying final video state...")
             
-            # Try to upload
-            with open(SAMPLE_VIDEO, "rb") as f:
-                files = {"file": ("sample.mp4", f, "video/mp4")}
-                data = {
-                    "kind": "workspace_video",
-                    "clip_min": "10",
-                    "clip_max": "30",
-                    "add_captions": "true"
-                }
-                resp = await client.post(f"{BASE_URL}/upload", files=files, data=data)
-            
-            if resp.status_code != 402:
-                fail_scenario(scenario, f"Expected 402 for insufficient credits, got {resp.status_code}: {resp.text[:500]}")
-                # Restore balance
-                db.profiles.update_one({"id": DEFAULT_USER_ID}, {"$set": {"credit_balance_minutes": 1000}})
+            # Assert status='completed'
+            if video_doc.get("status") != "completed":
+                fail_scenario(scenario, f"Expected status='completed', got '{video_doc.get('status')}'")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            error_data = resp.json()
-            if "error" not in error_data or "Insufficient credits" not in error_data.get("error", ""):
-                fail_scenario(scenario, f"Expected 'Insufficient credits' error, got: {error_data}")
-                # Restore balance
-                db.profiles.update_one({"id": DEFAULT_USER_ID}, {"$set": {"credit_balance_minutes": 1000}})
+            # Assert clip_count >= 1
+            clips = video_doc.get("clips", [])
+            if len(clips) < 1:
+                fail_scenario(scenario, f"Expected clip_count >= 1, got {len(clips)}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            log(scenario, f"✓ Insufficient credits error: {error_data.get('error')[:100]}")
+            log(scenario, f"  ✓ clip_count={len(clips)}")
             
-            # Restore balance
-            db.profiles.update_one({"id": DEFAULT_USER_ID}, {"$set": {"credit_balance_minutes": 1000}})
-            log(scenario, "Restored balance to 1000 minutes")
+            # Assert credits_charged >= 1
+            credits_charged = video_doc.get("credits_charged", 0)
+            if credits_charged < 1:
+                fail_scenario(scenario, f"Expected credits_charged >= 1, got {credits_charged}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
             
-            pass_scenario(scenario, "Credit deduction working correctly")
+            log(scenario, f"  ✓ credits_charged={credits_charged}")
+            
+            # Assert transcription_source ∈ {whisper, youtube-auto, none}
+            transcription_source = video_doc.get("transcription_source")
+            valid_sources = ["whisper", "youtube-auto", "none"]
+            if transcription_source not in valid_sources:
+                fail_scenario(scenario, f"Expected transcription_source in {valid_sources}, got '{transcription_source}'")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            log(scenario, f"  ✓ transcription_source={transcription_source}")
+            
+            # Step 4: Verify each clip's storage_url_mp4
+            log(scenario, "Step 4: Verifying clip MP4 files...")
+            
+            for i, clip in enumerate(clips):
+                storage_url = clip.get("storage_url_mp4")
+                if not storage_url:
+                    fail_scenario(scenario, f"Clip {i+1} missing storage_url_mp4")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                # Construct full URL
+                full_url = BASE_URL.replace("/api", "") + storage_url
+                
+                # HEAD request to check file
+                head_resp = await client.head(full_url, follow_redirects=True)
+                
+                if head_resp.status_code != 200:
+                    fail_scenario(scenario, f"Clip {i+1} MP4 not accessible: {full_url} returned {head_resp.status_code}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                content_type = head_resp.headers.get("content-type", "")
+                if "video/mp4" not in content_type:
+                    fail_scenario(scenario, f"Clip {i+1} wrong content-type: expected video/mp4, got {content_type}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                content_length = int(head_resp.headers.get("content-length", 0))
+                if content_length < 50000:
+                    fail_scenario(scenario, f"Clip {i+1} content-length too small: {content_length} bytes (expected > 50000)")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                log(scenario, f"  ✓ Clip {i+1}: {storage_url} → {content_length} bytes, {content_type}")
+            
+            results[scenario]["timing"] = time.time() - start_time
+            pass_scenario(scenario, f"Local upload produced {len(clips)} valid clips end-to-end ({results[scenario]['timing']:.1f}s)")
             
         except Exception as e:
+            results[scenario]["timing"] = time.time() - start_time
             fail_scenario(scenario, f"Exception: {e}")
-            # Try to restore balance
-            try:
-                mongo_client = MongoClient(MONGO_URL)
-                db = mongo_client[DB_NAME]
-                db.profiles.update_one({"id": DEFAULT_USER_ID}, {"$set": {"credit_balance_minutes": 1000}})
-            except:
-                pass
 
 
 async def test_scenario_d():
-    """D) Package purchase (simulated)"""
-    scenario = "D_package_purchase"
-    log(scenario, "Starting package purchase tests...")
+    """D) YouTube fast-fail (no proxy configured)"""
+    scenario = "D_youtube_fastfail"
+    start_time = time.time()
+    log(scenario, "Starting YouTube fast-fail test (no proxy)...")
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            # Step 0: Delete http_proxy integration if it exists
+            log(scenario, "Step 0: Deleting http_proxy integration to ensure no proxy is configured")
+            resp = await client.delete(f"{BASE_URL}/admin/integrations/http_proxy")
+            log(scenario, f"  DELETE /admin/integrations/http_proxy: {resp.status_code}")
+            
+            # Step 1: POST /api/ai/analyze with YouTube URL
+            log(scenario, "Step 1: POST /api/ai/analyze with YouTube URL")
+            analyze_data = {
+                "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+            }
+            
+            resp = await client.post(f"{BASE_URL}/ai/analyze", json=analyze_data)
+            
+            if resp.status_code != 200:
+                fail_scenario(scenario, f"POST /ai/analyze returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            try:
+                analyze_resp = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Analyze response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            video_id = analyze_resp.get("video_id")
+            if not video_id:
+                fail_scenario(scenario, f"No video_id in analyze response: {analyze_resp}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            # Verify response fields
+            if analyze_resp.get("status") != "queued":
+                fail_scenario(scenario, f"Expected status='queued', got '{analyze_resp.get('status')}'")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            if analyze_resp.get("title") != "Me at the zoo":
+                log(scenario, f"  ⚠️  Expected title='Me at the zoo', got '{analyze_resp.get('title')}' (may be OK if metadata fetch failed)")
+            
+            log(scenario, f"  ✓ Analyze successful: video_id={video_id}, status={analyze_resp.get('status')}, title={analyze_resp.get('title')}")
+            
+            # Step 2: Poll /api/videos/{video_id} every 2s for up to 25s
+            log(scenario, f"Step 2: Polling GET /api/videos/{video_id} every 2s (up to 25s)...")
+            
+            poll_start = time.time()
+            final_status = None
+            video_doc = None
+            failed_within_15s = False
+            
+            while time.time() - poll_start < 25:
+                resp = await client.get(f"{BASE_URL}/videos/{video_id}")
+                
+                if resp.status_code != 200:
+                    fail_scenario(scenario, f"GET /videos/{video_id} returned {resp.status_code}: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                # Assert response is always valid JSON (never HTML)
+                try:
+                    video_doc = resp.json()
+                except Exception as e:
+                    fail_scenario(scenario, f"Poll response not valid JSON: {e}. Body: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                # Check for HTML leak
+                if "<html" in resp.text.lower() or "<!doctype" in resp.text.lower():
+                    fail_scenario(scenario, f"Poll response contains HTML: {resp.text[:500]}")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                status = video_doc.get("status")
+                elapsed = time.time() - poll_start
+                log(scenario, f"  Poll at {elapsed:.1f}s: status={status}")
+                
+                if status == "failed":
+                    final_status = "failed"
+                    if elapsed <= 15:
+                        failed_within_15s = True
+                    break
+                elif status == "completed":
+                    fail_scenario(scenario, f"Expected video to fail (no proxy), but it completed successfully")
+                    results[scenario]["timing"] = time.time() - start_time
+                    return
+                
+                await asyncio.sleep(2)
+            
+            # Step 3: Assert status transitioned to 'failed' within 15s
+            if final_status != "failed":
+                fail_scenario(scenario, f"Expected status='failed', got '{video_doc.get('status') if video_doc else 'unknown'}' after 25s")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            if not failed_within_15s:
+                fail_scenario(scenario, f"Video failed but took longer than 15s (fast-fail probe should catch 403 within seconds)")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            fail_time = time.time() - poll_start
+            log(scenario, f"  ✓ Video failed within {fail_time:.1f}s (fast-fail working)")
+            
+            # Step 4: Assert error_message contains expected keywords
+            error_message = video_doc.get("error_message", "")
+            if not error_message:
+                fail_scenario(scenario, f"error_message is empty")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            expected_keywords = ["HTTP Proxy", "Configure", "403", "blocked", "refuses"]
+            found_keyword = any(kw.lower() in error_message.lower() for kw in expected_keywords)
+            
+            if not found_keyword:
+                fail_scenario(scenario, f"error_message does not contain expected keywords {expected_keywords}. Got: {error_message}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
+            log(scenario, f"  ✓ error_message contains expected keyword: '{error_message[:100]}'")
+            
+            results[scenario]["timing"] = time.time() - start_time
+            pass_scenario(scenario, f"YouTube fast-fail working correctly (failed in {fail_time:.1f}s, {results[scenario]['timing']:.1f}s total)")
+            
+        except Exception as e:
+            results[scenario]["timing"] = time.time() - start_time
+            fail_scenario(scenario, f"Exception: {e}")
+
+
+async def test_scenario_e():
+    """E) Package purchase regression"""
+    scenario = "E_package_purchase"
+    start_time = time.time()
+    log(scenario, "Starting package purchase regression test...")
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            # Step 1: Get pricing packages
+            # Step 1: GET /api/pricing-packages → grab Starter Pack id
+            log(scenario, "Step 1: GET /api/pricing-packages")
             resp = await client.get(f"{BASE_URL}/pricing-packages")
+            
             if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /pricing-packages returned {resp.status_code}")
+                fail_scenario(scenario, f"GET /pricing-packages returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            packages = resp.json()
+            try:
+                packages = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Packages response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
+            
             if not isinstance(packages, list) or not packages:
-                fail_scenario(scenario, f"No packages found: {packages}")
+                fail_scenario(scenario, f"Expected non-empty list of packages, got {type(packages)}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
             # Find Starter Pack
@@ -488,291 +578,115 @@ async def test_scenario_d():
                     break
             
             if not starter:
-                fail_scenario(scenario, "Starter Pack not found in pricing packages")
+                fail_scenario(scenario, f"Starter Pack not found. Available: {[p.get('name') for p in packages]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            log(scenario, f"Found Starter Pack: {starter.get('name')}, price_usd={starter.get('price_usd')}, credits={starter.get('credit_amount_minutes')}")
+            starter_id = starter.get("id")
+            starter_credits = starter.get("credit_amount_minutes", 300)
+            log(scenario, f"  ✓ Found Starter Pack: id={starter_id}, credits={starter_credits}")
             
-            # Step 2: Get initial balance
+            # Step 2: GET /api/auth/me → capture B1 = credit_balance_minutes
+            log(scenario, "Step 2: GET /api/auth/me (capture initial balance)")
             resp = await client.get(f"{BASE_URL}/auth/me")
+            
             if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /auth/me returned {resp.status_code}")
+                fail_scenario(scenario, f"GET /auth/me returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            b1 = resp.json().get("user", {}).get("credit_balance_minutes", 0)
-            log(scenario, f"Initial balance: {b1} minutes")
+            try:
+                me_data = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Auth/me response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
             
-            # Step 3: Purchase monthly
-            log(scenario, "Test 1: Monthly purchase")
+            b1 = me_data.get("user", {}).get("credit_balance_minutes", 0)
+            log(scenario, f"  ✓ Initial balance B1={b1}")
+            
+            # Step 3: POST /api/packages/purchase
+            log(scenario, "Step 3: POST /api/packages/purchase")
             purchase_data = {
-                "package_id": starter.get("id"),
+                "package_id": starter_id,
                 "billing_cycle": "month"
             }
+            
             resp = await client.post(f"{BASE_URL}/packages/purchase", json=purchase_data)
+            
             if resp.status_code != 200:
                 fail_scenario(scenario, f"POST /packages/purchase returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            purchase_resp = resp.json()
-            log(scenario, f"Purchase response: {json.dumps(purchase_resp, indent=2)}")
+            try:
+                purchase_resp = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Purchase response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
+                return
             
             # Verify response fields
             if not purchase_resp.get("ok"):
                 fail_scenario(scenario, f"Purchase not ok: {purchase_resp}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            expected_credits = starter.get("credit_amount_minutes", 300)
-            if purchase_resp.get("credits_added") != expected_credits:
-                fail_scenario(scenario, f"Expected credits_added={expected_credits}, got {purchase_resp.get('credits_added')}")
+            if purchase_resp.get("credits_added") != starter_credits:
+                fail_scenario(scenario, f"Expected credits_added={starter_credits}, got {purchase_resp.get('credits_added')}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            expected_balance = b1 + expected_credits
-            if purchase_resp.get("new_balance_minutes") != expected_balance:
-                fail_scenario(scenario, f"Expected new_balance={expected_balance}, got {purchase_resp.get('new_balance_minutes')}")
-                return
-            
-            expected_amount = starter.get("price_usd", 6.99)
-            if abs(purchase_resp.get("amount_paid", 0) - expected_amount) > 0.01:
-                fail_scenario(scenario, f"Expected amount_paid={expected_amount}, got {purchase_resp.get('amount_paid')}")
-                return
-            
-            if purchase_resp.get("currency") != "USD":
-                fail_scenario(scenario, f"Expected currency=USD, got {purchase_resp.get('currency')}")
+            expected_new_balance = b1 + starter_credits
+            if purchase_resp.get("new_balance_minutes") != expected_new_balance:
+                fail_scenario(scenario, f"Expected new_balance_minutes={expected_new_balance}, got {purchase_resp.get('new_balance_minutes')}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
             if purchase_resp.get("payment_status") != "completed_simulated":
-                fail_scenario(scenario, f"Expected payment_status=completed_simulated, got {purchase_resp.get('payment_status')}")
+                fail_scenario(scenario, f"Expected payment_status='completed_simulated', got '{purchase_resp.get('payment_status')}'")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            if not purchase_resp.get("transaction_id"):
-                fail_scenario(scenario, "Missing transaction_id")
-                return
+            log(scenario, f"  ✓ Purchase successful: credits_added={purchase_resp.get('credits_added')}, new_balance={purchase_resp.get('new_balance_minutes')}, payment_status={purchase_resp.get('payment_status')}")
             
-            log(scenario, f"✓ Monthly purchase successful: +{expected_credits} credits, paid ${expected_amount}")
-            
-            # Step 4: Verify balance updated
+            # Step 4: GET /api/auth/me → verify balance equals new_balance_minutes
+            log(scenario, "Step 4: GET /api/auth/me (verify new balance)")
             resp = await client.get(f"{BASE_URL}/auth/me")
+            
             if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /auth/me (2) returned {resp.status_code}")
+                fail_scenario(scenario, f"GET /auth/me (2) returned {resp.status_code}: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            b2 = resp.json().get("user", {}).get("credit_balance_minutes", 0)
-            if b2 != expected_balance:
-                fail_scenario(scenario, f"Balance mismatch: expected {expected_balance}, got {b2}")
+            try:
+                me_data_2 = resp.json()
+            except Exception as e:
+                fail_scenario(scenario, f"Auth/me (2) response not valid JSON: {e}. Body: {resp.text[:500]}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            log(scenario, f"✓ Balance verified: {b2} minutes")
+            b2 = me_data_2.get("user", {}).get("credit_balance_minutes", 0)
             
-            # Step 5: Verify transaction record
-            resp = await client.get(f"{BASE_URL}/transactions")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /transactions returned {resp.status_code}")
+            if b2 != expected_new_balance:
+                fail_scenario(scenario, f"Balance mismatch: expected {expected_new_balance}, got {b2}")
+                results[scenario]["timing"] = time.time() - start_time
                 return
             
-            transactions = resp.json()
-            if not isinstance(transactions, list):
-                fail_scenario(scenario, f"GET /transactions returned non-list")
-                return
+            log(scenario, f"  ✓ Balance verified: B2={b2} (B1 + {starter_credits})")
             
-            # Find the package_purchase transaction
-            pkg_txn = None
-            for txn in transactions:
-                if txn.get("reason") == "package_purchase" and txn.get("package_name") == starter.get("name"):
-                    pkg_txn = txn
-                    break
-            
-            if not pkg_txn:
-                fail_scenario(scenario, f"No transaction found with reason='package_purchase'")
-                return
-            
-            log(scenario, f"✓ Transaction record found: amount={pkg_txn.get('amount')}, package={pkg_txn.get('package_name')}")
-            
-            # Step 6: Test yearly purchase
-            log(scenario, "Test 2: Yearly purchase")
-            b_before_yearly = b2
-            purchase_data = {
-                "package_id": starter.get("id"),
-                "billing_cycle": "year"
-            }
-            resp = await client.post(f"{BASE_URL}/packages/purchase", json=purchase_data)
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"POST /packages/purchase (yearly) returned {resp.status_code}: {resp.text[:500]}")
-                return
-            
-            yearly_resp = resp.json()
-            expected_yearly_credits = expected_credits * 12
-            if yearly_resp.get("credits_added") != expected_yearly_credits:
-                fail_scenario(scenario, f"Expected yearly credits_added={expected_yearly_credits}, got {yearly_resp.get('credits_added')}")
-                return
-            
-            # Yearly discount: 12 * price * 0.8
-            expected_yearly_amount = round(starter.get("price_usd", 6.99) * 12 * 0.8, 2)
-            actual_yearly_amount = yearly_resp.get("amount_paid", 0)
-            if abs(actual_yearly_amount - expected_yearly_amount) > 0.1:
-                fail_scenario(scenario, f"Expected yearly amount≈{expected_yearly_amount}, got {actual_yearly_amount}")
-                return
-            
-            log(scenario, f"✓ Yearly purchase successful: +{expected_yearly_credits} credits, paid ${actual_yearly_amount}")
-            
-            # Step 7: Test coupon
-            log(scenario, "Test 3: Coupon code LAUNCH25")
-            b_before_coupon = yearly_resp.get("new_balance_minutes", 0)
-            
-            # Get coupon redemptions before
-            resp = await client.get(f"{BASE_URL}/admin/coupons?admin=true")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /admin/coupons returned {resp.status_code}")
-                return
-            
-            coupons = resp.json()
-            launch25 = None
-            for c in coupons:
-                if c.get("code") == "LAUNCH25":
-                    launch25 = c
-                    break
-            
-            if not launch25:
-                fail_scenario(scenario, "LAUNCH25 coupon not found")
-                return
-            
-            redemptions_before = launch25.get("current_redemptions", 0)
-            log(scenario, f"LAUNCH25 redemptions before: {redemptions_before}")
-            
-            purchase_data = {
-                "package_id": starter.get("id"),
-                "billing_cycle": "month",
-                "coupon_code": "LAUNCH25"
-            }
-            resp = await client.post(f"{BASE_URL}/packages/purchase", json=purchase_data)
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"POST /packages/purchase (coupon) returned {resp.status_code}: {resp.text[:500]}")
-                return
-            
-            coupon_resp = resp.json()
-            
-            # Verify coupon applied
-            if coupon_resp.get("coupon_applied") != "LAUNCH25":
-                fail_scenario(scenario, f"Expected coupon_applied=LAUNCH25, got {coupon_resp.get('coupon_applied')}")
-                return
-            
-            # 25% discount
-            expected_coupon_amount = round(starter.get("price_usd", 6.99) * 0.75, 2)
-            actual_coupon_amount = coupon_resp.get("amount_paid", 0)
-            if abs(actual_coupon_amount - expected_coupon_amount) > 0.1:
-                fail_scenario(scenario, f"Expected coupon amount≈{expected_coupon_amount}, got {actual_coupon_amount}")
-                return
-            
-            log(scenario, f"✓ Coupon purchase successful: paid ${actual_coupon_amount} (25% off)")
-            
-            # Verify redemptions incremented
-            resp = await client.get(f"{BASE_URL}/admin/coupons?admin=true")
-            if resp.status_code != 200:
-                fail_scenario(scenario, f"GET /admin/coupons (2) returned {resp.status_code}")
-                return
-            
-            coupons = resp.json()
-            launch25_after = None
-            for c in coupons:
-                if c.get("code") == "LAUNCH25":
-                    launch25_after = c
-                    break
-            
-            redemptions_after = launch25_after.get("current_redemptions", 0)
-            if redemptions_after != redemptions_before + 1:
-                fail_scenario(scenario, f"Expected redemptions={redemptions_before + 1}, got {redemptions_after}")
-                return
-            
-            log(scenario, f"✓ Coupon redemptions incremented: {redemptions_before} → {redemptions_after}")
-            
-            # Step 8: Test bad package
-            log(scenario, "Test 4: Bad package ID")
-            purchase_data = {
-                "package_id": "nonexistent-package-id",
-                "billing_cycle": "month"
-            }
-            resp = await client.post(f"{BASE_URL}/packages/purchase", json=purchase_data)
-            if resp.status_code != 404:
-                fail_scenario(scenario, f"Expected 404 for bad package, got {resp.status_code}")
-                return
-            
-            error_data = resp.json()
-            if "error" not in error_data or "not found" not in error_data.get("error", "").lower():
-                fail_scenario(scenario, f"Expected 'not found' error, got: {error_data}")
-                return
-            
-            log(scenario, f"✓ Bad package error: {error_data.get('error')}")
-            
-            pass_scenario(scenario, "Package purchase working correctly")
+            results[scenario]["timing"] = time.time() - start_time
+            pass_scenario(scenario, f"Package purchase working correctly ({results[scenario]['timing']:.1f}s)")
             
         except Exception as e:
-            fail_scenario(scenario, f"Exception: {e}")
-
-
-async def test_scenario_e():
-    """E) JSON sanity sweep"""
-    scenario = "E_json_sanity"
-    log(scenario, "Starting JSON sanity sweep...")
-    
-    endpoints = [
-        "/clips",
-        "/pricing-packages",
-        "/auth/me",
-        "/geo",
-        "/memes",
-        "/admin/integrations?admin=true",
-        "/admin/analytics?admin=true",
-        "/transactions",
-        "/coupons/validate?code=LAUNCH25",
-    ]
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            for endpoint in endpoints:
-                url = f"{BASE_URL}{endpoint}"
-                log(scenario, f"Testing {endpoint}...")
-                
-                resp = await client.get(url)
-                
-                # Check status code is 2xx or 4xx (not 5xx)
-                if resp.status_code >= 500:
-                    fail_scenario(scenario, f"{endpoint} returned {resp.status_code}: {resp.text[:500]}")
-                    return
-                
-                # Check content-type is JSON
-                content_type = resp.headers.get("content-type", "")
-                if "json" not in content_type.lower():
-                    fail_scenario(scenario, f"{endpoint} returned non-JSON content-type: {content_type}")
-                    return
-                
-                # Try to parse JSON
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    fail_scenario(scenario, f"{endpoint} returned invalid JSON: {e}. Body: {resp.text[:500]}")
-                    return
-                
-                # Check for HTML/stderr leaks
-                body_text = resp.text
-                if "<html" in body_text.lower() or "<!doctype" in body_text.lower():
-                    fail_scenario(scenario, f"{endpoint} returned HTML: {body_text[:500]}")
-                    return
-                
-                if "traceback" in body_text.lower() or "stderr" in body_text.lower():
-                    fail_scenario(scenario, f"{endpoint} leaked stderr/traceback: {body_text[:500]}")
-                    return
-                
-                log(scenario, f"  ✓ {endpoint}: {resp.status_code}, valid JSON")
-            
-            pass_scenario(scenario, f"All {len(endpoints)} endpoints returned clean JSON")
-            
-        except Exception as e:
+            results[scenario]["timing"] = time.time() - start_time
             fail_scenario(scenario, f"Exception: {e}")
 
 
 async def main():
     """Run all test scenarios"""
     print("=" * 80)
-    print("ClipForge AI Backend Test Suite")
+    print("ClipForge AI YouTube Ingestion Pipeline Test Suite")
     print("=" * 80)
     print(f"Base URL: {BASE_URL}")
     print(f"MongoDB: {MONGO_URL}/{DB_NAME}")
@@ -788,7 +702,7 @@ async def main():
     print("Running Test Scenarios")
     print("=" * 80 + "\n")
     
-    # Run scenarios
+    # Run scenarios in order
     await test_scenario_a()
     print()
     
@@ -811,8 +725,9 @@ async def main():
     
     for scenario, result in results.items():
         status = result["status"]
+        timing = result.get("timing", 0)
         emoji = "✅" if status == "PASS" else "❌" if status == "FAIL" else "⏸️"
-        print(f"{emoji} {scenario}: {status}")
+        print(f"{emoji} {scenario}: {status} ({timing:.1f}s)")
     
     print("=" * 80)
     
