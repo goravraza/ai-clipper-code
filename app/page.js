@@ -27,6 +27,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
 import Link from 'next/link'
+import StyleWizard from './_components/StyleWizard'
 
 const CROP_ASPECTS = [
   { value: '9:16', label: 'Vertical 9:16', tw: 'aspect-[9/16]' },
@@ -160,6 +161,10 @@ export default function HomePage() {
   const [clipLengthPreset, setClipLengthPreset] = useState('30-60') // '10-30' | '30-60' | '60-90'
   const [burnCaptions, setBurnCaptions] = useState(true)
   const [purchasing, setPurchasing] = useState(null)
+  // NEW: style wizard
+  const [wizardOpen, setWizardOpen] = useState(false)
+  const [wizardPayload, setWizardPayload] = useState(null)
+  const [pendingSubmit, setPendingSubmit] = useState(null) // function to call after wizard completes
   const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
@@ -269,15 +274,71 @@ export default function HomePage() {
     return { clip_min: min, clip_max: max }
   }
 
+  // ===== STYLE WIZARD ENTRY POINTS =====
   async function handleIngest() {
     if (!urlInput) return toast.error('Paste a video URL first')
+    // Try to fetch YouTube thumbnail for the wizard preview
+    let thumbnail = null
+    let title = null
+    try {
+      const ytm = urlInput.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/)|youtu\.be\/)([\w-]{11})/)
+      if (ytm) {
+        thumbnail = `https://img.youtube.com/vi/${ytm[1]}/maxresdefault.jpg`
+        try {
+          const oe = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(urlInput)}&format=json`).then(r=>r.json())
+          title = oe?.title
+        } catch {}
+      }
+    } catch {}
+    setWizardPayload({ type: 'url', url: urlInput, thumbnail, title: title || urlInput.slice(0,60) })
+    setPendingSubmit(() => (config) => submitIngest({ url: urlInput }, config))
+    setWizardOpen(true)
+  }
+
+  function handleDrop(e) {
+    e.preventDefault(); setIsDragging(false)
+    const files = Array.from(e.dataTransfer.files || [])
+    if (!files.length) return
+    handleFileUpload(files[0])
+  }
+
+  async function handleFileUpload(file) {
+    if (!file) return
+    if (!file.type.startsWith('video/') && !/\.(mp4|mov|webm|mkv)$/i.test(file.name)) {
+      return toast.error('Please drop a video file')
+    }
+    const fileBlobUrl = URL.createObjectURL(file)
+    setWizardPayload({ type: 'file', file, fileBlobUrl, title: file.name })
+    setPendingSubmit(() => (config) => submitFile(file, config))
+    setWizardOpen(true)
+  }
+
+  function handleWizardComplete(config) {
+    setWizardOpen(false)
+    // Cleanup blob URL if any (after a beat so the wizard can finish closing animation)
+    setTimeout(() => {
+      if (wizardPayload?.fileBlobUrl) URL.revokeObjectURL(wizardPayload.fileBlobUrl)
+      setWizardPayload(null)
+    }, 400)
+    if (pendingSubmit) pendingSubmit(config)
+    setPendingSubmit(null)
+  }
+
+  // ===== ACTUAL BACKEND SUBMISSIONS =====
+  async function submitIngest({ url }, wizardConfig) {
     setIsIngesting(true)
     setProcessing({ status: 'queued', progress: 0 })
     try {
       const { clip_min, clip_max } = getClipRange()
       const r = await fetch('/api/ai/analyze', {
         method: 'POST', headers: { 'content-type':'application/json' },
-        body: JSON.stringify({ url: urlInput, clip_min, clip_max, add_captions: burnCaptions })
+        body: JSON.stringify({
+          url, clip_min, clip_max, add_captions: burnCaptions,
+          language: wizardConfig?.language || 'auto',
+          style_preset: wizardConfig?.style_preset,
+          style_ass: wizardConfig?.style_ass,
+          overlays_config: wizardConfig?.overlays_config,
+        })
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'AI failed')
@@ -291,7 +352,7 @@ export default function HomePage() {
         const sd = await sr.json()
         setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
         if (sd.status === 'completed') {
-          toast.success(`✅ ${sd.clip_count || sd.clips?.length || 0} clips ready! (${sd.credits_charged || 0} credits used)`, { description: `From: ${sd.title || urlInput.slice(0,50)}` })
+          toast.success(`✅ ${sd.clip_count || sd.clips?.length || 0} clips ready! (${sd.credits_charged || 0} credits used)`, { description: `From: ${sd.title || url.slice(0,50)}` })
           const [fresh, me] = await Promise.all([
             fetch('/api/clips').then(r => r.json()),
             fetch('/api/auth/me').then(r => r.json()),
@@ -309,18 +370,7 @@ export default function HomePage() {
     finally { setIsIngesting(false); setTimeout(()=>setProcessing(null), 3000) }
   }
 
-  function handleDrop(e) {
-    e.preventDefault(); setIsDragging(false)
-    const files = Array.from(e.dataTransfer.files || [])
-    if (!files.length) return
-    handleFileUpload(files[0])
-  }
-
-  async function handleFileUpload(file) {
-    if (!file) return
-    if (!file.type.startsWith('video/') && !/\.(mp4|mov|webm|mkv)$/i.test(file.name)) {
-      return toast.error('Please drop a video file')
-    }
+  async function submitFile(file, wizardConfig) {
     setIsIngesting(true)
     setProcessing({ status: 'uploading', progress: 0 })
     try {
@@ -331,6 +381,10 @@ export default function HomePage() {
       form.append('clip_min', String(clip_min))
       form.append('clip_max', String(clip_max))
       form.append('add_captions', String(burnCaptions))
+      if (wizardConfig?.language)        form.append('language', wizardConfig.language)
+      if (wizardConfig?.style_preset)    form.append('style_preset', wizardConfig.style_preset)
+      if (wizardConfig?.style_ass)       form.append('style_ass', JSON.stringify(wizardConfig.style_ass))
+      if (wizardConfig?.overlays_config) form.append('overlays_config', JSON.stringify(wizardConfig.overlays_config))
       toast.info(`Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`)
       const r = await fetch('/api/upload', { method: 'POST', body: form })
       const data = await r.json()
@@ -776,6 +830,14 @@ export default function HomePage() {
           </div>
         </div>
       </footer>
+
+      {/* STYLE WIZARD MODAL */}
+      <StyleWizard
+        open={wizardOpen}
+        onClose={() => { setWizardOpen(false); if (wizardPayload?.fileBlobUrl) URL.revokeObjectURL(wizardPayload.fileBlobUrl); setWizardPayload(null); setPendingSubmit(null) }}
+        onComplete={handleWizardComplete}
+        payload={wizardPayload}
+      />
     </div>
   )
 }

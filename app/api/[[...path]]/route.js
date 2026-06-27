@@ -547,6 +547,11 @@ async function handle(request, { params }) {
         const clipMin = Math.max(5, parseInt(form.get('clip_min')) || 30)
         const clipMax = Math.max(clipMin + 5, parseInt(form.get('clip_max')) || 60)
         const addCaptions = form.get('add_captions') !== 'false'
+        const language = form.get('language') || 'auto'
+        const stylePreset = form.get('style_preset') || null
+        let styleAss = null, overlaysConfig = null
+        try { styleAss = form.get('style_ass') ? JSON.parse(form.get('style_ass')) : null } catch {}
+        try { overlaysConfig = form.get('overlays_config') ? JSON.parse(form.get('overlays_config')) : null } catch {}
 
         const originalsDir = '/app/data/uploads/originals/' + id
         await fs.mkdir(originalsDir, { recursive: true })
@@ -555,8 +560,6 @@ async function handle(request, { params }) {
         const buffer = Buffer.from(await file.arrayBuffer())
         await fs.writeFile(fullPath, buffer)
 
-        // Quick credit pre-check using file size as a rough proxy (1MB ≈ 1min for 360p H.264)
-        // Actual deduction happens after ffprobe knows the true duration.
         const estimatedMinutes = Math.max(1, Math.ceil(buffer.length / (1024 * 1024 * 2)))
         if ((user?.credit_balance_minutes ?? 0) < estimatedMinutes) {
           await fs.rm(originalsDir, { recursive: true, force: true }).catch(()=>{})
@@ -569,14 +572,15 @@ async function handle(request, { params }) {
           status: 'queued', progress: 0,
           clip_length_range: { min: clipMin, max: clipMax },
           add_captions: addCaptions,
+          language, style_preset: stylePreset, style_ass: styleAss, overlays_config: overlaysConfig,
           created_at: new Date(), updated_at: new Date(),
         })
-        await logActivity(db, user.id, 'video_uploaded', request, { filename: file.name, size: buffer.length, clip_range: `${clipMin}-${clipMax}s` })
+        await logActivity(db, user.id, 'video_uploaded', request, { filename: file.name, size: buffer.length, clip_range: `${clipMin}-${clipMax}s`, style: stylePreset, language })
 
         const { processVideoInBackground } = await import('@/lib/video-processor')
-        processVideoInBackground({ videoId: id, localFile: fullPath, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions }).catch(e => console.error('bg fail', e))
+        processVideoInBackground({ videoId: id, localFile: fullPath, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions, language, stylePreset, styleAss, overlaysConfig }).catch(e => console.error('bg fail', e))
 
-        return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions })
+        return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions, language, style_preset: stylePreset })
       }
 
       const subdir = kind === 'meme_thumbnail' ? 'thumbs' : 'memes'
@@ -609,8 +613,11 @@ async function handle(request, { params }) {
       const clipMin = Math.max(5, parseInt(body.clip_min) || 30)
       const clipMax = Math.max(clipMin + 5, parseInt(body.clip_max) || 60)
       const addCaptions = body.add_captions !== false
+      const language = body.language || 'auto'
+      const stylePreset = body.style_preset || null
+      const styleAss = body.style_ass || null
+      const overlaysConfig = body.overlays_config || null
 
-      // Light pre-check — assume at least 1 credit; real deduction happens after ffprobe
       if ((user?.credit_balance_minutes ?? 0) < 1) {
         return NextResponse.json({ error: 'Insufficient credits. Buy a package below to continue.' }, { status: 402 })
       }
@@ -624,14 +631,15 @@ async function handle(request, { params }) {
         status: 'queued', progress: 0,
         clip_length_range: { min: clipMin, max: clipMax },
         add_captions: addCaptions,
+        language, style_preset: stylePreset, style_ass: styleAss, overlays_config: overlaysConfig,
         created_at: new Date(), updated_at: new Date(),
       })
-      await logActivity(db, user.id, 'ai_analyze_started', request, { url, clip_range: `${clipMin}-${clipMax}s` })
+      await logActivity(db, user.id, 'ai_analyze_started', request, { url, clip_range: `${clipMin}-${clipMax}s`, style: stylePreset, language })
 
       const { processVideoInBackground } = await import('@/lib/video-processor')
-      processVideoInBackground({ videoId, url, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions }).catch(e => console.error('bg fail', e))
+      processVideoInBackground({ videoId, url, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions, language, stylePreset, styleAss, overlaysConfig }).catch(e => console.error('bg fail', e))
 
-      return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions })
+      return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions, language, style_preset: stylePreset })
     }
 
     // GET /api/videos/:id  — poll processing status
