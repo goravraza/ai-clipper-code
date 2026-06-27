@@ -103,17 +103,30 @@ const DEFAULT_OVERLAYS = {
 // ============================================================================
 // MAIN COMPONENT
 // ============================================================================
-export default function StyleWizard({ open, onClose, onComplete, payload }) {
-  // payload: { type: 'url' | 'file', url?: string, file?: File, title?: string, thumbnail?: string, fileBlobUrl?: string }
-  const [step, setStep] = useState(1)
-  const [language, setLanguage] = useState('auto')
-  const [stylePreset, setStylePreset] = useState('the_beast')
-  const [overlays, setOverlays] = useState(DEFAULT_OVERLAYS)
-  const [trimRange, setTrimRange] = useState([0, 60])  // user-defined trim window in seconds
+export default function StyleWizard({ open, onClose, onComplete, payload, initialConfig = null, mode = 'create' }) {
+  // payload: { type: 'url' | 'file', url?: string, file?: File, title?: string, thumbnail?: string, fileBlobUrl?: string, duration?: number }
+  // mode: 'create' | 'restyle'  — restyle mode jumps to step 2 and disables source preview
+  const [step, setStep] = useState(mode === 'restyle' ? 2 : 1)
+  const [language, setLanguage] = useState(initialConfig?.language || 'auto')
+  const [stylePreset, setStylePreset] = useState(initialConfig?.style_preset || 'the_beast')
+  const [overlays, setOverlays] = useState(() => {
+    if (initialConfig?.overlays_config) {
+      const oc = initialConfig.overlays_config
+      return {
+        caption:    { ...DEFAULT_OVERLAYS.caption,    enabled: oc.caption?.enabled !== false,    position: oc.caption?.position_percent ?? DEFAULT_OVERLAYS.caption.position },
+        hook:       { ...DEFAULT_OVERLAYS.hook,       enabled: oc.hook?.enabled !== false,       position: oc.hook?.position_percent ?? DEFAULT_OVERLAYS.hook.position },
+        title:      { ...DEFAULT_OVERLAYS.title,      enabled: oc.title?.enabled !== false,      position: oc.title?.position_percent ?? DEFAULT_OVERLAYS.title.position },
+        description:{ ...DEFAULT_OVERLAYS.description,enabled: oc.description?.enabled !== false,position: oc.description?.position_percent ?? DEFAULT_OVERLAYS.description.position },
+      }
+    }
+    return DEFAULT_OVERLAYS
+  })
+  const [trimRange, setTrimRange] = useState([initialConfig?.trim_start_seconds || 0, initialConfig?.trim_end_seconds || Math.min(60, payload?.duration || 60)])
+  const [fontSize, setFontSize] = useState(initialConfig?.font_size || 22)
+  const [outlineSize, setOutlineSize] = useState(initialConfig?.outline_size ?? 2)
   const [busy, setBusy] = useState(false)
 
-  // Reset to step 1 each time wizard opens
-  useEffect(() => { if (open) { setStep(1) } }, [open])
+  useEffect(() => { if (open) { setStep(mode === 'restyle' ? 2 : 1); setBusy(false) } }, [open, mode])
 
   const enabledCount = useMemo(() => Object.values(overlays).filter(o => o.enabled).length, [overlays])
   const selectedPreset = STYLE_PRESETS.find(p => p.id === stylePreset) || STYLE_PRESETS[1]
@@ -126,7 +139,9 @@ export default function StyleWizard({ open, onClose, onComplete, payload }) {
     onComplete?.({
       language,
       style_preset: stylePreset,
-      style_ass: selectedPreset.ass,
+      style_ass: { ...selectedPreset.ass, fontSize, outline: outlineSize },
+      font_size: fontSize,
+      outline_size: outlineSize,
       trim_start_seconds: trimRange[0],
       trim_end_seconds: trimRange[1],
       overlays_config: {
@@ -151,9 +166,9 @@ export default function StyleWizard({ open, onClose, onComplete, payload }) {
           .wizard-step-btn:active { transform: scale(.97); }
         `}</style>
 
-        {step === 1 && <Step1 payload={payload} language={language} setLanguage={setLanguage} onBack={back} onContinue={next} />}
-        {step === 2 && <Step2 payload={payload} stylePreset={stylePreset} setStylePreset={setStylePreset} overlays={overlays} setOverlays={setOverlays} onBack={back} onContinue={next} />}
-        {step === 3 && <Step3 payload={payload} stylePreset={stylePreset} overlays={overlays} setOverlays={setOverlays} onBack={back} onFinish={finish} busy={busy} />}
+        {step === 1 && <Step1 payload={payload} language={language} setLanguage={setLanguage} trimRange={trimRange} setTrimRange={setTrimRange} onBack={back} onContinue={next} />}
+        {step === 2 && <Step2 payload={payload} stylePreset={stylePreset} setStylePreset={setStylePreset} overlays={overlays} setOverlays={setOverlays} fontSize={fontSize} setFontSize={setFontSize} outlineSize={outlineSize} setOutlineSize={setOutlineSize} onBack={back} onContinue={next} mode={mode} />}
+        {step === 3 && <Step3 payload={payload} stylePreset={stylePreset} overlays={overlays} setOverlays={setOverlays} fontSize={fontSize} setFontSize={setFontSize} outlineSize={outlineSize} setOutlineSize={setOutlineSize} onBack={back} onFinish={finish} busy={busy} mode={mode} />}
       </DialogContent>
     </Dialog>
   )
@@ -162,17 +177,39 @@ export default function StyleWizard({ open, onClose, onComplete, payload }) {
 // ============================================================================
 // STEP 1 — Ingestion confirmation & language
 // ============================================================================
-function Step1({ payload, language, setLanguage, onBack, onContinue }) {
+function Step1({ payload, language, setLanguage, trimRange, setTrimRange, onBack, onContinue }) {
   const selected = SPOKEN_LANGUAGES.find(l => l.code === language) || SPOKEN_LANGUAGES[0]
+  const duration = payload?.duration || 600 // assume up to 10 min if unknown
+  const fmt = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${Math.floor(s%60).toString().padStart(2,'0')}`
   return (
     <div className="p-6 space-y-5">
       <div className="text-center">
         <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Step 1 / 3</div>
-        <h2 className="text-xl font-bold">Confirm your video & spoken language</h2>
+        <h2 className="text-xl font-bold">Confirm video, language & trim range</h2>
       </div>
 
       <div className="relative rounded-xl overflow-hidden border border-border bg-black aspect-video max-w-2xl mx-auto">
         <SourcePreview payload={payload} />
+      </div>
+
+      {/* Trim slider — visual start/end picker */}
+      <div className="max-w-2xl mx-auto space-y-2 rounded-xl border border-border bg-muted/30 p-4">
+        <div className="flex items-center justify-between text-sm">
+          <Label className="flex items-center gap-1.5 font-semibold"><Scissors className="h-3.5 w-3.5 text-primary"/> Trim range (the AI will pick clips inside this window)</Label>
+          <span className="font-mono text-xs text-muted-foreground">{fmt(trimRange[0])} → {fmt(trimRange[1])}  ({trimRange[1]-trimRange[0]}s)</span>
+        </div>
+        <Slider min={0} max={duration} step={1} value={trimRange} onValueChange={setTrimRange} />
+        <div className="flex justify-between text-[10px] text-muted-foreground">
+          <span>0:00</span>
+          <span>{fmt(duration)}</span>
+        </div>
+        <div className="flex gap-2 pt-1">
+          {[ [0, 60, '1 min'], [0, 180, '3 min'], [0, 600, '10 min'], [0, duration, 'Full'] ].map(([a,b,label]) => (
+            <button key={label} type="button" onClick={() => setTrimRange([a, Math.min(b, duration)])} className="wizard-step-btn text-[11px] px-3 py-1 rounded-full bg-background border border-border hover:border-primary/50">
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex justify-end relative">
@@ -232,7 +269,7 @@ function SourcePreview({ payload }) {
 // ============================================================================
 // STEP 2 — Pick a Style
 // ============================================================================
-function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, onBack, onContinue }) {
+function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, fontSize, setFontSize, outlineSize, setOutlineSize, onBack, onContinue, mode }) {
   const enabledCount = Object.values(overlays).filter(o => o.enabled).length
   return (
     <div className="p-6 space-y-4">
@@ -249,7 +286,7 @@ function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, on
       </div>
 
       <div className="grid md:grid-cols-2 gap-5">
-        <PortraitPreview payload={payload} stylePreset={stylePreset} overlays={overlays} />
+        <PortraitPreview payload={payload} stylePreset={stylePreset} overlays={overlays} fontSize={fontSize} outlineSize={outlineSize} />
 
         <div className="rounded-2xl border border-border bg-background p-4 flex flex-col">
           <Tabs defaultValue="style" className="flex-1 flex flex-col">
@@ -260,8 +297,8 @@ function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, on
               </TabsTrigger>
             </TabsList>
 
-            <TabsContent value="style" className="mt-4 flex-1">
-              <div className="grid grid-cols-3 gap-2 max-h-[420px] overflow-y-auto pr-1">
+            <TabsContent value="style" className="mt-4 flex-1 space-y-4">
+              <div className="grid grid-cols-3 gap-2 max-h-[260px] overflow-y-auto pr-1">
                 {STYLE_PRESETS.map(p => {
                   const active = stylePreset === p.id
                   return (
@@ -277,10 +314,28 @@ function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, on
                   )
                 })}
               </div>
+
+              {/* Customize: font size + stroke */}
+              <div className="rounded-xl border border-border bg-muted/30 p-3 space-y-3">
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs">
+                    <Label className="text-muted-foreground">Font size</Label>
+                    <span className="font-mono">{fontSize}px</span>
+                  </div>
+                  <Slider min={12} max={48} step={1} value={[fontSize]} onValueChange={v => setFontSize(v[0])} />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs">
+                    <Label className="text-muted-foreground">Stroke / outline</Label>
+                    <span className="font-mono">{outlineSize}px</span>
+                  </div>
+                  <Slider min={0} max={8} step={1} value={[outlineSize]} onValueChange={v => setOutlineSize(v[0])} />
+                </div>
+              </div>
             </TabsContent>
 
             <TabsContent value="overlays" className="mt-4">
-              <OverlayPanel overlays={overlays} setOverlays={setOverlays} />
+              <OverlayPanel overlays={overlays} setOverlays={setOverlays} fontSize={fontSize} setFontSize={setFontSize} outlineSize={outlineSize} setOutlineSize={setOutlineSize} />
             </TabsContent>
           </Tabs>
 
@@ -295,7 +350,7 @@ function Step2({ payload, stylePreset, setStylePreset, overlays, setOverlays, on
 // ============================================================================
 // STEP 3 — Text overlays positioning
 // ============================================================================
-function Step3({ payload, stylePreset, overlays, setOverlays, onBack, onFinish, busy }) {
+function Step3({ payload, stylePreset, overlays, setOverlays, fontSize, setFontSize, outlineSize, setOutlineSize, onBack, onFinish, busy, mode }) {
   const enabledCount = Object.values(overlays).filter(o => o.enabled).length
   return (
     <div className="p-6 space-y-4">
@@ -312,7 +367,7 @@ function Step3({ payload, stylePreset, overlays, setOverlays, onBack, onFinish, 
       </div>
 
       <div className="grid md:grid-cols-2 gap-5">
-        <PortraitPreview payload={payload} stylePreset={stylePreset} overlays={overlays} />
+        <PortraitPreview payload={payload} stylePreset={stylePreset} overlays={overlays} fontSize={fontSize} outlineSize={outlineSize} />
 
         <div className="rounded-2xl border border-border bg-background p-4 flex flex-col">
           <Tabs defaultValue="overlays" className="flex-1 flex flex-col">
@@ -328,12 +383,12 @@ function Step3({ payload, stylePreset, overlays, setOverlays, onBack, onFinish, 
             </TabsContent>
 
             <TabsContent value="overlays" className="mt-4">
-              <OverlayPanel overlays={overlays} setOverlays={setOverlays} />
+              <OverlayPanel overlays={overlays} setOverlays={setOverlays} fontSize={fontSize} setFontSize={setFontSize} outlineSize={outlineSize} setOutlineSize={setOutlineSize} />
             </TabsContent>
           </Tabs>
 
           <Button disabled={busy} onClick={onFinish} className="mt-4 wizard-step-btn w-full bg-foreground text-background hover:bg-foreground/90">
-            {busy ? 'Starting…' : 'Continue'}
+            {busy ? 'Starting…' : (mode === 'restyle' ? 'Apply New Style' : 'Continue')}
           </Button>
           <button onClick={onBack} className="text-xs text-muted-foreground mt-2 hover:text-foreground">Don&apos;t show this again</button>
         </div>
@@ -345,37 +400,46 @@ function Step3({ payload, stylePreset, overlays, setOverlays, onBack, onFinish, 
 // ============================================================================
 // Helpers — Portrait 9:16 preview
 // ============================================================================
-function PortraitPreview({ payload, stylePreset, overlays }) {
+function PortraitPreview({ payload, stylePreset, overlays, fontSize, outlineSize }) {
   const preset = STYLE_PRESETS.find(p => p.id === stylePreset) || STYLE_PRESETS[1]
+  // Compose live CSS — override fontSize + outline (text-shadow approximation of stroke)
+  const liveCss = useMemo(() => {
+    const base = { ...preset.css }
+    if (fontSize) base.fontSize = `${fontSize}px`
+    if (outlineSize > 0) {
+      const stroke = []
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) if (dx || dy) stroke.push(`${dx * outlineSize}px ${dy * outlineSize}px 0 #000`)
+      base.textShadow = stroke.join(', ')
+    }
+    return base
+  }, [preset, fontSize, outlineSize])
+
   return (
     <div className="flex items-start justify-center">
       <div className="relative w-[260px] aspect-[9/16] rounded-[28px] overflow-hidden border-[6px] border-zinc-900 shadow-2xl bg-black">
-        {/* Background source */}
         <SourcePortrait payload={payload} />
 
-        {/* Overlays positioned by % */}
         {overlays.hook.enabled && (
           <div className="absolute left-0 right-0 flex justify-center px-2 pointer-events-none" style={{ top: `${overlays.hook.position}%` }}>
-            <span style={preset.css} className="text-center">{overlays.hook.text}</span>
+            <span style={liveCss} className="text-center">{overlays.hook.text}</span>
           </div>
         )}
         {overlays.title.enabled && (
           <div className="absolute left-0 right-0 flex justify-center px-2 pointer-events-none" style={{ top: `${overlays.title.position}%` }}>
-            <span style={{ ...preset.css, fontSize: 18, writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>{overlays.title.text}</span>
+            <span style={{ ...liveCss, fontSize: `${Math.max(12, (fontSize || 22) - 4)}px`, writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>{overlays.title.text}</span>
           </div>
         )}
         {overlays.caption.enabled && (
           <div className="absolute left-0 right-0 flex justify-center px-2 pointer-events-none" style={{ top: `${overlays.caption.position}%` }}>
-            <span style={preset.css} className="text-center">{overlays.caption.text}</span>
+            <span style={liveCss} className="text-center">{overlays.caption.text}</span>
           </div>
         )}
         {overlays.description.enabled && (
           <div className="absolute left-0 right-0 flex justify-center px-2 pointer-events-none" style={{ top: `${overlays.description.position}%` }}>
-            <span style={{ ...preset.css, fontSize: 12, opacity: .85 }}>{overlays.description.text}</span>
+            <span style={{ ...liveCss, fontSize: `${Math.max(10, (fontSize || 22) - 8)}px`, opacity: .85 }}>{overlays.description.text}</span>
           </div>
         )}
 
-        {/* Fake player controls bottom */}
         <div className="absolute left-0 right-0 bottom-0 px-3 pb-2 pt-6 bg-gradient-to-t from-black/80 to-transparent text-white flex items-center gap-2 text-[10px]">
           <Play className="h-4 w-4 fill-white" />
           <Volume2 className="h-3.5 w-3.5" />
@@ -383,7 +447,6 @@ function PortraitPreview({ payload, stylePreset, overlays }) {
           <div className="flex-1" />
           <Maximize className="h-3.5 w-3.5" />
         </div>
-        {/* Progress bar */}
         <div className="absolute left-2 right-2 bottom-1 h-0.5 rounded-full bg-white/20">
           <div className="h-full bg-white/90 rounded-full" style={{ width: '14%' }} />
         </div>
@@ -409,11 +472,33 @@ function SourcePortrait({ payload }) {
 // ============================================================================
 // Overlay control panel (shared between step 2 tabs and step 3)
 // ============================================================================
-function OverlayPanel({ overlays, setOverlays }) {
+function OverlayPanel({ overlays, setOverlays, fontSize, setFontSize, outlineSize, setOutlineSize }) {
   function update(key, patch) { setOverlays(s => ({ ...s, [key]: { ...s[key], ...patch } })) }
   const rows = ['caption', 'hook', 'title', 'description']
+  const positions = [
+    { label: 'Top', value: 8 },
+    { label: 'Middle', value: 50 },
+    { label: 'Bottom', value: 88 },
+  ]
   return (
     <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+      {(typeof setFontSize === 'function' || typeof setOutlineSize === 'function') && (
+        <div className="rounded-xl border border-border bg-muted/30 p-3 space-y-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">Typography</div>
+          {typeof setFontSize === 'function' && (
+            <div>
+              <div className="flex justify-between text-xs"><span className="text-muted-foreground">Font size</span><span className="font-mono">{fontSize}px</span></div>
+              <Slider min={12} max={48} step={1} value={[fontSize]} onValueChange={v => setFontSize(v[0])} />
+            </div>
+          )}
+          {typeof setOutlineSize === 'function' && (
+            <div>
+              <div className="flex justify-between text-xs"><span className="text-muted-foreground">Stroke</span><span className="font-mono">{outlineSize}px</span></div>
+              <Slider min={0} max={8} step={1} value={[outlineSize]} onValueChange={v => setOutlineSize(v[0])} />
+            </div>
+          )}
+        </div>
+      )}
       {rows.map(key => {
         const o = overlays[key]
         return (
@@ -425,10 +510,17 @@ function OverlayPanel({ overlays, setOverlays }) {
               </div>
               <Switch checked={o.enabled} onCheckedChange={(v) => update(key, { enabled: v })} />
             </div>
-            <div className={`space-y-1 ${o.enabled ? '' : 'opacity-40 pointer-events-none'}`}>
+            <div className={`space-y-2 ${o.enabled ? '' : 'opacity-40 pointer-events-none'}`}>
+              {/* Quick position presets */}
+              <div className="flex gap-1.5">
+                {positions.map(p => (
+                  <button key={p.label} type="button" onClick={() => update(key, { position: p.value })} className={`wizard-step-btn text-[11px] flex-1 py-1.5 rounded-md border transition ${Math.abs(o.position - p.value) < 4 ? 'border-foreground bg-foreground/10 font-semibold' : 'border-border bg-background hover:border-primary/50'}`}>{p.label}</button>
+                ))}
+              </div>
+              {/* Fine slider */}
               <Slider min={0} max={100} step={1} value={[o.position]} onValueChange={(v) => update(key, { position: v[0] })} />
               <div className="flex justify-between text-[10px] text-muted-foreground">
-                <span>↑ Higher</span>
+                <span>↑ Higher ({o.position}%)</span>
                 <span>Lower ↓</span>
               </div>
             </div>

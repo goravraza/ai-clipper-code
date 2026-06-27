@@ -164,6 +164,8 @@ export default function HomePage() {
   // NEW: style wizard
   const [wizardOpen, setWizardOpen] = useState(false)
   const [wizardPayload, setWizardPayload] = useState(null)
+  const [wizardInitialConfig, setWizardInitialConfig] = useState(null)
+  const [wizardMode, setWizardMode] = useState('create')
   const [pendingSubmit, setPendingSubmit] = useState(null) // function to call after wizard completes
   const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
@@ -315,13 +317,34 @@ export default function HomePage() {
 
   function handleWizardComplete(config) {
     setWizardOpen(false)
-    // Cleanup blob URL if any (after a beat so the wizard can finish closing animation)
     setTimeout(() => {
-      if (wizardPayload?.fileBlobUrl) URL.revokeObjectURL(wizardPayload.fileBlobUrl)
-      setWizardPayload(null)
+      if (wizardPayload?.fileBlobUrl && wizardPayload.fileBlobUrl.startsWith('blob:')) URL.revokeObjectURL(wizardPayload.fileBlobUrl)
+      setWizardPayload(null); setWizardInitialConfig(null); setWizardMode('create')
     }, 400)
     if (pendingSubmit) pendingSubmit(config)
     setPendingSubmit(null)
+  }
+
+  async function submitRestyle(clip, config) {
+    toast.info('Restyling clip with new style…')
+    try {
+      const r = await fetch(`/api/clips/${clip.id}/restyle`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          style_preset: config.style_preset,
+          style_ass: config.style_ass,
+          overlays_config: config.overlays_config,
+          font_size: config.font_size,
+          outline_size: config.outline_size,
+        }),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Restyle failed')
+      toast.success('✅ Clip restyled', { description: `New style: ${config.style_preset}` })
+      // refresh the clips list so the new MP4 reloads (cache-bust query)
+      const fresh = await fetch('/api/clips').then(r => r.json())
+      setClips(fresh)
+    } catch (e) { toast.error('Restyle failed', { description: e.message }) }
   }
 
   // ===== ACTUAL BACKEND SUBMISSIONS =====
@@ -628,7 +651,13 @@ export default function HomePage() {
               </div>
               <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
                 {clips.map((clip) => (
-                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t} onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))} />
+                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t} onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))} onRestyle={(c) => {
+                    setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
+                    setPendingSubmit(() => (config) => submitRestyle(c, config))
+                    setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
+                    setWizardMode('restyle')
+                    setWizardOpen(true)
+                  }} />
                 ))}
               </div>
             </div>
@@ -842,7 +871,7 @@ export default function HomePage() {
   )
 }
 
-function ClipCard({ clip, memes, t, onUpdate }) {
+function ClipCard({ clip, memes, t, onUpdate, onRestyle }) {
   const [title, setTitle] = useState(clip.clip_title)
   const [scheduledTime, setScheduledTime] = useState(clip.scheduled_time || '')
   const [platform, setPlatform] = useState('youtube_shorts')
@@ -862,8 +891,10 @@ function ClipCard({ clip, memes, t, onUpdate }) {
 
   function download() {
     if (clip.storage_url_mp4 && clip.storage_url_mp4.startsWith('/api/files/')) {
+      // Use the dedicated /download endpoint which sets Content-Disposition: attachment
+      // so the browser actually downloads instead of opening the MP4 inline.
       const a = document.createElement('a')
-      a.href = clip.storage_url_mp4
+      a.href = `/api/clips/${clip.id}/download`
       a.download = `${clip.clip_title.replace(/[^a-z0-9]+/gi, '_')}.mp4`
       document.body.appendChild(a); a.click(); a.remove()
       toast.success('Downloading MP4', { description: clip.clip_title })
@@ -892,6 +923,10 @@ function ClipCard({ clip, memes, t, onUpdate }) {
         document.body.appendChild(a); a.click(); a.remove()
       }
     } catch (e) { toast.error('R2 download failed', { description: e.message }) }
+  }
+
+  function openRestyleWizard() {
+    if (typeof onRestyle === 'function') onRestyle(clip)
   }
 
   const score = clip.virality_score
@@ -946,14 +981,19 @@ function ClipCard({ clip, memes, t, onUpdate }) {
           <PreviewButton clip={clip} memes={memes} />
         </div>
         <div className="flex gap-2">
-          <Button size="sm" variant="outline" className="flex-1" onClick={download}>
-            <Download className="h-3.5 w-3.5 mr-1" /> MP4
+          <Button size="sm" variant="outline" className="flex-1" onClick={download} disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}>
+            <Download className="h-3.5 w-3.5 mr-1" /> {clip.trim_applied_at ? 'Trimmed MP4' : 'MP4'}
           </Button>
-          {clip.storage_url_mp4?.startsWith('/api/files/') && (
-            <Button size="sm" variant="outline" className="flex-1" onClick={downloadFromR2} title="Upload to Cloudflare R2 and get a 7-day shareable signed URL">
-              <Cloud className="h-3.5 w-3.5 mr-1" /> {clip.r2_key ? 'R2 Link' : 'To R2'}
-            </Button>
-          )}
+          <Button
+            size="sm"
+            variant={clip.r2_key ? 'default' : 'outline'}
+            className={`flex-1 ${clip.r2_key ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
+            onClick={downloadFromR2}
+            disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}
+            title={clip.r2_key ? 'Get a fresh signed CDN URL (1h) — already on R2' : 'Upload to Cloudflare R2 CDN and get a 7-day shareable signed URL'}
+          >
+            <Cloud className="h-3.5 w-3.5 mr-1" /> {clip.r2_key ? 'CDN Link' : 'Upload to R2'}
+          </Button>
           <Drawer>
             <DrawerTrigger asChild>
               <Button size="sm" className="flex-1 gradient-bg text-white hover:opacity-90">
@@ -1070,14 +1110,17 @@ function TrimCropButton({ clip, onUpdate }) {
   async function save() {
     setSaving(true)
     try {
-      const r = await fetch(`/api/clips/${clip.id}`, {
-        method: 'PUT', headers: { 'content-type': 'application/json' },
+      // POST /apply-trim actually re-renders the MP4 with new bounds + crop (not just metadata)
+      const r = await fetch(`/api/clips/${clip.id}/apply-trim`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ trim_start: trim[0], trim_end: trim[1], crop_aspect: aspect })
       })
-      const c = await r.json(); onUpdate(c)
-      toast.success('Trim & crop saved', { description: `${(trim[1] - trim[0]).toFixed(1)}s @ ${aspect}` })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Trim failed')
+      onUpdate(data.clip)
+      toast.success('✂️ Trim applied to MP4', { description: `${(trim[1] - trim[0]).toFixed(1)}s @ ${aspect} — re-downloads will get the trimmed file.` })
       setOpen(false)
-    } catch (e) { toast.error('Save failed') }
+    } catch (e) { toast.error('Trim failed', { description: e.message }) }
     finally { setSaving(false) }
   }
 

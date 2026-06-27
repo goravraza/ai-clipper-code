@@ -753,6 +753,171 @@ async function handle(request, { params }) {
     }
 
 
+    // POST /api/clips/:id/restyle  — re-burn captions with new style/position WITHOUT re-fetching from YouTube
+    if (path_.startsWith('/clips/') && path_.endsWith('/restyle') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      const body = await request.json()
+      const styleAss = body.style_ass || null
+      const stylePreset = body.style_preset || clip.style_preset
+      const overlaysConfig = body.overlays_config || clip.overlays_config
+      const fontSize = body.font_size || styleAss?.fontSize
+      const outlineSize = body.outline_size
+
+      try {
+        const clipFile = clip.storage_url_mp4.replace('/api/files/', '')
+        const srcPath = path.join('/app/data/uploads', clipFile)
+        if (!(await fs.stat(srcPath).catch(()=>null))) return NextResponse.json({ error: 'Source clip file missing' }, { status: 410 })
+
+        const tmpDir = `/tmp/restyle_${clipId}`
+        await fs.mkdir(tmpDir, { recursive: true })
+
+        const ass = { ...(styleAss || {}) }
+        if (fontSize)    ass.fontSize = Number(fontSize)
+        if (outlineSize !== undefined) ass.outline = Number(outlineSize)
+
+        // Build subtitles filter
+        const { spawn } = await import('child_process')
+        const captionPos = overlaysConfig?.caption?.position_percent ?? 78
+        const marginV = Math.max(20, Math.round((100 - Math.max(0, Math.min(100, captionPos))) * 9))
+        const baseStyle = { fontName:'DejaVu Sans', fontSize:18, primary:'&H00FFFFFF&', outlineColour:'&H00000000&', borderStyle:1, outline:2, shadow:0, bold:1 }
+        const s = { ...baseStyle, ...ass }
+        const styleParts = [
+          `FontName=${s.fontName}`, `FontSize=${s.fontSize}`, `PrimaryColour=${s.primary}`,
+          s.back ? `BackColour=${s.back}` : null,
+          `OutlineColour=${s.outlineColour}`, `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${s.shadow}`, `Bold=${s.bold}`, `Alignment=2`, `MarginV=${marginV}`,
+        ].filter(Boolean).join(',')
+
+        // Re-burn caption pass if we have stored SRT, otherwise just re-encode (effectively a no-op style swap fails gracefully)
+        const srtContent = clip.srt_content
+        const newPath = path.join('/app/data/uploads/clips', `${clipId}.mp4`)  // overwrite same key so existing references work
+        const tmpOut = path.join(tmpDir, 'restyled.mp4')
+
+        await new Promise((resolve, reject) => {
+          let vf = null
+          if (srtContent) {
+            const srtPath = path.join(tmpDir, 'cap.srt')
+            require('fs').writeFileSync(srtPath, srtContent, 'utf-8')
+            const escSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
+            vf = `subtitles='${escSrt}':force_style='${styleParts}'`
+          }
+          const args = ['-y', '-i', srcPath]
+          if (vf) args.push('-vf', vf)
+          args.push('-c:v','libx264','-preset','veryfast','-crf','22','-c:a','copy','-movflags','+faststart', tmpOut)
+          const p = spawn('/usr/bin/ffmpeg', args)
+          let stderr = ''
+          p.stderr.on('data', d => { stderr += d.toString() })
+          p.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}: ${stderr.slice(0,300)}`)))
+          p.on('error', reject)
+        })
+
+        await fs.rename(tmpOut, newPath)
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        await db.collection('generated_clips').updateOne(
+          { id: clipId },
+          { $set: { style_preset: stylePreset, overlays_config: overlaysConfig, restyled_at: new Date(), restyled_count: (clip.restyled_count || 0) + 1, captions_burned: !!srtContent } }
+        )
+        await logActivity(db, user.id, 'clip_restyled', request, { clip_id: clipId, style: stylePreset })
+
+        // Bust R2 cache if previously uploaded
+        if (clip.r2_key) {
+          try { const { deleteFromR2 } = await import('@/lib/r2'); await deleteFromR2({ db, key: clip.r2_key }); await db.collection('generated_clips').updateOne({ id: clipId }, { $unset: { r2_key: '', r2_size: '', r2_uploaded_at: '' } }) } catch {}
+        }
+
+        const updated = await db.collection('generated_clips').findOne({ id: clipId })
+        return NextResponse.json({ ok: true, clip: strip(updated) })
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 })
+      }
+    }
+
+    // GET /api/clips/:id/download  — stream the clip with Content-Disposition: attachment (forces download)
+    if (path_.startsWith('/clips/') && path_.endsWith('/download') && method === 'GET') {
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      if (!clip.storage_url_mp4 || !clip.storage_url_mp4.startsWith('/api/files/')) {
+        return NextResponse.json({ error: 'No rendered MP4 for this clip' }, { status: 410 })
+      }
+      try {
+        const localPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
+        const stat = await fs.stat(localPath)
+        const data = await fs.readFile(localPath)
+        const safeName = String(clip.clip_title || 'clip').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'clip'
+        return new NextResponse(data, { headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(stat.size),
+          'content-disposition': `attachment; filename="${safeName}.mp4"`,
+          'cache-control': 'private, no-cache',
+        } })
+      } catch (e) { return NextResponse.json({ error: 'File missing on server' }, { status: 410 }) }
+    }
+
+    // POST /api/clips/:id/apply-trim  — actually re-render the MP4 with trim/crop bounds (the saved fields alone are metadata-only)
+    if (path_.startsWith('/clips/') && path_.endsWith('/apply-trim') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      if (!clip.storage_url_mp4 || !clip.storage_url_mp4.startsWith('/api/files/')) {
+        return NextResponse.json({ error: 'No rendered MP4 for this clip — cannot trim' }, { status: 410 })
+      }
+      const body = await request.json().catch(() => ({}))
+      const duration = (clip.end_time_seconds || 0) - (clip.start_time_seconds || 0)
+      let trimStart = Number.isFinite(body.trim_start) ? Math.max(0, Number(body.trim_start)) : 0
+      let trimEnd = Number.isFinite(body.trim_end) ? Math.min(duration, Number(body.trim_end)) : duration
+      if (trimEnd - trimStart < 1) return NextResponse.json({ error: 'Trim range must be at least 1 second' }, { status: 400 })
+      const cropAspect = body.crop_aspect || clip.crop_aspect || null
+      const localPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
+      if (!(await fs.stat(localPath).catch(()=>null))) return NextResponse.json({ error: 'Source MP4 missing on server' }, { status: 410 })
+
+      try {
+        const { spawn } = await import('child_process')
+        const tmpOut = path.join(UPLOAD_DIR, 'clips', `${clipId}.trim.mp4`)
+        // Build ffmpeg args: trim using -ss/-to (re-encode to keep keyframe accuracy), apply crop filter if asked
+        const args = ['-y', '-ss', String(trimStart), '-to', String(trimEnd), '-i', localPath]
+        if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
+          const [aw, ah] = cropAspect.split(':').map(Number)
+          // crop to target aspect from center, then scale to nearest even pixel
+          const cropExpr = `crop='min(iw,ih*${aw}/${ah})':'min(ih,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2,scale=trunc(iw/2)*2:trunc(ih/2)*2`
+          args.push('-vf', cropExpr)
+        }
+        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmpOut)
+        await new Promise((resolve, reject) => {
+          const p = spawn('/usr/bin/ffmpeg', args)
+          let stderr = ''
+          p.stderr.on('data', d => { stderr += d.toString() })
+          p.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}: ${stderr.slice(-300)}`)))
+          p.on('error', reject)
+        })
+        await fs.rename(tmpOut, localPath)
+        // Re-generate thumbnail at the trimmed midpoint
+        try {
+          const thumbPath = localPath.replace(/\.mp4$/, '.jpg')
+          await new Promise((resolve) => {
+            const p = spawn('/usr/bin/ffmpeg', ['-y', '-ss', String((trimEnd - trimStart) / 2), '-i', localPath, '-frames:v', '1', '-q:v', '3', '-vf', 'scale=540:-2', thumbPath])
+            p.on('close', () => resolve())
+            p.on('error', () => resolve())
+          })
+        } catch {}
+        await db.collection('generated_clips').updateOne(
+          { id: clipId },
+          { $set: { trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect, trim_applied_at: new Date(), trim_version: (clip.trim_version || 0) + 1 } }
+        )
+        // Bust R2 cache if it was uploaded — the trimmed MP4 is now different
+        if (clip.r2_key) {
+          try { const { deleteFromR2 } = await import('@/lib/r2'); await deleteFromR2({ db, key: clip.r2_key }); await db.collection('generated_clips').updateOne({ id: clipId }, { $unset: { r2_key: '', r2_size: '', r2_uploaded_at: '' } }) } catch {}
+        }
+        await logActivity(db, user.id, 'clip_trim_applied', request, { clip_id: clipId, trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect })
+        const updated = await db.collection('generated_clips').findOne({ id: clipId })
+        return NextResponse.json({ ok: true, clip: strip(updated), final_duration: trimEnd - trimStart })
+      } catch (e) {
+        return NextResponse.json({ error: 'Trim render failed: ' + e.message }, { status: 500 })
+      }
+    }
+
     // ============= R2 / FULL VIDEO DOWNLOAD =============
     // POST /api/clips/:id/upload-to-r2  — upload a generated clip to R2 and return a signed URL
     if (path_.startsWith('/clips/') && path_.endsWith('/upload-to-r2') && method === 'POST') {
