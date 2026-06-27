@@ -813,7 +813,8 @@ async function handle(request, { params }) {
           p.on('error', reject)
         })
 
-        await fs.rename(tmpOut, newPath)
+        await fs.copyFile(tmpOut, newPath)
+        try { await fs.unlink(tmpOut) } catch {}
         try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
         await db.collection('generated_clips').updateOne(
           { id: clipId },
