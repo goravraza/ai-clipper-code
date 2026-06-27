@@ -156,6 +156,10 @@ export default function HomePage() {
   const [couponCode, setCouponCode] = useState('')
   const [couponData, setCouponData] = useState(null)
   const [validatingCoupon, setValidatingCoupon] = useState(false)
+  // NEW: clip length range + caption burn-in
+  const [clipLengthPreset, setClipLengthPreset] = useState('30-60') // '10-30' | '30-60' | '60-90'
+  const [burnCaptions, setBurnCaptions] = useState(true)
+  const [purchasing, setPurchasing] = useState(null)
   const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
@@ -235,17 +239,34 @@ export default function HomePage() {
     window.location.reload()
   }
 
-  function handleBuy(pkg) {
-    if (!geo) return
-    const isIndia = geo.country_code === 'IN'
-    const w = window.open('about:blank', '_blank')
-    if (isIndia) {
-      toast.success(`Opening Razorpay checkout for ${pkg.name}`, { description: `Amount: ₹${pkg.price_inr.toLocaleString('en-IN')} — Razorpay (MOCK)` })
-      w?.document?.write(`<html><body style="font-family:system-ui;background:#0a0a14;color:white;padding:40px;text-align:center"><h1 style="color:#3399cc">Razorpay</h1><h2>${pkg.name}</h2><p style="font-size:32px">₹${pkg.price_inr.toLocaleString('en-IN')}</p><p>Mock payment interface.</p></body></html>`)
-    } else {
-      toast.success(`Opening Lemon Squeezy checkout for ${pkg.name}`, { description: `Amount: $${pkg.price_usd} — Lemon Squeezy (MOCK)` })
-      w?.document?.write(`<html><body style="font-family:system-ui;background:#fff8e7;color:#111;padding:40px;text-align:center"><h1 style="color:#FFC233">🍋 Lemon Squeezy</h1><h2>${pkg.name}</h2><p style="font-size:32px">$${pkg.price_usd}</p><p>Mock payment interface.</p></body></html>`)
-    }
+  async function handleBuy(pkg) {
+    if (!pkg) return
+    setPurchasing(pkg.id)
+    try {
+      const r = await fetch('/api/packages/purchase', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          package_id: pkg.id,
+          coupon_code: couponData?.valid ? couponData.code : undefined,
+          billing_cycle: billingCycle,
+          country: geo?.country_code,
+        }),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Purchase failed')
+      toast.success(`✅ ${data.message || `+${data.credits_added} min added`}`, {
+        description: `New balance: ${data.new_balance_minutes} min — paid ${data.currency} ${data.amount_paid}${data.coupon_applied ? ` (coupon ${data.coupon_applied})` : ''}`,
+      })
+      // refresh profile to show new credit balance
+      const me = await fetch('/api/auth/me').then(r => r.json())
+      setProfile(me.user)
+    } catch (e) { toast.error('Purchase failed', { description: e.message }) }
+    finally { setPurchasing(null) }
+  }
+
+  function getClipRange() {
+    const [min, max] = clipLengthPreset.split('-').map(Number)
+    return { clip_min: min, clip_max: max }
   }
 
   async function handleIngest() {
@@ -253,16 +274,16 @@ export default function HomePage() {
     setIsIngesting(true)
     setProcessing({ status: 'queued', progress: 0 })
     try {
+      const { clip_min, clip_max } = getClipRange()
       const r = await fetch('/api/ai/analyze', {
         method: 'POST', headers: { 'content-type':'application/json' },
-        body: JSON.stringify({ url: urlInput })
+        body: JSON.stringify({ url: urlInput, clip_min, clip_max, add_captions: burnCaptions })
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'AI failed')
       const videoId = data.video_id
-      toast.info('Processing started \u2014 downloading, transcribing, then cutting with FFmpeg', { description: 'This usually takes 1\u20133 minutes for short videos.' })
+      toast.info('Processing started — downloading, transcribing, then cutting with FFmpeg', { description: 'This usually takes 1–3 minutes for short videos.' })
 
-      // Poll status until done
       const startTs = Date.now()
       while (Date.now() - startTs < 8 * 60 * 1000) {
         await new Promise(r => setTimeout(r, 2500))
@@ -270,10 +291,12 @@ export default function HomePage() {
         const sd = await sr.json()
         setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
         if (sd.status === 'completed') {
-          toast.success(`\u2705 ${sd.clip_count || sd.clips?.length || 0} real clips ready!`, { description: `From: ${sd.title || urlInput.slice(0,50)}` })
-          // refresh clips
-          const fresh = await fetch('/api/clips').then(r => r.json())
-          setClips(fresh)
+          toast.success(`✅ ${sd.clip_count || sd.clips?.length || 0} clips ready! (${sd.credits_charged || 0} credits used)`, { description: `From: ${sd.title || urlInput.slice(0,50)}` })
+          const [fresh, me] = await Promise.all([
+            fetch('/api/clips').then(r => r.json()),
+            fetch('/api/auth/me').then(r => r.json()),
+          ])
+          setClips(fresh); setProfile(me.user)
           setUrlInput('')
           break
         }
@@ -301,10 +324,14 @@ export default function HomePage() {
     setIsIngesting(true)
     setProcessing({ status: 'uploading', progress: 0 })
     try {
+      const { clip_min, clip_max } = getClipRange()
       const form = new FormData()
       form.append('file', file)
       form.append('kind', 'workspace_video')
-      toast.info(`Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)\u2026`)
+      form.append('clip_min', String(clip_min))
+      form.append('clip_max', String(clip_max))
+      form.append('add_captions', String(burnCaptions))
+      toast.info(`Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`)
       const r = await fetch('/api/upload', { method: 'POST', body: form })
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'Upload failed')
@@ -316,9 +343,12 @@ export default function HomePage() {
         const sd = await sr.json()
         setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
         if (sd.status === 'completed') {
-          toast.success(`\u2705 ${sd.clip_count || sd.clips?.length || 0} real clips ready!`, { description: `From: ${sd.title}` })
-          const fresh = await fetch('/api/clips').then(r => r.json())
-          setClips(fresh)
+          toast.success(`✅ ${sd.clip_count || sd.clips?.length || 0} clips ready! (${sd.credits_charged || 0} credits used)`, { description: `From: ${sd.title}` })
+          const [fresh, me] = await Promise.all([
+            fetch('/api/clips').then(r => r.json()),
+            fetch('/api/auth/me').then(r => r.json()),
+          ])
+          setClips(fresh); setProfile(me.user)
           break
         }
         if (sd.status === 'failed') {
@@ -455,6 +485,47 @@ export default function HomePage() {
                   <Youtube className="h-4 w-4 text-red-500" /> YouTube <span>•</span>
                   <Instagram className="h-4 w-4 text-pink-500" /> Reels <span>•</span>
                   <Music2 className="h-4 w-4 text-foreground" /> TikTok
+                </div>
+
+                {/* CLIP LENGTH + CAPTIONS controls */}
+                <div className="rounded-xl border border-border bg-muted/30 p-4 space-y-4">
+                  <div className="space-y-2">
+                    <Label className="flex items-center gap-1.5 text-sm font-medium">
+                      <Scissors className="h-3.5 w-3.5 text-primary" /> Clip Length
+                    </Label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { value: '10-30', label: '10–30s', sub: 'TikTok hooks' },
+                        { value: '30-60', label: '30–60s', sub: 'Shorts / Reels' },
+                        { value: '60-90', label: '60–90s', sub: 'Long-form' },
+                      ].map(opt => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setClipLengthPreset(opt.value)}
+                          className={`rounded-lg border px-3 py-2 text-left transition-all ${clipLengthPreset === opt.value ? 'border-primary bg-primary/10 ring-2 ring-primary/30' : 'border-border bg-background hover:border-primary/50'}`}
+                        >
+                          <div className="text-sm font-semibold">{opt.label}</div>
+                          <div className="text-[10px] text-muted-foreground">{opt.sub}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <Separator />
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <Label className="flex items-center gap-1.5 text-sm font-medium">
+                        <Captions className="h-3.5 w-3.5 text-primary" /> Burn captions into clips
+                      </Label>
+                      <p className="text-xs text-muted-foreground mt-0.5">Auto-generated by Whisper, baked into the video for TikTok / Reels.</p>
+                    </div>
+                    <Switch checked={burnCaptions} onCheckedChange={setBurnCaptions} />
+                  </div>
+                  <div className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+                    <Coins className="h-3 w-3" />
+                    Cost: <span className="font-semibold text-foreground">1 credit per minute</span> of source video.
+                    You have <span className="font-semibold text-primary">{profile?.credit_balance_minutes ?? 0} credits</span>.
+                  </div>
                 </div>
 
                 {/* PROCESSING PROGRESS */}
@@ -621,7 +692,10 @@ export default function HomePage() {
                       {dynamicPrice.couponDiscount > 0 && <Badge className="gradient-bg text-white border-transparent">+{dynamicPrice.couponDiscount}% coupon</Badge>}
                     </div>
                   </div>
-                  <Button size="lg" className="gradient-bg text-white hover:opacity-90" onClick={() => handleBuy(selectedPack)}>{t.buy} {selectedPack.name}</Button>
+                  <Button size="lg" disabled={purchasing === selectedPack.id} className="gradient-bg text-white hover:opacity-90" onClick={() => handleBuy(selectedPack)}>
+                    {purchasing === selectedPack.id ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
+                    {t.buy} {selectedPack.name}
+                  </Button>
                 </div>
               )}
             </CardContent>
@@ -648,7 +722,8 @@ export default function HomePage() {
                       <li className="flex items-center gap-2"><Languages className="h-4 w-4 text-primary" /> 40+ subtitle languages</li>
                       <li className="flex items-center gap-2"><Calendar className="h-4 w-4 text-primary" /> Social scheduling</li>
                     </ul>
-                    <Button onClick={() => handleBuy(pkg)} className={`w-full ${pkg.is_featured ? 'gradient-bg text-white' : ''}`} variant={pkg.is_featured ? 'default' : 'outline'}>
+                    <Button onClick={() => handleBuy(pkg)} disabled={purchasing === pkg.id} className={`w-full ${pkg.is_featured ? 'gradient-bg text-white' : ''}`} variant={pkg.is_featured ? 'default' : 'outline'}>
+                      {purchasing === pkg.id ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
                       {isIndia ? 'Pay via Razorpay' : 'Pay via Lemon Squeezy'}
                     </Button>
                   </CardContent>

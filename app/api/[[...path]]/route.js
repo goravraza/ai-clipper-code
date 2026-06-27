@@ -544,6 +544,10 @@ async function handle(request, { params }) {
       // ============= WORKSPACE VIDEO UPLOAD \u2014 kicks off full processing =============
       if (kind === 'workspace_video') {
         const user = await getUser(request, db)
+        const clipMin = Math.max(5, parseInt(form.get('clip_min')) || 30)
+        const clipMax = Math.max(clipMin + 5, parseInt(form.get('clip_max')) || 60)
+        const addCaptions = form.get('add_captions') !== 'false'
+
         const originalsDir = '/app/data/uploads/originals/' + id
         await fs.mkdir(originalsDir, { recursive: true })
         const filename = `video.${ext}`
@@ -551,18 +555,28 @@ async function handle(request, { params }) {
         const buffer = Buffer.from(await file.arrayBuffer())
         await fs.writeFile(fullPath, buffer)
 
+        // Quick credit pre-check using file size as a rough proxy (1MB ≈ 1min for 360p H.264)
+        // Actual deduction happens after ffprobe knows the true duration.
+        const estimatedMinutes = Math.max(1, Math.ceil(buffer.length / (1024 * 1024 * 2)))
+        if ((user?.credit_balance_minutes ?? 0) < estimatedMinutes) {
+          await fs.rm(originalsDir, { recursive: true, force: true }).catch(()=>{})
+          return NextResponse.json({ error: `Insufficient credits. You have ${user?.credit_balance_minutes || 0} min — this video needs ~${estimatedMinutes} min. Buy a package below.` }, { status: 402 })
+        }
+
         await db.collection('videos_processed').insertOne({
           id, user_id: user.id, original_url: `local:${file.name}`,
           source_type: 'upload', title: file.name, thumbnail_url: null,
           status: 'queued', progress: 0,
+          clip_length_range: { min: clipMin, max: clipMax },
+          add_captions: addCaptions,
           created_at: new Date(), updated_at: new Date(),
         })
-        await logActivity(db, user.id, 'video_uploaded', request, { filename: file.name, size: buffer.length })
+        await logActivity(db, user.id, 'video_uploaded', request, { filename: file.name, size: buffer.length, clip_range: `${clipMin}-${clipMax}s` })
 
         const { processVideoInBackground } = await import('@/lib/video-processor')
-        processVideoInBackground({ videoId: id, localFile: fullPath, userId: user.id, db, callLLM }).catch(e => console.error('bg fail', e))
+        processVideoInBackground({ videoId: id, localFile: fullPath, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions }).catch(e => console.error('bg fail', e))
 
-        return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length })
+        return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions })
       }
 
       const subdir = kind === 'meme_thumbnail' ? 'thumbs' : 'memes'
@@ -592,6 +606,15 @@ async function handle(request, { params }) {
       const body = await request.json()
       const url = body.url || ''
       if (!url) return NextResponse.json({ error: 'url required' }, { status: 400 })
+      const clipMin = Math.max(5, parseInt(body.clip_min) || 30)
+      const clipMax = Math.max(clipMin + 5, parseInt(body.clip_max) || 60)
+      const addCaptions = body.add_captions !== false
+
+      // Light pre-check — assume at least 1 credit; real deduction happens after ffprobe
+      if ((user?.credit_balance_minutes ?? 0) < 1) {
+        return NextResponse.json({ error: 'Insufficient credits. Buy a package below to continue.' }, { status: 402 })
+      }
+
       const meta = await metadataForUrl(url)
       const videoId = uuidv4()
       await db.collection('videos_processed').insertOne({
@@ -599,15 +622,16 @@ async function handle(request, { params }) {
         source_type: meta.source_type || 'other',
         title: meta.title || null, thumbnail_url: meta.thumbnail || null,
         status: 'queued', progress: 0,
+        clip_length_range: { min: clipMin, max: clipMax },
+        add_captions: addCaptions,
         created_at: new Date(), updated_at: new Date(),
       })
-      await logActivity(db, user.id, 'ai_analyze_started', request, { url })
+      await logActivity(db, user.id, 'ai_analyze_started', request, { url, clip_range: `${clipMin}-${clipMax}s` })
 
-      // Fire-and-forget background pipeline (yt-dlp + transcribe + AI + ffmpeg)
       const { processVideoInBackground } = await import('@/lib/video-processor')
-      processVideoInBackground({ videoId, url, userId: user.id, db, callLLM }).catch(e => console.error('bg fail', e))
+      processVideoInBackground({ videoId, url, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions }).catch(e => console.error('bg fail', e))
 
-      return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title })
+      return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions })
     }
 
     // GET /api/videos/:id  — poll processing status
@@ -719,6 +743,84 @@ async function handle(request, { params }) {
       await logActivity(db, profile.id, 'password_reset_completed', request, {})
       return NextResponse.json({ ok: true })
     }
+
+
+    // ============= PACKAGE PURCHASE (simulated checkout, adds credits) =============
+    // POST /api/packages/purchase  body: { package_id, coupon_code?, billing_cycle? }
+    if (path_ === '/packages/purchase' && method === 'POST') {
+      const user = await getUser(request, db)
+      if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
+      const body = await request.json()
+      const pkg = await db.collection('pricing_packages').findOne({ id: body.package_id })
+      if (!pkg) return NextResponse.json({ error: 'Package not found' }, { status: 404 })
+
+      // Geo to determine currency
+      const ipHeader = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || ''
+      const isIndia = /^(India|IN)$/i.test(body.country || '') || /^\s*(IN)\s*$/i.test(ipHeader)
+      const currency = isIndia ? 'INR' : 'USD'
+      let amount = isIndia ? pkg.price_inr : pkg.price_usd
+      const billingCycle = body.billing_cycle === 'year' ? 'year' : 'month'
+      if (billingCycle === 'year') amount = amount * 12 * 0.8
+
+      // Coupon
+      let couponDiscount = 0
+      let appliedCoupon = null
+      if (body.coupon_code) {
+        const code = String(body.coupon_code).trim().toUpperCase()
+        const c = await db.collection('coupon_codes').findOne({ code })
+        if (c && c.is_active && (!c.expires_at || new Date(c.expires_at) > new Date()) && (!c.max_redemptions || c.current_redemptions < c.max_redemptions)) {
+          couponDiscount = c.discount_percent
+          appliedCoupon = c
+          amount = amount * (1 - couponDiscount / 100)
+          await db.collection('coupon_codes').updateOne({ id: c.id }, { $inc: { current_redemptions: 1 } })
+        }
+      }
+
+      const creditsAdded = pkg.credit_amount_minutes * (billingCycle === 'year' ? 12 : 1)
+      const txnId = uuidv4()
+
+      // === MOCK PAYMENT: in production, replace with Stripe Checkout / Razorpay Order creation ===
+      // Successful payment → credit the user
+      const updateRes = await db.collection('profiles').findOneAndUpdate(
+        { id: user.id },
+        { $inc: { credit_balance_minutes: creditsAdded } },
+        { returnDocument: 'after' }
+      )
+      const updated = updateRes?.value || updateRes
+      const newBalance = updated?.credit_balance_minutes ?? (user.credit_balance_minutes + creditsAdded)
+
+      await db.collection('credit_transactions').insertOne({
+        id: txnId, user_id: user.id, package_id: pkg.id, package_name: pkg.name,
+        amount: creditsAdded, currency, price_paid: Math.round(amount * 100) / 100,
+        coupon_code: appliedCoupon?.code || null, coupon_discount_percent: couponDiscount,
+        billing_cycle: billingCycle, payment_processor: isIndia ? 'razorpay' : 'lemon_squeezy',
+        payment_status: 'completed_simulated', reason: 'package_purchase',
+        created_at: new Date(),
+      })
+      await logActivity(db, user.id, 'package_purchased', request, { package: pkg.name, amount, currency, credits: creditsAdded })
+
+      return NextResponse.json({
+        ok: true,
+        package_name: pkg.name,
+        credits_added: creditsAdded,
+        new_balance_minutes: newBalance,
+        amount_paid: Math.round(amount * 100) / 100,
+        currency,
+        billing_cycle: billingCycle,
+        coupon_applied: appliedCoupon?.code || null,
+        transaction_id: txnId,
+        payment_status: 'completed_simulated',
+        message: `+${creditsAdded} minutes added. (MOCK payment — real Stripe/Razorpay wiring pending.)`,
+      })
+    }
+
+    // GET /api/transactions  — user's purchase history
+    if (path_ === '/transactions' && method === 'GET') {
+      const user = await getUser(request, db)
+      const list = await db.collection('credit_transactions').find({ user_id: user.id }).sort({ created_at: -1 }).limit(50).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+
 
     // ============= COUPONS =============
     // Public validate
