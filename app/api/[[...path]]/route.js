@@ -753,8 +753,66 @@ async function handle(request, { params }) {
     }
 
 
+    // ============= R2 / FULL VIDEO DOWNLOAD =============
+    // POST /api/clips/:id/upload-to-r2  — upload a generated clip to R2 and return a signed URL
+    if (path_.startsWith('/clips/') && path_.endsWith('/upload-to-r2') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      try {
+        const { uploadToR2 } = await import('@/lib/r2')
+        const localPath = path.join('/app/data/uploads', clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
+        const key = `clips/${user.id}/${clipId}.mp4`
+        const result = await uploadToR2({ db, localPath, key, contentType: 'video/mp4', expiresInSeconds: 7 * 86400 })
+        await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { r2_key: result.key, r2_bucket: result.bucket, r2_size: result.size, r2_uploaded_at: new Date() } })
+        await logActivity(db, user.id, 'clip_uploaded_to_r2', request, { clip_id: clipId, size: result.size })
+        return NextResponse.json({ ok: true, signed_url: result.signedUrl, public_url: result.publicUrl, size: result.size, expires_in_seconds: 7 * 86400 })
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 })
+      }
+    }
+
+    // POST /api/videos/:id/download-full  — fetch full video (via cookies+proxy), upload to R2, return signed URL
+    if (path_.startsWith('/videos/') && path_.endsWith('/download-full') && method === 'POST') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const video = await db.collection('videos_processed').findOne({ id: vid })
+      if (!video) return NextResponse.json({ error: 'Video not found' }, { status: 404 })
+
+      try {
+        const { fetchFullVideoFromYouTube } = await import('@/lib/video-processor')
+        const { uploadToR2 } = await import('@/lib/r2')
+        const tmpDir = `/tmp/fullvideo_${vid}`
+        await fs.mkdir(tmpDir, { recursive: true })
+        const localFull = video.source_type === 'upload'
+          ? path.join('/app/data/uploads/originals', vid, (await fs.readdir(path.join('/app/data/uploads/originals', vid)).catch(()=>[]))[0] || '')
+          : await fetchFullVideoFromYouTube({ url: video.original_url, outDir: tmpDir, db, maxHeight: 720 })
+
+        const key = `full/${user.id}/${vid}.mp4`
+        const result = await uploadToR2({ db, localPath: localFull, key, contentType: 'video/mp4', expiresInSeconds: 7 * 86400 })
+        await db.collection('videos_processed').updateOne({ id: vid }, { $set: { r2_key: result.key, r2_size: result.size, r2_uploaded_at: new Date() } })
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        await logActivity(db, user.id, 'full_video_uploaded_to_r2', request, { video_id: vid, size: result.size })
+        return NextResponse.json({ ok: true, signed_url: result.signedUrl, public_url: result.publicUrl, size: result.size, expires_in_seconds: 7 * 86400 })
+      } catch (e) {
+        return NextResponse.json({ error: e.message }, { status: 500 })
+      }
+    }
+
+    // GET /api/clips/:id/signed-url  — fetch fresh signed URL for previously-uploaded R2 clip
+    if (path_.startsWith('/clips/') && path_.endsWith('/signed-url') && method === 'GET') {
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip?.r2_key) return NextResponse.json({ error: 'Clip not on R2 — upload first' }, { status: 404 })
+      try {
+        const { getR2SignedUrl } = await import('@/lib/r2')
+        const signedUrl = await getR2SignedUrl({ db, key: clip.r2_key, expiresInSeconds: 3600 })
+        return NextResponse.json({ signed_url: signedUrl, expires_in_seconds: 3600 })
+      } catch (e) { return NextResponse.json({ error: e.message }, { status: 500 }) }
+    }
+
     // ============= PACKAGE PURCHASE (simulated checkout, adds credits) =============
-    // POST /api/packages/purchase  body: { package_id, coupon_code?, billing_cycle? }
     if (path_ === '/packages/purchase' && method === 'POST') {
       const user = await getUser(request, db)
       if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })

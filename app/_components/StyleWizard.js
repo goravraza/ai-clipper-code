@@ -109,6 +109,7 @@ export default function StyleWizard({ open, onClose, onComplete, payload }) {
   const [language, setLanguage] = useState('auto')
   const [stylePreset, setStylePreset] = useState('the_beast')
   const [overlays, setOverlays] = useState(DEFAULT_OVERLAYS)
+  const [trimRange, setTrimRange] = useState([0, 60])  // user-defined trim window in seconds
   const [busy, setBusy] = useState(false)
 
   // Reset to step 1 each time wizard opens
@@ -126,6 +127,8 @@ export default function StyleWizard({ open, onClose, onComplete, payload }) {
       language,
       style_preset: stylePreset,
       style_ass: selectedPreset.ass,
+      trim_start_seconds: trimRange[0],
+      trim_end_seconds: trimRange[1],
       overlays_config: {
         caption:    { enabled: overlays.caption.enabled,    position_percent: overlays.caption.position },
         hook:       { enabled: overlays.hook.enabled,       position_percent: overlays.hook.position },

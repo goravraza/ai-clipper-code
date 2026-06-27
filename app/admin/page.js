@@ -96,6 +96,27 @@ const INTEGRATIONS = [
     docsUrl: 'https://developer.paypal.com/dashboard/applications',
   },
   {
+    provider: 'youtube_cookies', name: 'YouTube Cookies', category: 'infra', icon: Key,
+    description: 'Netscape-format cookies.txt for yt-dlp. Improves YouTube ingestion success rate. Must be paired with a HTTP Proxy when datacenter IP is blocked.',
+    fields: [
+      { key: 'cookies_text', label: 'cookies.txt content', type: 'textarea', placeholder: '# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...' },
+      { key: 'notes', label: 'Notes (optional)', type: 'text' },
+    ],
+    docsUrl: 'https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp',
+  },
+  {
+    provider: 'cloudflare_r2', name: 'Cloudflare R2 (video storage)', category: 'infra', icon: Key,
+    description: 'S3-compatible object storage for full-video delivery (~$0.015/GB egress vs. AWS $0.09). Used for "Download Full Video" feature.',
+    fields: [
+      { key: 'account_id', label: 'Account ID', type: 'text', placeholder: '8535b8d53861d501df7eff4b18f7a2ee' },
+      { key: 'access_key_id', label: 'Access Key ID', type: 'password' },
+      { key: 'secret_access_key', label: 'Secret Access Key', type: 'password' },
+      { key: 'bucket', label: 'Bucket name', type: 'text', placeholder: 'clipforge-videos' },
+      { key: 'public_domain', label: 'Public custom domain (optional)', type: 'text', placeholder: 'https://videos.yourdomain.com' },
+    ],
+    docsUrl: 'https://developers.cloudflare.com/r2/api/tokens/',
+  },
+  {
     provider: 'http_proxy', name: 'HTTP Proxy (for YouTube)', category: 'infra', icon: Key,
     description: 'Residential / datacenter HTTP proxy used by yt-dlp + ffmpeg to bypass YouTube IP blocks. Required for YouTube URL ingestion. Format: http(s)://user:pass@host:port',
     fields: [
@@ -311,13 +332,22 @@ function IntegrationCard({ meta, existing, onSave, onDelete }) {
           <div key={field.key} className="space-y-1">
             <Label className="text-xs text-muted-foreground">{field.label}</Label>
             <div className="relative">
-              <Input
-                type={field.type === 'password' && !revealing ? 'password' : 'text'}
-                placeholder={field.placeholder || ''}
-                value={values[field.key] ?? ''}
-                onChange={(e) => setValues(prev => ({ ...prev, [field.key]: e.target.value }))}
-                className="font-mono text-xs pr-9"
-              />
+              {field.type === 'textarea' ? (
+                <textarea
+                  placeholder={field.placeholder || ''}
+                  value={values[field.key] ?? ''}
+                  onChange={(e) => setValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                  className="font-mono text-[10px] w-full min-h-[120px] max-h-[200px] rounded-md border border-input bg-background px-3 py-2 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              ) : (
+                <Input
+                  type={field.type === 'password' && !revealing ? 'password' : 'text'}
+                  placeholder={field.placeholder || ''}
+                  value={values[field.key] ?? ''}
+                  onChange={(e) => setValues(prev => ({ ...prev, [field.key]: e.target.value }))}
+                  className="font-mono text-xs pr-9"
+                />
+              )}
               {field.type === 'password' && (
                 <button type="button" onClick={() => setRevealing(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                   {revealing ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
