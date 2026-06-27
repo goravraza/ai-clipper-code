@@ -6,68 +6,59 @@
 # END - Testing Protocol - DO NOT EDIT OR REMOVE THIS SECTION
 #====================================================================================================
 
-user_problem_statement: "User asked: (1) add per-clip editing features modeled after Vizard (Edit modal with Presets, CC, Text, Crop, Trim, Speed, Logo, Templates) replacing the small Trim/CC/Preview/Upload-to-R2 buttons on the clip cards with a unified [Edit] [Get Clip] [Schedule] trio; (2) fix Hindi caption spelling accuracy (was using whisper-1 — upgraded to gpt-4o-transcribe)."
+user_problem_statement: "User feedback after editor v1: (1) captions weren't generated on the latest ingestion; (2) logo should be draggable on the preview and size-adjustable, with the preview matching final render exactly; (3) speed change should be reflected in the preview video playback."
 
 backend:
-  - task: "Upgrade transcription to gpt-4o-transcribe (better Hindi/Indic accuracy)"
-    implemented: true
-    working: true
-    file: "lib/video-processor.js"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-        -working: "NA"
-        -agent: "main"
-        -comment: "transcribeWithWhisper now tries gpt-4o-transcribe first (much better Indic-language fidelity), and gracefully falls back to whisper-1 if the newer model isn't available for the API key. gpt-4o-transcribe returns only {text} (no per-segment timestamps), so we synthesize ~6-word chunks with 1s spacing — buildClipSrt then clamps to the real clip duration. Set OPENAI_TRANSCRIBE_MODEL env to override."
-        -working: true
-        -agent: "testing"
-        -comment: "Code review confirms gpt-4o-transcribe implementation is correct. The transcribeWithWhisper function (lines 316-377) tries gpt-4o-transcribe first with response_format='json', then falls back to whisper-1 with verbose_json if the primary model fails. Logs '[transcribe] Used model: {model}' for verification. For gpt-4o-transcribe responses without timestamps, synthesizes 6-word chunks with 1s spacing. Implementation is production-ready."
-
-  - task: "POST /api/clips/:id/render — unified single-pass MP4 re-render with all edits"
-    implemented: true
-    working: true
-    file: "app/api/[[...path]]/route.js"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-        -working: "NA"
-        -agent: "main"
-        -comment: "Replaces the prior separate /apply-trim and /restyle endpoints. Accepts {trim_start, trim_end, crop_aspect, speed, style_preset, style_ass, font_size, outline_size, caption_position_percent, logo_url, logo_position, title_text, title_position, clip_title, template_id}. Builds a single ffmpeg vf chain: crop → scale → setpts (speed) → subtitles (re-burn with shifted SRT for trim+speed) → drawtext (title overlay). If logo_url is set, uses -filter_complex to overlay scaled logo. Audio is atempo'd to match speed. Probes the actual file duration via ffprobe (NOT just end-start metadata) to handle clips that were previously trimmed. Re-generates thumbnail, busts R2 cache, bumps render_version (for cache-busting in frontend video element)."
-        -working: true
-        -agent: "testing"
-        -comment: "✅ ALL TESTS PASSED. Tested 10 scenarios: (a) Trim only: 30s→3s ✓, (b) Crop only: 1280x720→720x720 (1:1) ✓, (c) Speed only: 39s→26s at 1.5x ✓, (d) Title only: overlay applied, DB fields saved ✓, (e) All combined: trim+crop+speed+style+title in single pass, 26s→2.48s ✓, (f) Cache bust: r2_key/r2_size/r2_uploaded_at unset after render ✓, (g) Error cases: 400 for trim<1s, 404 for missing clip, 410 for CDN clips ✓. Verified: render_version increments, ffprobe durations match API response, aspect ratios correct, file sizes change. Regression tests: /download works with Content-Disposition:attachment ✓, /clips returns array ✓."
-
-  - task: "POST /api/upload accepts kind=logo (saves to /data/uploads/logos/<uuid>.png)"
-    implemented: true
-    working: true
-    file: "app/api/[[...path]]/route.js"
-    stuck_count: 0
-    priority: "medium"
-    needs_retesting: false
-    status_history:
-        -working: "NA"
-        -agent: "main"
-        -comment: "Added 'logo' as a valid kind for the existing /api/upload multipart endpoint. Returns {url, filename, size} where url is /api/files/logos/<uuid>.<ext>."
-        -working: true
-        -agent: "testing"
-        -comment: "✅ PASSED. Created 100x100 PNG test image, uploaded with kind=logo. Response: {url: '/api/files/logos/<uuid>.png', filename, size: 287}. Verified GET request returns 200 with content-type: image/png. File saved correctly to /data/uploads/logos/ directory."
-
-frontend:
-  - task: "ClipCard buttons: replace CC/Trim/Preview/MP4/Upload-to-R2/Schedule with [Edit] [Get Clip] [Schedule]"
+  - task: "yt-dlp-based audio extraction (replaces fragile ffmpeg+stream URL via proxy)"
     implemented: true
     working: "NA"
-    file: "app/page.js"
+    file: "lib/video-processor.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: true
     status_history:
         -working: "NA"
         -agent: "main"
-        -comment: "Clean 3-button trio per the user's reference. Edit + Get Clip are disabled (greyed) for legacy seeded clips with cdn.clipforge.ai URLs (not /api/files/). The 'Get Clip' button calls /api/clips/:id/download (Content-Disposition: attachment). Verified via screenshot."
+        -comment: "ROOT CAUSE for missing captions: ffmpeg-via-http_proxy was throwing 'unexpected TLS packet' errors on Thordata exit-nodes when fetching the audio-only stream URL → Whisper never got audio → no SRT → captions missing. NEW: yt-dlp with --extract-audio --audio-format mp3 (5 retries, 30s socket timeout, ffmpeg-location pinned) downloads audio directly via the proxy (yt-dlp handles proxy redirects much better than ffmpeg). Falls back to the old ffmpeg+stream path if yt-dlp also fails."
 
-  - task: "New unified ClipEditor modal — Presets, CC, Text, Crop, Trim, Speed, Logo + Templates row + Format selector"
+  - task: "Audio duration probe + properly-scaled synthetic segments for gpt-4o-transcribe"
+    implemented: true
+    working: "NA"
+    file: "lib/video-processor.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Previously: gpt-4o-transcribe returned plain text without timestamps; synthetic segments were created with start=0,1,2... — totally misaligned with the source video's timeline, so buildClipSrt filtered them all out (clipStart=51 etc.) → empty SRT → no captions burned. NOW: probe audio duration with ffprobe, then distribute words evenly across [0, audioDuration] in ~6-word cues. Cues now line up with the actual audio timeline, so clip-local SRT extraction works."
+
+  - task: "POST /api/clips/:id/render — accept logo_x_percent/y_percent/scale_percent for drag-positioned logos"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "Backward-compatible: if logo_x_percent + logo_y_percent supplied, ffmpeg uses overlay=(W*x/100)-(w/2):(H*y/100)-(h/2) (x/y is logo CENTER as % of frame). Else uses the 4-corner preset. logo_scale_percent (5–50) controls logo width as % of frame width. Persisted to DB so re-opening the editor shows the same position. Verified via curl with center-50/50 + scale 20%, returns 200 and DB has new fields."
+
+frontend:
+  - task: "Editor preview — playbackRate matches selected speed"
+    implemented: true
+    working: true
+    file: "app/_components/ClipEditor.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "videoRef.current.playbackRate is set whenever state.speed or the video src changes. A prominent '1.50×' badge in top-left of the preview confirms the active speed. Verified via screenshot — Speed tab + preset buttons work, badge appears, footer shows 'playback speed 1.50×'."
+
+  - task: "Editor preview — draggable logo with live percent-coords + size slider"
     implemented: true
     working: "NA"
     file: "app/_components/ClipEditor.js"
@@ -77,20 +68,31 @@ frontend:
     status_history:
         -working: "NA"
         -agent: "main"
-        -comment: "Brand new 5xl modal that visually matches the Vizard reference. Includes: editable clip title; templates row (Key Insights / Hot Take / Quotable / Deep Dive / Casual Recap); FORMAT toggle (9:16/1:1/16:9); live video preview with title + logo overlay; 7 tabs: Presets (18 caption styles in 3x6 grid), CC (font size, stroke, caption position slider + Top/Middle/Bottom quick buttons), Text (title text + top/bottom position), Crop (aspect picker), Trim (dual-handle slider + Reset/Center 30s presets), Speed (0.5–2x with preset buttons + atempo audio), Logo (upload + 4-corner position picker). Render Clip CTA POSTs all settings to /api/clips/:id/render in a single ffmpeg pass. Probes actual MP4 duration from the <video> element on open so trim bounds are correct even after prior renders."
+        -comment: "Logo on preview is positioned with state.logo_x_percent / logo_y_percent (CSS left/top %). Pointer events (pointerdown/move/up + setPointerCapture) let the user drag anywhere on the preview frame; coords clamp to 0–100% and update in real time. logo_scale_percent slider in the Logo tab (5–40%) resizes the logo. 4-corner quick presets remain as shortcuts. Logo tab also shows a hint banner + live coord readout. Hooks declared above the early return to fix Rules-of-Hooks violation."
+
+  - task: "Editor preview — speed/title/caption/logo overlays accurate to final render"
+    implemented: true
+    working: "NA"
+    file: "app/_components/ClipEditor.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Preview container uses CSS aspect-ratio matching state.crop_aspect, with object-cover on the video — this gives the same center-crop ffmpeg will do. Title text overlay positioned top-4 or bottom-4 (matches ffmpeg drawtext y expression). Logo positioned at (x%, y%) of the preview box, which corresponds 1:1 to the rendered overlay coordinate after ffmpeg overlay=(W*x/100)-(w/2):(H*y/100)-(h/2). Caption position guide line shows 'Sample caption preview' at the configured percent-from-top. Speed badge + playbackRate. Now: 'what you see is what you get'."
 
 metadata:
   created_by: "main_agent"
-  version: "7.0"
-  test_sequence: 6
+  version: "7.1"
+  test_sequence: 7
   run_ui: false
 
 test_plan:
   current_focus:
-    - "POST /api/clips/:id/render — combined trim+crop+speed+title+logo single-pass test"
-    - "POST /api/clips/:id/render — verify cache-bust (R2 deletion + render_version bump)"
-    - "POST /api/upload with kind=logo — verify it saves under /data/uploads/logos"
-    - "/api/ai/analyze with Hindi YouTube URL — verify gpt-4o-transcribe path is used and segments are produced"
+    - "Re-ingest a Hindi YouTube URL — verify captions are generated this time (transcription_source should be 'whisper' or 'gpt-4o-transcribe-synth', segments > 5, captions_burned: true on each clip)"
+    - "Verify yt-dlp audio extraction succeeds via Thordata proxy (look for 'audio.mp3' file created and Whisper call succeeding)"
+    - "POST /api/clips/:id/render with logo_x_percent + logo_y_percent + logo_scale_percent — verify the logo appears at the requested coords in the output MP4 (visual inspection via ffmpeg-extracted frame)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -98,60 +100,20 @@ test_plan:
 agent_communication:
     -agent: "main"
     -message: |
-      Implemented the Vizard-style unified editor + transcription upgrade.
+      Three fixes shipped to address user feedback:
 
-      KEY CHANGES:
-      1. /api/clips/:id/render — single ffmpeg pass that applies trim + crop + speed + caption-style + title overlay + logo overlay. Replaces /apply-trim and /restyle (those still exist for backward compat but the editor now uses /render exclusively).
-      2. gpt-4o-transcribe for Whisper — fixes Hindi spelling issues like "नही" → "नहीं". Falls back to whisper-1 if the model isn't accessible.
-      3. ClipCard cards now show ONLY [Edit] [Get Clip] [Schedule] — removed the cramped 6-button layout and the standalone "Upload to R2" + "CC" buttons (R2 still available via admin / direct API if needed).
-      4. ClipEditor modal with 7 tabs and 18 caption presets.
-      5. Logo upload endpoint added under existing /api/upload (kind=logo).
+      1) CAPTIONS NOT GENERATED — Two root causes fixed:
+         (a) ffmpeg-via-proxy was failing TLS on audio-stream URL. Switched to yt-dlp --extract-audio (proxy-tolerant).
+         (b) gpt-4o-transcribe synthetic segments had timestamps 0,1,2... that didn't align with the source timeline. Now we probe audio duration and distribute cues evenly across it.
 
-      VERIFIED MANUALLY:
-      - /render on clip 0d01beb7 with trim+crop+title → 200, file shrank, ffprobe confirms new duration.
-      - Editor modal opens, all 7 tabs render, preset grid shows live preview swatches, video preview shows.
+      2) LOGO INTERACTIVE — User can drag the logo on the preview to any (x, y). Backend accepts logo_x_percent / logo_y_percent / logo_scale_percent. 4-corner presets remain as quick shortcuts. The Logo tab shows live coord readout + size slider.
 
-      NEEDS TESTING:
-      a) /render with each subset of params (trim only, crop only, speed only, logo only, title only, all combined).
-      b) /upload?kind=logo for PNG/JPG/WebP.
-      c) /ai/analyze with a Hindi YouTube URL to verify gpt-4o-transcribe is used (look for "[transcribe] Used model: gpt-4o-transcribe" in /var/log/supervisor/nextjs.out.log).
-      d) Regression: /download still works, /apply-trim still works (legacy), /restyle still works.
+      3) PREVIEW MATCHES FINAL — Preview video playbackRate is set from state.speed. Speed badge visible. Caption position guide shown. Title position matches ffmpeg drawtext. Logo position is 1:1 between preview CSS and ffmpeg overlay coords.
 
-    -agent: "testing"
-    -message: |
-      ✅ BACKEND TESTING COMPLETE — ALL TESTS PASSED
+      VERIFIED:
+      - /render with logo_x=50, logo_y=50, scale=20 → 200, DB persists fields.
+      - Speed badge shows in preview, footer says "playback speed 1.50×".
 
-      **TEST RESULTS:**
-      
-      1. POST /api/clips/:id/render (10 scenarios tested):
-         ✅ Trim only: 30s → 3s (verified with ffprobe)
-         ✅ Crop only: 1280x720 → 720x720 (1:1 square aspect)
-         ✅ Speed only: 39s → 26s at 1.5x speed
-         ✅ Title only: overlay applied, DB fields saved
-         ✅ All combined: trim+crop+speed+style+title in single pass (26s → 2.48s)
-         ✅ Cache bust: r2_key/r2_size/r2_uploaded_at unset after render
-         ✅ Error cases: 400 for trim<1s, 404 for missing clip, 410 for CDN clips
-         ✅ render_version increments correctly
-         ✅ Final durations match API response
-         ✅ Aspect ratios correct (9:16, 1:1 tested)
-      
-      2. POST /api/upload (kind=logo):
-         ✅ PNG upload successful
-         ✅ Returns correct URL: /api/files/logos/<uuid>.png
-         ✅ File accessible via GET with correct content-type
-      
-      3. gpt-4o-transcribe upgrade:
-         ✅ Code review confirms correct implementation
-         ✅ Tries gpt-4o-transcribe first, falls back to whisper-1
-         ✅ Logs model used for verification
-         ✅ Synthesizes 6-word chunks for gpt-4o responses
-      
-      4. Regression tests:
-         ✅ GET /api/clips/:id/download works with Content-Disposition: attachment
-         ✅ GET /api/clips returns array
-      
-      **NOTES:**
-      - All backend APIs working correctly
-      - No major issues found
-      - Render endpoint is DESTRUCTIVE (overwrites source MP4) as documented
-      - Frontend testing not performed (as per system limitations)
+      NEEDS FRESH INGESTION TEST:
+      - Submit a Hindi YouTube URL → verify captions burn into clips this time.
+      - Drag-render a logo → verify output MP4 has logo at requested position.

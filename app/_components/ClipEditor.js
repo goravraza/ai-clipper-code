@@ -87,6 +87,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       caption_position_percent: clip.overlays_config?.caption?.position_percent ?? 78,
       logo_url: clip.logo_url || null,
       logo_position: clip.logo_position || 'top-right',
+      logo_x_percent: Number.isFinite(clip.logo_x_percent) ? clip.logo_x_percent : 90,
+      logo_y_percent: Number.isFinite(clip.logo_y_percent) ? clip.logo_y_percent : 10,
+      logo_scale_percent: Number.isFinite(clip.logo_scale_percent) ? clip.logo_scale_percent : 12,
       clip_title: clip.clip_title || '',
       duration: dur,
     }
@@ -98,6 +101,10 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   const [uploadingLogo, setUploadingLogo] = useState(false)
   const [probedDuration, setProbedDuration] = useState(null)
   const fileRef = useRef(null)
+  // Refs for preview interactions — declared before any early return
+  const videoRef = useRef(null)
+  const previewBoxRef = useRef(null)
+  const draggingRef = useRef(false)
 
   useEffect(() => { setState(initial); setTab('presets'); setProbedDuration(null) }, [initial])
 
@@ -123,6 +130,14 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     v.addEventListener('loadedmetadata', handler, { once: true })
     return () => v.removeEventListener('loadedmetadata', handler)
   }, [clip?.id, clip?.storage_url_mp4, clip?.render_version])
+
+  // Apply speed to the preview video element
+  useEffect(() => {
+    const v = videoRef.current
+    if (v && state?.speed) {
+      try { v.playbackRate = Math.max(0.5, Math.min(2.0, state.speed)) } catch { /* noop */ }
+    }
+  }, [state?.speed, clip?.storage_url_mp4, clip?.render_version])
 
   if (!clip || !state) return null
 
@@ -168,6 +183,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         caption_position_percent: state.caption_position_percent,
         logo_url: state.logo_url,
         logo_position: state.logo_position,
+        logo_x_percent: state.logo_x_percent,
+        logo_y_percent: state.logo_y_percent,
+        logo_scale_percent: state.logo_scale_percent,
         title_text: state.title_text,
         title_position: state.title_position,
         clip_title: state.clip_title,
@@ -191,6 +209,25 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
 
   // Cache-bust the video URL on render so the new MP4 loads
   const videoSrc = clip.storage_url_mp4 ? `${clip.storage_url_mp4}?v=${clip.render_version || 0}` : null
+
+  // Logo drag handlers (refs are declared up top above the early return)
+  const onLogoPointerDown = (e) => {
+    e.preventDefault()
+    draggingRef.current = true
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+  }
+  const onLogoPointerMove = (e) => {
+    if (!draggingRef.current) return
+    const box = previewBoxRef.current?.getBoundingClientRect()
+    if (!box) return
+    const x = Math.max(0, Math.min(100, ((e.clientX - box.left) / box.width) * 100))
+    const y = Math.max(0, Math.min(100, ((e.clientY - box.top) / box.height) * 100))
+    patch({ logo_x_percent: x, logo_y_percent: y, logo_position: 'custom' })
+  }
+  const onLogoPointerUp = (e) => {
+    draggingRef.current = false
+    e.currentTarget.releasePointerCapture?.(e.pointerId)
+  }
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose?.()}>
@@ -233,9 +270,14 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         <div className="grid grid-cols-[260px_1fr] gap-0 min-h-0">
           {/* Left: live video preview */}
           <div className="border-r border-border p-4 flex flex-col items-center bg-zinc-950">
-            <div className={`relative w-full ${previewAspect.tw} max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800 bg-black`} style={{ aspectRatio: state.crop_aspect.replace(':','/') }}>
+            <div
+              ref={previewBoxRef}
+              className={`relative w-full max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800 bg-black select-none`}
+              style={{ aspectRatio: state.crop_aspect.replace(':','/') }}
+            >
               {videoSrc ? (
                 <video
+                  ref={videoRef}
                   key={videoSrc}
                   src={videoSrc}
                   className="absolute inset-0 w-full h-full object-cover"
@@ -247,21 +289,49 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={previewBg} alt="" className="absolute inset-0 w-full h-full object-cover" />
               )}
+              {/* Speed indicator */}
+              {Math.abs(state.speed - 1) > 0.01 && (
+                <Badge className="absolute top-2 left-2 bg-amber-500 text-black font-bold">{state.speed.toFixed(2)}×</Badge>
+              )}
               {/* Title overlay live preview */}
               {state.title_text && (
                 <div className={`absolute left-1/2 -translate-x-1/2 ${state.title_position === 'bottom' ? 'bottom-4' : 'top-4'} px-3 py-1.5 bg-black/70 text-white text-xs font-bold tracking-wide rounded`}>
                   {state.title_text}
                 </div>
               )}
-              {/* Logo preview */}
+              {/* Caption position guide */}
+              {state.caption_position_percent != null && (
+                <div className="absolute left-2 right-2 pointer-events-none" style={{ top: `${state.caption_position_percent}%`, transform: 'translateY(-50%)' }}>
+                  <div className="bg-black/70 text-white text-[10px] px-2 py-0.5 rounded text-center font-semibold" style={{ fontSize: `${Math.max(8, state.font_size * 0.5)}px` }}>
+                    Sample caption preview
+                  </div>
+                </div>
+              )}
+              {/* Logo overlay — draggable. The frame logo position is the CENTER of the logo. */}
               {state.logo_url && (
-                <div className={`absolute ${state.logo_position?.startsWith('top') ? 'top-3' : 'bottom-3'} ${state.logo_position?.endsWith('right') ? 'right-3' : 'left-3'}`}>
+                <div
+                  className="absolute cursor-move ring-2 ring-primary/70 hover:ring-primary transition-shadow"
+                  style={{
+                    left: `${state.logo_x_percent}%`,
+                    top: `${state.logo_y_percent}%`,
+                    width: `${state.logo_scale_percent}%`,
+                    transform: 'translate(-50%, -50%)',
+                    touchAction: 'none',
+                  }}
+                  onPointerDown={onLogoPointerDown}
+                  onPointerMove={onLogoPointerMove}
+                  onPointerUp={onLogoPointerUp}
+                  onPointerCancel={onLogoPointerUp}
+                  title="Drag to position"
+                >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={state.logo_url} alt="logo" className="h-10 w-auto object-contain drop-shadow-md" />
+                  <img src={state.logo_url} alt="logo" className="w-full h-auto object-contain pointer-events-none drop-shadow-md" draggable={false} />
                 </div>
               )}
             </div>
-            <div className="text-[10px] text-muted-foreground mt-2 text-center">Preview · changes apply on Render</div>
+            <div className="text-[10px] text-muted-foreground mt-2 text-center">
+              Preview · {state.logo_url ? 'drag logo to reposition · ' : ''}playback speed {state.speed.toFixed(2)}×
+            </div>
           </div>
 
           {/* Right: tabs */}
@@ -423,11 +493,25 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 {uploadingLogo && <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" /> uploading…</div>}
                 {state.logo_url && (
                   <>
+                    <div className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-xs">
+                      ✋ <span className="font-medium">Drag the logo on the preview</span> to position it. Current: <span className="font-mono">{Math.round(state.logo_x_percent)}%, {Math.round(state.logo_y_percent)}%</span>
+                    </div>
                     <div className="space-y-2">
-                      <Label>Position</Label>
+                      <div className="flex justify-between text-sm">
+                        <Label>Logo size</Label>
+                        <span className="text-muted-foreground">{Math.round(state.logo_scale_percent)}% of width</span>
+                      </div>
+                      <Slider min={5} max={40} step={1} value={[state.logo_scale_percent]} onValueChange={([v]) => patch({ logo_scale_percent: v })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Quick presets</Label>
                       <div className="grid grid-cols-4 gap-2">
                         {LOGO_POSITIONS.map(p => (
-                          <Button key={p.id} size="sm" variant={state.logo_position === p.id ? 'default' : 'outline'} onClick={() => patch({ logo_position: p.id })}>{p.label}</Button>
+                          <Button key={p.id} size="sm" variant="outline" onClick={() => {
+                            const x = p.id.endsWith('right') ? 90 : 10
+                            const y = p.id.startsWith('bottom') ? 90 : 10
+                            patch({ logo_x_percent: x, logo_y_percent: y, logo_position: p.id })
+                          }}>{p.label}</Button>
                         ))}
                       </div>
                     </div>

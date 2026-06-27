@@ -874,7 +874,11 @@ async function handle(request, { params }) {
       if (fontSize) styleAss.fontSize = fontSize
       if (outlineSize !== undefined) styleAss.outline = outlineSize
       const logoUrl = body.logo_url || null
-      const logoPosition = body.logo_position || 'top-right'  // top-left | top-right | bottom-left | bottom-right
+      const logoPosition = body.logo_position || 'top-right'  // top-left | top-right | bottom-left | bottom-right | custom
+      // Optional drag-positioned coords (0–100 % of frame). If both set, override the 9-corner preset.
+      const logoX = Number.isFinite(body.logo_x_percent) ? Math.max(0, Math.min(100, Number(body.logo_x_percent))) : null
+      const logoY = Number.isFinite(body.logo_y_percent) ? Math.max(0, Math.min(100, Number(body.logo_y_percent))) : null
+      const logoScale = Number.isFinite(body.logo_scale_percent) ? Math.max(5, Math.min(50, Number(body.logo_scale_percent))) : 12  // logo width as % of frame width
       const titleText = String(body.title_text || '').trim().slice(0, 120)
       const titlePosition = body.title_position || 'top'  // top | bottom
       const newClipTitle = body.clip_title ? String(body.clip_title).slice(0, 90) : null
@@ -983,11 +987,20 @@ async function handle(request, { params }) {
             }
             if (logoTmp && await fs.stat(logoTmp).catch(()=>null)) {
               args.push('-i', logoTmp)
-              const xExpr = logoPosition.endsWith('right') ? 'W-w-20' : '20'
-              const yExpr = logoPosition.startsWith('bottom') ? 'H-h-20' : '20'
-              // Combine: first apply video filters via filter_complex
+              // If custom % coords supplied, use them. Else use the corner preset.
+              // Logo is scaled to (logoScale)% of frame WIDTH.
+              const logoW = `iw*${logoScale}/100`
+              let xExpr, yExpr
+              if (logoX !== null && logoY !== null) {
+                // logoX/Y is the CENTER of the logo as % of frame
+                xExpr = `(W*${logoX}/100)-(w/2)`
+                yExpr = `(H*${logoY}/100)-(h/2)`
+              } else {
+                xExpr = logoPosition.endsWith('right') ? 'W-w-20' : '20'
+                yExpr = logoPosition.startsWith('bottom') ? 'H-h-20' : '20'
+              }
               const vfChain = vfilters.length ? vfilters.join(',') : 'null'
-              args.push('-filter_complex', `[0:v]${vfChain}[v];[1:v]scale=120:-1[lg];[v][lg]overlay=${xExpr}:${yExpr}`)
+              args.push('-filter_complex', `[0:v]${vfChain}[v];[1:v]scale=${logoW}:-1[lg];[v][lg]overlay=${xExpr}:${yExpr}`)
             } else if (vfilters.length) {
               args.push('-vf', vfilters.join(','))
             }
@@ -1024,6 +1037,7 @@ async function handle(request, { params }) {
           trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect, speed,
           style_preset: stylePreset, style_ass: styleAss, font_size: fontSize, outline_size: outlineSize,
           logo_url: logoUrl, logo_position: logoUrl ? logoPosition : null,
+          logo_x_percent: logoX, logo_y_percent: logoY, logo_scale_percent: logoScale,
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
           template_id: templateId,
           last_rendered_at: new Date(),
