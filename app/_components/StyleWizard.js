@@ -5,10 +5,11 @@ import { Dialog, DialogContent } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
+import { Label } from '@/components/ui/label'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import { Badge } from '@/components/ui/badge'
-import { ArrowLeft, Languages, Volume2, ChevronDown, Check, Play, Maximize, Sliders } from 'lucide-react'
+import { ArrowLeft, Languages, Volume2, ChevronDown, Check, Play, Maximize, Sliders, Scissors } from 'lucide-react'
 
 // ============================================================================
 // STYLE PRESETS — each maps to a CSS preview style and a backend ASS spec
