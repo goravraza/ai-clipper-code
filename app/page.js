@@ -8,7 +8,7 @@ import {
   Flame, TrendingUp, Zap, Settings2, Type, Palette, Wand2, Coins,
   Youtube, Instagram, Music2, ShieldCheck, ChevronRight, Loader2, Play,
   Languages, Smile, Pencil, Check, LogIn, LogOut, User as UserIcon,
-  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud,
+  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud, Sliders,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -28,6 +28,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger, DropdownMenuLabel } from '@/components/ui/dropdown-menu'
 import Link from 'next/link'
 import StyleWizard from './_components/StyleWizard'
+import ClipEditor from './_components/ClipEditor'
 
 const CROP_ASPECTS = [
   { value: '9:16', label: 'Vertical 9:16', tw: 'aspect-[9/16]' },
@@ -167,6 +168,8 @@ export default function HomePage() {
   const [wizardInitialConfig, setWizardInitialConfig] = useState(null)
   const [wizardMode, setWizardMode] = useState('create')
   const [pendingSubmit, setPendingSubmit] = useState(null) // function to call after wizard completes
+  // NEW: unified per-clip editor
+  const [editorClip, setEditorClip] = useState(null)
   const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
@@ -651,7 +654,10 @@ export default function HomePage() {
               </div>
               <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
                 {clips.map((clip) => (
-                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t} onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))} onRestyle={(c) => {
+                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                    onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+                    onEdit={(c) => setEditorClip(c)}
+                    onRestyle={(c) => {
                     setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
                     setPendingSubmit(() => (config) => submitRestyle(c, config))
                     setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
@@ -867,11 +873,19 @@ export default function HomePage() {
         onComplete={handleWizardComplete}
         payload={wizardPayload}
       />
+
+      {/* UNIFIED PER-CLIP EDITOR */}
+      <ClipEditor
+        open={!!editorClip}
+        clip={editorClip}
+        onClose={() => setEditorClip(null)}
+        onSaved={(c) => setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+      />
     </div>
   )
 }
 
-function ClipCard({ clip, memes, t, onUpdate, onRestyle }) {
+function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
   const [title, setTitle] = useState(clip.clip_title)
   const [scheduledTime, setScheduledTime] = useState(clip.scheduled_time || '')
   const [platform, setPlatform] = useState('youtube_shorts')
@@ -975,24 +989,12 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle }) {
       <CardContent className="p-3 space-y-2">
         <Input value={title} onChange={(e)=>setTitle(e.target.value)} onBlur={saveTitle} className="font-semibold text-sm h-9" />
         <HookEditor clip={clip} memes={memes} onUpdate={onUpdate} hookLabel={hookLabel} t={t} />
-        <div className="flex gap-1">
-          <CaptionsButton clip={clip} onUpdate={onUpdate} />
-          <TrimCropButton clip={clip} onUpdate={onUpdate} />
-          <PreviewButton clip={clip} memes={memes} />
-        </div>
         <div className="flex gap-2">
-          <Button size="sm" variant="outline" className="flex-1" onClick={download} disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}>
-            <Download className="h-3.5 w-3.5 mr-1" /> {clip.trim_applied_at ? 'Trimmed MP4' : 'MP4'}
+          <Button size="sm" variant="outline" className="flex-1" onClick={() => onEdit?.(clip)} disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}>
+            <Sliders className="h-3.5 w-3.5 mr-1" /> Edit
           </Button>
-          <Button
-            size="sm"
-            variant={clip.r2_key ? 'default' : 'outline'}
-            className={`flex-1 ${clip.r2_key ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
-            onClick={downloadFromR2}
-            disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}
-            title={clip.r2_key ? 'Get a fresh signed CDN URL (1h) — already on R2' : 'Upload to Cloudflare R2 CDN and get a 7-day shareable signed URL'}
-          >
-            <Cloud className="h-3.5 w-3.5 mr-1" /> {clip.r2_key ? 'CDN Link' : 'Upload to R2'}
+          <Button size="sm" variant="outline" className="flex-1" onClick={download} disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}>
+            <Download className="h-3.5 w-3.5 mr-1" /> Get Clip
           </Button>
           <Drawer>
             <DrawerTrigger asChild>

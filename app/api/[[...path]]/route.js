@@ -583,7 +583,7 @@ async function handle(request, { params }) {
         return NextResponse.json({ video_id: id, status: 'queued', title: file.name, size: buffer.length, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions, language, style_preset: stylePreset })
       }
 
-      const subdir = kind === 'meme_thumbnail' ? 'thumbs' : 'memes'
+      const subdir = kind === 'meme_thumbnail' ? 'thumbs' : kind === 'logo' ? 'logos' : 'memes'
       const dir = path.join(UPLOAD_DIR, subdir)
       await fs.mkdir(dir, { recursive: true })
       const filename = `${id}.${ext}`
@@ -831,6 +831,220 @@ async function handle(request, { params }) {
         return NextResponse.json({ ok: true, clip: strip(updated) })
       } catch (e) {
         return NextResponse.json({ error: e.message }, { status: 500 })
+      }
+    }
+
+    // POST /api/clips/:id/render  — UNIFIED edit: re-renders MP4 applying ALL edits in one ffmpeg pass.
+    // Body: { trim_start, trim_end, crop_aspect, speed, style_preset, style_ass, font_size, outline_size,
+    //         caption_position_percent, logo_url, logo_position, title_text, title_position, clip_title, template_id }
+    if (path_.startsWith('/clips/') && path_.endsWith('/render') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      if (!clip.storage_url_mp4 || !clip.storage_url_mp4.startsWith('/api/files/')) {
+        return NextResponse.json({ error: 'No rendered MP4 available — clip must be generated first' }, { status: 410 })
+      }
+      const body = await request.json().catch(() => ({}))
+      // Probe actual MP4 duration via ffprobe — DB's start/end_time are the ORIGINAL bounds,
+      // but the file on disk may already be shorter (e.g. if a previous trim was applied).
+      let srcDuration = (clip.end_time_seconds || 0) - (clip.start_time_seconds || 0)
+      try {
+        const srcCheckPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
+        const { execFile } = await import('child_process')
+        const probed = await new Promise((resolve) => {
+          execFile('/usr/bin/ffprobe', ['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1', srcCheckPath], (err, stdout) => {
+            if (err) return resolve(null)
+            const d = parseFloat(stdout.trim())
+            resolve(Number.isFinite(d) && d > 0 ? d : null)
+          })
+        })
+        if (probed) srcDuration = probed
+      } catch {}
+      const trimStart = Number.isFinite(body.trim_start) ? Math.max(0, Number(body.trim_start)) : 0
+      const trimEnd = Number.isFinite(body.trim_end) ? Math.min(srcDuration, Number(body.trim_end)) : srcDuration
+      if (trimEnd - trimStart < 1) return NextResponse.json({ error: 'Trim range must be at least 1 second' }, { status: 400 })
+      const speed = Math.max(0.5, Math.min(2.0, Number(body.speed) || 1.0))
+      const cropAspect = body.crop_aspect || clip.crop_aspect || null
+      const stylePreset = body.style_preset || clip.style_preset || null
+      const captionPos = Number.isFinite(body.caption_position_percent) ? Math.max(5, Math.min(95, Number(body.caption_position_percent))) : (clip.overlays_config?.caption?.position_percent ?? 78)
+      const fontSize = Number(body.font_size) || (body.style_ass?.fontSize) || 18
+      const outlineSize = Number.isFinite(body.outline_size) ? Number(body.outline_size) : 2
+      const styleAss = { ...(body.style_ass || clip.style_ass || {}) }
+      if (fontSize) styleAss.fontSize = fontSize
+      if (outlineSize !== undefined) styleAss.outline = outlineSize
+      const logoUrl = body.logo_url || null
+      const logoPosition = body.logo_position || 'top-right'  // top-left | top-right | bottom-left | bottom-right
+      const titleText = String(body.title_text || '').trim().slice(0, 120)
+      const titlePosition = body.title_position || 'top'  // top | bottom
+      const newClipTitle = body.clip_title ? String(body.clip_title).slice(0, 90) : null
+      const templateId = body.template_id || clip.template_id || null
+
+      // Source file
+      const srcPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
+      if (!(await fs.stat(srcPath).catch(()=>null))) return NextResponse.json({ error: 'Source MP4 missing on server' }, { status: 410 })
+
+      // Need a non-burned source to re-burn captions. Look for cached "raw_<id>.mp4" in /clips dir, else use the current MP4 as input (captions may already be burned, but we'll proceed — re-burn over burned text is acceptable in edit flow).
+      const tmpDir = `/tmp/render_${clipId}_${Date.now()}`
+      await fs.mkdir(tmpDir, { recursive: true })
+      const tmpOut = path.join(tmpDir, 'out.mp4')
+
+      try {
+        const { spawn } = await import('child_process')
+
+        // Build subtitles filter if we have cached SRT
+        let subtitleFilter = ''
+        if (clip.srt_content && clip.srt_content.trim().length > 0) {
+          // Adjust SRT timing for trim offset by writing a new SRT shifted by -trimStart (and clipped)
+          const srtPath = path.join(tmpDir, 'cap.srt')
+          // Simple shift: parse, offset, write
+          const lines = clip.srt_content.split(/\r?\n/)
+          const out = []
+          let i = 0; let cueIdx = 0
+          while (i < lines.length) {
+            const idxLine = lines[i++]
+            if (!idxLine || !/^\d+$/.test(idxLine.trim())) continue
+            const timing = lines[i++] || ''
+            const m = timing.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/)
+            if (!m) continue
+            const startS = (+m[1] * 3600 + +m[2] * 60 + +m[3]) + +m[4] / 1000
+            const endS = (+m[5] * 3600 + +m[6] * 60 + +m[7]) + +m[8] / 1000
+            // collect text lines until blank
+            const textLines = []
+            while (i < lines.length && lines[i].trim() !== '') { textLines.push(lines[i++]) }
+            i++ // skip blank
+            // Adjust to trim window
+            const ns = startS - trimStart
+            const ne = endS - trimStart
+            if (ne <= 0 || ns >= (trimEnd - trimStart)) continue
+            const cs = Math.max(0, ns) / speed
+            const ce = Math.min(trimEnd - trimStart, ne) / speed
+            if (ce - cs < 0.1) continue
+            cueIdx++
+            const fmt = (s) => {
+              const sec = Math.max(0, s)
+              const hh = String(Math.floor(sec/3600)).padStart(2,'0')
+              const mm = String(Math.floor((sec%3600)/60)).padStart(2,'0')
+              const ss = String(Math.floor(sec%60)).padStart(2,'0')
+              const ms = String(Math.floor((sec - Math.floor(sec))*1000)).padStart(3,'0')
+              return `${hh}:${mm}:${ss},${ms}`
+            }
+            out.push(`${cueIdx}\n${fmt(cs)} --> ${fmt(ce)}\n${textLines.join('\n')}\n`)
+          }
+          if (out.length > 0) {
+            await fs.writeFile(srtPath, out.join('\n'), 'utf-8')
+            const escSrt = srtPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
+            const marginV = Math.max(20, Math.round((100 - captionPos) * 9))
+            const s = { fontName:'DejaVu Sans', fontSize: fontSize, primary:'&H00FFFFFF&', outlineColour:'&H00000000&', borderStyle:1, outline: outlineSize, shadow:0, bold:1, ...styleAss }
+            const styleStr = [
+              `FontName=${s.fontName}`, `FontSize=${s.fontSize}`, `PrimaryColour=${s.primary}`,
+              s.back ? `BackColour=${s.back}` : null,
+              `OutlineColour=${s.outlineColour || '&H00000000&'}`, `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${s.shadow}`, `Bold=${s.bold}`, `Alignment=2`, `MarginV=${marginV}`,
+            ].filter(Boolean).join(',')
+            subtitleFilter = `subtitles='${escSrt}':force_style='${styleStr}'`
+          }
+        }
+
+        // Build video filter chain in order: crop → scale (for speed) → setpts → subtitles → drawtext (title)
+        const vfilters = []
+        if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
+          const [aw, ah] = cropAspect.split(':').map(Number)
+          vfilters.push(`crop='min(iw\\,ih*${aw}/${ah})':'min(ih\\,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2`)
+          vfilters.push(`scale=trunc(iw/2)*2:trunc(ih/2)*2`)
+        }
+        if (speed !== 1.0) {
+          vfilters.push(`setpts=PTS/${speed}`)
+        }
+        if (subtitleFilter) vfilters.push(subtitleFilter)
+
+        // Title overlay via drawtext (font path on system)
+        if (titleText) {
+          const esc = titleText.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\u2019")
+          const fontfile = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+          const yExpr = titlePosition === 'bottom' ? 'h-text_h-40' : '40'
+          vfilters.push(`drawtext=fontfile=${fontfile}:text='${esc}':fontcolor=white:fontsize=42:borderw=4:bordercolor=black:box=1:boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=${yExpr}`)
+        }
+
+        // Logo overlay: download if URL, then -i + overlay filter
+        const args = ['-y', '-ss', String(trimStart), '-to', String(trimEnd), '-i', srcPath]
+        let logoTmp = null
+        if (logoUrl) {
+          try {
+            // logoUrl can be /api/files/logos/<id>.png — resolve to local path
+            if (logoUrl.startsWith('/api/files/')) {
+              logoTmp = path.join(UPLOAD_DIR, logoUrl.replace(/^\/api\/files\//, ''))
+            } else if (/^https?:\/\//.test(logoUrl)) {
+              logoTmp = path.join(tmpDir, 'logo.png')
+              const lr = await fetch(logoUrl)
+              if (lr.ok) {
+                const buf = Buffer.from(await lr.arrayBuffer())
+                await fs.writeFile(logoTmp, buf)
+              } else logoTmp = null
+            }
+            if (logoTmp && await fs.stat(logoTmp).catch(()=>null)) {
+              args.push('-i', logoTmp)
+              const xExpr = logoPosition.endsWith('right') ? 'W-w-20' : '20'
+              const yExpr = logoPosition.startsWith('bottom') ? 'H-h-20' : '20'
+              // Combine: first apply video filters via filter_complex
+              const vfChain = vfilters.length ? vfilters.join(',') : 'null'
+              args.push('-filter_complex', `[0:v]${vfChain}[v];[1:v]scale=120:-1[lg];[v][lg]overlay=${xExpr}:${yExpr}`)
+            } else if (vfilters.length) {
+              args.push('-vf', vfilters.join(','))
+            }
+          } catch (logoErr) { console.error('logo prep failed', logoErr.message); if (vfilters.length) args.push('-vf', vfilters.join(',')) }
+        } else if (vfilters.length) {
+          args.push('-vf', vfilters.join(','))
+        }
+        // Audio: keep but adjust tempo if speed changed (atempo only valid 0.5–2.0)
+        if (speed !== 1.0) {
+          args.push('-filter:a', `atempo=${speed}`)
+        }
+        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmpOut)
+
+        await new Promise((resolve, reject) => {
+          const p = spawn('/usr/bin/ffmpeg', args)
+          let stderr = ''
+          p.stderr.on('data', d => { stderr += d.toString() })
+          p.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}: ${stderr.slice(-400)}`)))
+          p.on('error', reject)
+        })
+
+        // Replace in place (same key so old URL still works)
+        await fs.copyFile(tmpOut, srcPath)
+        // Regenerate thumb
+        try {
+          const thumbPath = srcPath.replace(/\.mp4$/, '.jpg')
+          await new Promise((resolve) => {
+            const p = spawn('/usr/bin/ffmpeg', ['-y', '-ss', String((trimEnd - trimStart) / 2), '-i', srcPath, '-frames:v', '1', '-q:v', '3', '-vf', 'scale=540:-2', thumbPath])
+            p.on('close', () => resolve()); p.on('error', () => resolve())
+          })
+        } catch {}
+
+        const setFields = {
+          trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect, speed,
+          style_preset: stylePreset, style_ass: styleAss, font_size: fontSize, outline_size: outlineSize,
+          logo_url: logoUrl, logo_position: logoUrl ? logoPosition : null,
+          title_text: titleText || null, title_position: titleText ? titlePosition : null,
+          template_id: templateId,
+          last_rendered_at: new Date(),
+          render_version: (clip.render_version || 0) + 1,
+          overlays_config: { ...(clip.overlays_config || {}), caption: { ...(clip.overlays_config?.caption || {}), position_percent: captionPos } },
+        }
+        if (newClipTitle) setFields.clip_title = newClipTitle
+        await db.collection('generated_clips').updateOne({ id: clipId }, { $set: setFields })
+
+        // Bust R2 cache
+        if (clip.r2_key) {
+          try { const { deleteFromR2 } = await import('@/lib/r2'); await deleteFromR2({ db, key: clip.r2_key }); await db.collection('generated_clips').updateOne({ id: clipId }, { $unset: { r2_key: '', r2_size: '', r2_uploaded_at: '' } }) } catch {}
+        }
+
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        await logActivity(db, user.id, 'clip_rendered', request, { clip_id: clipId, trim: [trimStart, trimEnd], crop: cropAspect, speed, has_logo: !!logoUrl, has_title: !!titleText, template: templateId })
+        const updated = await db.collection('generated_clips').findOne({ id: clipId })
+        return NextResponse.json({ ok: true, clip: strip(updated), final_duration: (trimEnd - trimStart) / speed })
+      } catch (e) {
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        return NextResponse.json({ error: 'Render failed: ' + e.message }, { status: 500 })
       }
     }
 
