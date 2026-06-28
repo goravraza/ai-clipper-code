@@ -46,6 +46,15 @@ const INTEGRATIONS = [
     docsUrl: 'https://console.anthropic.com/settings/keys',
   },
   {
+    provider: 'groq_whisper', name: 'Groq Whisper (transcription)', category: 'ai', icon: Sparkles,
+    description: 'Whisper Large v3 hosted on Groq — ~25× faster and ~3× cheaper than OpenAI Whisper. When enabled, used as the primary transcription engine (falls back to OpenAI if it errors).',
+    fields: [
+      { key: 'api_key', label: 'API Key', type: 'password', placeholder: 'gsk_...' },
+      { key: 'model', label: 'Model', type: 'text', placeholder: 'whisper-large-v3 (or whisper-large-v3-turbo)' },
+    ],
+    docsUrl: 'https://console.groq.com/keys',
+  },
+  {
     provider: 'razorpay', name: 'Razorpay', category: 'payment', icon: CreditCard,
     description: 'Primary payment gateway for Indian users (INR).',
     fields: [
