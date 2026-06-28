@@ -24,7 +24,17 @@ export function styleAssToCss({ styleAss, fontSize, outlineSize, frameWidth = 36
   const px = Math.max(10, Math.round((Number(fontSize) || ass.fontSize || 20) * (frameWidth / 540)))
   const outlinePx = Math.max(0, Math.round((Number(outlineSize) || ass.outline || 2)))
   const stroked = outlinePx > 0 ? {
-    textShadow: `-${outlinePx}px -${outlinePx}px 0 ${stroke}, ${outlinePx}px -${outlinePx}px 0 ${stroke}, -${outlinePx}px ${outlinePx}px 0 ${stroke}, ${outlinePx}px ${outlinePx}px 0 ${stroke}, 0 0 4px rgba(0,0,0,0.5)`,
+    // Sharp outlines only — no blurred drop-shadow. Eight directions for clean stroke effect.
+    textShadow: [
+      `-${outlinePx}px -${outlinePx}px 0 ${stroke}`,
+      `${outlinePx}px -${outlinePx}px 0 ${stroke}`,
+      `-${outlinePx}px ${outlinePx}px 0 ${stroke}`,
+      `${outlinePx}px ${outlinePx}px 0 ${stroke}`,
+      `0 -${outlinePx}px 0 ${stroke}`,
+      `0 ${outlinePx}px 0 ${stroke}`,
+      `-${outlinePx}px 0 0 ${stroke}`,
+      `${outlinePx}px 0 0 ${stroke}`,
+    ].join(', '),
   } : {}
   return {
     fontFamily,

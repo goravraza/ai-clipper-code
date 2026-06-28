@@ -91,6 +91,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       logo_x_percent: Number.isFinite(clip.logo_x_percent) ? clip.logo_x_percent : 90,
       logo_y_percent: Number.isFinite(clip.logo_y_percent) ? clip.logo_y_percent : 10,
       logo_scale_percent: Number.isFinite(clip.logo_scale_percent) ? clip.logo_scale_percent : 12,
+      // NEW: drag-positioned caption coords (center anchor, % of frame)
+      caption_x_percent: Number.isFinite(clip.caption_x_percent) ? clip.caption_x_percent : 50,
+      caption_y_percent: Number.isFinite(clip.caption_y_percent) ? clip.caption_y_percent : (clip.overlays_config?.caption?.position_percent ?? 78),
       clip_title: clip.clip_title || '',
       duration: dur,
     }
@@ -228,6 +231,8 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         font_size: state.font_size,
         outline_size: state.outline_size,
         caption_position_percent: state.caption_position_percent,
+        caption_x_percent: state.caption_x_percent,
+        caption_y_percent: state.caption_y_percent,
         logo_url: state.logo_url,
         logo_position: state.logo_position,
         logo_x_percent: state.logo_x_percent,
@@ -312,6 +317,28 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     e.currentTarget.releasePointerCapture?.(e.pointerId)
   }
 
+  // Caption drag handlers — move the caption block anywhere on the canvas.
+  const captionDraggingRef = { current: false }
+  const onCapPointerDown = (e) => {
+    if (editingCueIdx >= 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    captionDraggingRef.current = true
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+  }
+  const onCapPointerMove = (e) => {
+    if (!captionDraggingRef.current) return
+    const box = previewBoxRef.current?.getBoundingClientRect()
+    if (!box) return
+    const x = Math.max(5, Math.min(95, ((e.clientX - box.left) / box.width) * 100))
+    const y = Math.max(5, Math.min(95, ((e.clientY - box.top) / box.height) * 100))
+    patch({ caption_x_percent: x, caption_y_percent: y, caption_position_percent: y })
+  }
+  const onCapPointerUp = (e) => {
+    captionDraggingRef.current = false
+    e.currentTarget.releasePointerCapture?.(e.pointerId)
+  }
+
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose?.()}>
       <DialogContent className="max-w-5xl w-[96vw] max-h-[92vh] overflow-hidden p-0">
@@ -382,10 +409,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   {state.title_text}
                 </div>
               )}
-              {/* Caption position guide - INTERACTIVE ACTIVE CAPTION OVERLAY */}
+              {/* INTERACTIVE ACTIVE CAPTION OVERLAY — draggable on the canvas */}
               {(() => {
                 const activeCue = activeCueIdx >= 0 ? activeCaptionTrack[activeCueIdx] : null
-                // Always show SOMETHING so user sees what styling will look like — fallback to a sample
                 const displayCue = activeCue || (activeCaptionTrack[0] ? { ...activeCaptionTrack[0], _ghost: true } : { text: 'Sample caption preview', _ghost: true, _idx: -1 })
                 const displayText = chunkForLine(displayCue.text || '', 4)
                 const cssStyle = styleAssToCss({
@@ -397,8 +423,19 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 const isEditing = editingCueIdx === activeCueIdx && activeCueIdx >= 0
                 return (
                   <div
-                    className="absolute left-[10%] right-[10%] pointer-events-auto text-center"
-                    style={{ top: `${state.caption_position_percent}%`, transform: 'translateY(-50%)' }}
+                    className={`absolute pointer-events-auto text-center ${isEditing ? '' : 'cursor-move'} hover:ring-2 hover:ring-primary/40 rounded`}
+                    style={{
+                      left: `${state.caption_x_percent}%`,
+                      top: `${state.caption_y_percent}%`,
+                      transform: 'translate(-50%, -50%)',
+                      width: '80%',
+                      touchAction: 'none',
+                    }}
+                    onPointerDown={onCapPointerDown}
+                    onPointerMove={onCapPointerMove}
+                    onPointerUp={onCapPointerUp}
+                    onPointerCancel={onCapPointerUp}
+                    title={activeCue ? 'Drag to reposition · double-click to edit text' : 'Generate captions to see them here'}
                   >
                     {isEditing ? (
                       <textarea
@@ -413,11 +450,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                       />
                     ) : (
                       <span
-                        title={activeCue ? 'Double-click to edit this caption' : 'Generate captions to see them here'}
-                        className={`whitespace-pre-line cursor-text transition-opacity ${displayCue._ghost ? 'opacity-40' : 'opacity-100'} hover:ring-2 hover:ring-primary/60 hover:rounded`}
+                        className={`whitespace-pre-line transition-opacity ${displayCue._ghost ? 'opacity-40' : 'opacity-100'}`}
                         style={cssStyle}
-                        onDoubleClick={() => { if (activeCue) setEditingCueIdx(activeCueIdx) }}
-                        onClick={() => { if (activeCue) setTab('cc') }}
+                        onDoubleClick={(e) => { e.stopPropagation(); if (activeCue) setEditingCueIdx(activeCueIdx) }}
                       >
                         {displayText}
                       </span>

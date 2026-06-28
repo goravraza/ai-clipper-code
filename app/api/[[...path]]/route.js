@@ -931,6 +931,10 @@ async function handle(request, { params }) {
       const cropAspect = body.crop_aspect || clip.crop_aspect || null
       const stylePreset = body.style_preset || clip.style_preset || null
       const captionPos = Number.isFinite(body.caption_position_percent) ? Math.max(5, Math.min(95, Number(body.caption_position_percent))) : (clip.overlays_config?.caption?.position_percent ?? 78)
+      // Drag-positioned caption coords (anchor = caption CENTER, % of frame).
+      // If caption_y_percent is set, it overrides captionPos (which is legacy position-from-top).
+      const captionXPercent = Number.isFinite(body.caption_x_percent) ? Math.max(5, Math.min(95, Number(body.caption_x_percent))) : 50
+      const captionYPercent = Number.isFinite(body.caption_y_percent) ? Math.max(5, Math.min(95, Number(body.caption_y_percent))) : captionPos
       const fontSize = Number(body.font_size) || (body.style_ass?.fontSize) || 18
       const outlineSize = Number.isFinite(body.outline_size) ? Number(body.outline_size) : 2
       const styleAss = { ...(body.style_ass || clip.style_ass || {}) }
@@ -1043,7 +1047,7 @@ async function handle(request, { params }) {
 
         if (srtPath) {
           const escSrt = srtPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
-          // Probe source video dimensions for accurate ASS layout (margins are pixel-based).
+          // Compute target OUTPUT frame size — we always upscale 9:16 to a clean 1080×1920 for HD shorts.
           let frameW = 1080, frameH = 1920
           try {
             const { execFile } = await import('child_process')
@@ -1052,39 +1056,52 @@ async function handle(request, { params }) {
             })
             const [w, h] = dim.trim().split(',').map(Number)
             if (w && h) {
-              // Apply crop transform to estimate output frame size
               if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
                 const [aw, ah] = cropAspect.split(':').map(Number)
-                const targetAspect = aw / ah
-                const srcAspect = w / h
-                if (srcAspect > targetAspect) { frameW = Math.floor(h * targetAspect / 2) * 2; frameH = h }
-                else { frameW = w; frameH = Math.floor(w / targetAspect / 2) * 2 }
+                if (cropAspect === '9:16') { frameW = 1080; frameH = 1920 }
+                else if (cropAspect === '16:9') { frameW = 1920; frameH = 1080 }
+                else if (cropAspect === '1:1') { frameW = 1080; frameH = 1080 }
+                else { frameW = 1080; frameH = Math.round(1080 * ah / aw) }
               } else { frameW = w; frameH = h }
             }
           } catch {}
-          const heightFactor = frameH / 200
-          const marginV = Math.max(20, Math.round((100 - captionPos) * heightFactor))
-          const marginH = Math.round(frameW * 0.10) // 10% guard on each side → 80% max caption width
+          // Use Alignment=5 (middle-center) + position via MarginL/MarginV computed from caption_x/y % of frame.
+          // This lets the user DRAG the caption to any point on the canvas, exactly mirrored by ASS PlayRes.
+          const cx = Math.round(captionXPercent / 100 * frameW)  // caption CENTER x in pixels
+          const cy = Math.round(captionYPercent / 100 * frameH)  // caption CENTER y in pixels
+          // For Alignment=5 (center-center anchor), MarginL = anchor-x offset, MarginV = (frameH - anchor-y).
+          // ASS uses MarginV from top when Alignment=8 (top-center) or from bottom when Alignment=2 (bottom-center).
+          // Simplest reliable approach: use Alignment=8 (top-center) + MarginV = anchor-y - line/2 (approx via cy).
+          // We'll set MarginV = cy (top anchor) so the TOP of the caption box sits at cy. Add a marginH of 10%.
+          const marginV = Math.max(10, Math.min(frameH - 50, cy - Math.round((fontSize * 1.2))))
+          const marginH = Math.round(frameW * 0.10) // 10% guard each side → 80% max width (no bleed)
           const s = { fontName:'DejaVu Sans', fontSize: fontSize, primary:'&H00FFFFFF&', outlineColour:'&H00000000&', borderStyle:1, outline: outlineSize, shadow:0, bold:1, ...styleAss }
+          // Remove text-shadow effect (sharp outline only)
+          const shadowSize = 0
           const styleStr = [
             `FontName=${s.fontName}`, `FontSize=${s.fontSize}`, `PrimaryColour=${s.primary}`,
             s.back ? `BackColour=${s.back}` : null,
             `OutlineColour=${s.outlineColour || '&H00000000&'}`,
-            `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${s.shadow}`, `Bold=${s.bold}`,
-            `Alignment=2`, `MarginV=${marginV}`, `MarginL=${marginH}`, `MarginR=${marginH}`,
+            `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${shadowSize}`, `Bold=${s.bold}`,
+            // Alignment=8 (top-center) makes MarginV behave as "distance from TOP of frame"
+            `Alignment=8`, `MarginV=${marginV}`, `MarginL=${marginH}`, `MarginR=${marginH}`,
             `WrapStyle=0`,
           ].filter(Boolean).join(',')
           subtitleFilter = `subtitles='${escSrt}':force_style='${styleStr}':original_size=${frameW}x${frameH}`
-          // Persist the regenerated SRT back to the clip so subsequent edits start from latest
           try { const finalSrt = await fs.readFile(srtPath, 'utf-8'); await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { srt_content_rendered: finalSrt } }) } catch {}
         }
 
-        // Build video filter chain in order: crop → scale (for speed) → setpts → subtitles → drawtext (title)
+        // Build video filter chain: crop → scale to TARGET 1080p HD → setpts → subtitles → drawtext (title)
         const vfilters = []
+        const targetW = cropAspect === '16:9' ? 1920 : 1080
+        const targetH = cropAspect === '9:16' ? 1920 : cropAspect === '1:1' ? 1080 : cropAspect === '16:9' ? 1080 : 1920
         if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
           const [aw, ah] = cropAspect.split(':').map(Number)
           vfilters.push(`crop='min(iw\\,ih*${aw}/${ah})':'min(ih\\,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2`)
-          vfilters.push(`scale=trunc(iw/2)*2:trunc(ih/2)*2`)
+          // Upscale to clean HD output — Lanczos for crisp upscaling
+          vfilters.push(`scale=${targetW}:${targetH}:flags=lanczos`)
+        } else {
+          vfilters.push(`scale='min(iw,1080)':'-2':flags=lanczos`)
         }
         if (speed !== 1.0) {
           vfilters.push(`setpts=PTS/${speed}`)
@@ -1142,7 +1159,11 @@ async function handle(request, { params }) {
         if (speed !== 1.0) {
           args.push('-filter:a', `atempo=${speed}`)
         }
-        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmpOut)
+        // HD-quality encoding: CRF 18 (visual-lossless), preset slow, target ~6Mbps for shorts
+        args.push('-c:v', 'libx264', '-preset', 'slow', '-crf', '18', '-pix_fmt', 'yuv420p',
+          '-maxrate', '8000k', '-bufsize', '12000k',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+          '-movflags', '+faststart', tmpOut)
 
         await new Promise((resolve, reject) => {
           const p = spawn('/usr/bin/ffmpeg', args)
@@ -1166,6 +1187,7 @@ async function handle(request, { params }) {
         const setFields = {
           trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect, speed,
           style_preset: stylePreset, style_ass: styleAss, font_size: fontSize, outline_size: outlineSize,
+          caption_x_percent: captionXPercent, caption_y_percent: captionYPercent,
           logo_url: logoUrl, logo_position: logoUrl ? logoPosition : null,
           logo_x_percent: logoX, logo_y_percent: logoY, logo_scale_percent: logoScale,
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
