@@ -834,6 +834,61 @@ async function handle(request, { params }) {
       }
     }
 
+    // GET /api/clips/:id/transcript — return parsed segments [{start, end, text}] for the editor
+    if (path_.startsWith('/clips/') && path_.endsWith('/transcript') && method === 'GET') {
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      const src = clip.srt_content || ''
+      const segs = []
+      if (src.trim()) {
+        const lines = src.split(/\r?\n/)
+        let i = 0
+        while (i < lines.length) {
+          const idxLine = lines[i++]
+          if (!idxLine || !/^\d+$/.test(idxLine.trim())) continue
+          const timing = lines[i++] || ''
+          const m = timing.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/)
+          if (!m) continue
+          const startS = (+m[1] * 3600 + +m[2] * 60 + +m[3]) + +m[4] / 1000
+          const endS = (+m[5] * 3600 + +m[6] * 60 + +m[7]) + +m[8] / 1000
+          const textLines = []
+          while (i < lines.length && lines[i].trim() !== '') { textLines.push(lines[i++]) }
+          i++
+          segs.push({ start: startS, end: endS, text: textLines.join(' ').trim() })
+        }
+      }
+      return NextResponse.json({ segments: segs, clip_id: clipId, has_srt: !!src.trim() })
+    }
+
+    // PUT /api/clips/:id/transcript — save edited segments back; rebuilds srt_content
+    if (path_.startsWith('/clips/') && path_.endsWith('/transcript') && method === 'PUT') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      const body = await request.json().catch(() => ({}))
+      const incoming = Array.isArray(body.segments) ? body.segments : []
+      const cleaned = incoming.map(s => ({
+        start: Math.max(0, Number(s.start) || 0),
+        end: Math.max(0, Number(s.end) || 0),
+        text: String(s.text || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 500),
+      })).filter(s => s.text && s.end > s.start)
+      // Re-serialize SRT
+      const srtTime = (sec) => {
+        const x = Math.max(0, sec)
+        const hh = String(Math.floor(x/3600)).padStart(2,'0')
+        const mm = String(Math.floor((x%3600)/60)).padStart(2,'0')
+        const ss = String(Math.floor(x%60)).padStart(2,'0')
+        const ms = String(Math.floor((x - Math.floor(x))*1000)).padStart(3,'0')
+        return `${hh}:${mm}:${ss},${ms}`
+      }
+      const srt = cleaned.map((c, i) => `${i + 1}\n${srtTime(c.start)} --> ${srtTime(c.end)}\n${c.text}\n`).join('\n')
+      await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { srt_content: srt, transcript_edited_at: new Date() } })
+      await logActivity(db, user.id, 'clip_transcript_edited', request, { clip_id: clipId, segments_count: cleaned.length })
+      return NextResponse.json({ ok: true, segments_count: cleaned.length })
+    }
+
     // POST /api/clips/:id/render  — UNIFIED edit: re-renders MP4 applying ALL edits in one ffmpeg pass.
     // Body: { trim_start, trim_end, crop_aspect, speed, style_preset, style_ass, font_size, outline_size,
     //         caption_position_percent, logo_url, logo_position, title_text, title_position, clip_title, template_id }
@@ -896,15 +951,69 @@ async function handle(request, { params }) {
       try {
         const { spawn } = await import('child_process')
 
-        // Build subtitles filter if we have cached SRT
+        // Build subtitles filter — accepts user-edited caption_segments override from the editor.
+        // Also enforces 3–4 word chunks with \N line break to prevent text bleeding outside 9:16 frame.
         let subtitleFilter = ''
-        if (clip.srt_content && clip.srt_content.trim().length > 0) {
-          // Adjust SRT timing for trim offset by writing a new SRT shifted by -trimStart (and clipped)
+        const userCaptionSegments = Array.isArray(body.caption_segments) ? body.caption_segments : null
+        // Editor sends segments already in CLIP-LOCAL time (post-trim, pre-speed). Build SRT directly.
+        // If editor didn't send segments, fall back to clip.srt_content (already clip-local) and shift for trim+speed.
+        const writeSrt = async (cues) => {
+          const fmt = (s) => {
+            const sec = Math.max(0, s)
+            const hh = String(Math.floor(sec/3600)).padStart(2,'0')
+            const mm = String(Math.floor((sec%3600)/60)).padStart(2,'0')
+            const ss = String(Math.floor(sec%60)).padStart(2,'0')
+            const ms = String(Math.floor((sec - Math.floor(sec))*1000)).padStart(3,'0')
+            return `${hh}:${mm}:${ss},${ms}`
+          }
+          // Enforce per-cue chunking — max 4 words per line, hard-break long cues.
+          const MAX_WORDS_PER_LINE = 4
+          const chunked = []
+          for (const c of cues) {
+            const text = String(c.text || '').replace(/\s+/g, ' ').trim()
+            if (!text || !(c.end > c.start)) continue
+            const words = text.split(/\s+/)
+            if (words.length <= MAX_WORDS_PER_LINE) {
+              chunked.push({ start: c.start, end: c.end, text })
+            } else if (words.length <= MAX_WORDS_PER_LINE * 2) {
+              // Single cue, two visual lines via \N
+              const half = Math.ceil(words.length / 2)
+              chunked.push({ start: c.start, end: c.end, text: words.slice(0, half).join(' ') + '\n' + words.slice(half).join(' ') })
+            } else {
+              // Split into multiple sequential cues, each ≤ MAX_WORDS_PER_LINE words
+              const numChunks = Math.ceil(words.length / MAX_WORDS_PER_LINE)
+              const per = (c.end - c.start) / numChunks
+              for (let k = 0; k < numChunks; k++) {
+                const slice = words.slice(k * MAX_WORDS_PER_LINE, (k + 1) * MAX_WORDS_PER_LINE).join(' ')
+                if (slice) chunked.push({ start: c.start + k * per, end: c.start + (k + 1) * per, text: slice })
+              }
+            }
+          }
+          if (chunked.length === 0) return null
+          const out = chunked.map((c, i) => `${i + 1}\n${fmt(c.start)} --> ${fmt(c.end)}\n${c.text}\n`).join('\n')
           const srtPath = path.join(tmpDir, 'cap.srt')
-          // Simple shift: parse, offset, write
+          await fs.writeFile(srtPath, out, 'utf-8')
+          return srtPath
+        }
+
+        let srtPath = null
+        if (userCaptionSegments && userCaptionSegments.length > 0) {
+          // Editor passes already-clip-local cues (relative to original clip MP4 timeline 0..srcDuration).
+          // We still need to adjust for the current trim window + speed.
+          const adjusted = userCaptionSegments.map(s => {
+            const startS = Math.max(0, Number(s.start) || 0)
+            const endS = Math.max(startS + 0.1, Number(s.end) || startS + 0.5)
+            const ns = startS - trimStart
+            const ne = endS - trimStart
+            if (ne <= 0 || ns >= (trimEnd - trimStart)) return null
+            return { start: Math.max(0, ns) / speed, end: Math.min(trimEnd - trimStart, ne) / speed, text: String(s.text || '') }
+          }).filter(Boolean)
+          srtPath = await writeSrt(adjusted)
+        } else if (clip.srt_content && clip.srt_content.trim().length > 0) {
+          // Parse cached SRT and shift to trim window + speed
           const lines = clip.srt_content.split(/\r?\n/)
-          const out = []
-          let i = 0; let cueIdx = 0
+          const parsed = []
+          let i = 0
           while (i < lines.length) {
             const idxLine = lines[i++]
             if (!idxLine || !/^\d+$/.test(idxLine.trim())) continue
@@ -913,40 +1022,53 @@ async function handle(request, { params }) {
             if (!m) continue
             const startS = (+m[1] * 3600 + +m[2] * 60 + +m[3]) + +m[4] / 1000
             const endS = (+m[5] * 3600 + +m[6] * 60 + +m[7]) + +m[8] / 1000
-            // collect text lines until blank
             const textLines = []
             while (i < lines.length && lines[i].trim() !== '') { textLines.push(lines[i++]) }
-            i++ // skip blank
-            // Adjust to trim window
+            i++
             const ns = startS - trimStart
             const ne = endS - trimStart
             if (ne <= 0 || ns >= (trimEnd - trimStart)) continue
-            const cs = Math.max(0, ns) / speed
-            const ce = Math.min(trimEnd - trimStart, ne) / speed
-            if (ce - cs < 0.1) continue
-            cueIdx++
-            const fmt = (s) => {
-              const sec = Math.max(0, s)
-              const hh = String(Math.floor(sec/3600)).padStart(2,'0')
-              const mm = String(Math.floor((sec%3600)/60)).padStart(2,'0')
-              const ss = String(Math.floor(sec%60)).padStart(2,'0')
-              const ms = String(Math.floor((sec - Math.floor(sec))*1000)).padStart(3,'0')
-              return `${hh}:${mm}:${ss},${ms}`
+            parsed.push({ start: Math.max(0, ns) / speed, end: Math.min(trimEnd - trimStart, ne) / speed, text: textLines.join(' ') })
+          }
+          srtPath = await writeSrt(parsed)
+        }
+
+        if (srtPath) {
+          const escSrt = srtPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
+          // Probe source video dimensions for accurate ASS layout (margins are pixel-based).
+          let frameW = 1080, frameH = 1920
+          try {
+            const { execFile } = await import('child_process')
+            const { stdout: dim } = await new Promise((resolve, reject) => {
+              execFile('/usr/bin/ffprobe', ['-v','error','-select_streams','v:0','-show_entries','stream=width,height','-of','csv=p=0', srcPath], (err, stdout) => err ? reject(err) : resolve({ stdout }))
+            })
+            const [w, h] = dim.trim().split(',').map(Number)
+            if (w && h) {
+              // Apply crop transform to estimate output frame size
+              if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
+                const [aw, ah] = cropAspect.split(':').map(Number)
+                const targetAspect = aw / ah
+                const srcAspect = w / h
+                if (srcAspect > targetAspect) { frameW = Math.floor(h * targetAspect / 2) * 2; frameH = h }
+                else { frameW = w; frameH = Math.floor(w / targetAspect / 2) * 2 }
+              } else { frameW = w; frameH = h }
             }
-            out.push(`${cueIdx}\n${fmt(cs)} --> ${fmt(ce)}\n${textLines.join('\n')}\n`)
-          }
-          if (out.length > 0) {
-            await fs.writeFile(srtPath, out.join('\n'), 'utf-8')
-            const escSrt = srtPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
-            const marginV = Math.max(20, Math.round((100 - captionPos) * 9))
-            const s = { fontName:'DejaVu Sans', fontSize: fontSize, primary:'&H00FFFFFF&', outlineColour:'&H00000000&', borderStyle:1, outline: outlineSize, shadow:0, bold:1, ...styleAss }
-            const styleStr = [
-              `FontName=${s.fontName}`, `FontSize=${s.fontSize}`, `PrimaryColour=${s.primary}`,
-              s.back ? `BackColour=${s.back}` : null,
-              `OutlineColour=${s.outlineColour || '&H00000000&'}`, `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${s.shadow}`, `Bold=${s.bold}`, `Alignment=2`, `MarginV=${marginV}`,
-            ].filter(Boolean).join(',')
-            subtitleFilter = `subtitles='${escSrt}':force_style='${styleStr}'`
-          }
+          } catch {}
+          const heightFactor = frameH / 200
+          const marginV = Math.max(20, Math.round((100 - captionPos) * heightFactor))
+          const marginH = Math.round(frameW * 0.10) // 10% guard on each side → 80% max caption width
+          const s = { fontName:'DejaVu Sans', fontSize: fontSize, primary:'&H00FFFFFF&', outlineColour:'&H00000000&', borderStyle:1, outline: outlineSize, shadow:0, bold:1, ...styleAss }
+          const styleStr = [
+            `FontName=${s.fontName}`, `FontSize=${s.fontSize}`, `PrimaryColour=${s.primary}`,
+            s.back ? `BackColour=${s.back}` : null,
+            `OutlineColour=${s.outlineColour || '&H00000000&'}`,
+            `BorderStyle=${s.borderStyle}`, `Outline=${s.outline}`, `Shadow=${s.shadow}`, `Bold=${s.bold}`,
+            `Alignment=2`, `MarginV=${marginV}`, `MarginL=${marginH}`, `MarginR=${marginH}`,
+            `WrapStyle=0`,
+          ].filter(Boolean).join(',')
+          subtitleFilter = `subtitles='${escSrt}':force_style='${styleStr}':original_size=${frameW}x${frameH}`
+          // Persist the regenerated SRT back to the clip so subsequent edits start from latest
+          try { const finalSrt = await fs.readFile(srtPath, 'utf-8'); await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { srt_content_rendered: finalSrt } }) } catch {}
         }
 
         // Build video filter chain in order: crop → scale (for speed) → setpts → subtitles → drawtext (title)

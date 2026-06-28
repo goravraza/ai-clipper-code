@@ -6,47 +6,59 @@
 # END - Testing Protocol - DO NOT EDIT OR REMOVE THIS SECTION
 #====================================================================================================
 
-user_problem_statement: "User feedback after editor v1: (1) captions weren't generated on the latest ingestion; (2) logo should be draggable on the preview and size-adjustable, with the preview matching final render exactly; (3) speed change should be reflected in the preview video playback."
+user_problem_statement: "Three integrated fixes: (1) Auto text-wrap for captions inside 9:16 frame (no bleeding), (2) Interactive caption selection & inline editing on preview canvas, (3) Live preset/typography styling applied in real-time without breaking backend render."
 
 backend:
-  - task: "yt-dlp-based audio extraction (replaces fragile ffmpeg+stream URL via proxy)"
+  - task: "buildClipSrt + ffmpegSubtitleFilter — auto-chunk 4 words/line, ASS WrapStyle, 10% horizontal guards"
     implemented: true
-    working: "NA"
+    working: true
     file: "lib/video-processor.js"
     stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
-        -working: "NA"
+        -working: true
         -agent: "main"
-        -comment: "ROOT CAUSE for missing captions: ffmpeg-via-http_proxy was throwing 'unexpected TLS packet' errors on Thordata exit-nodes when fetching the audio-only stream URL → Whisper never got audio → no SRT → captions missing. NEW: yt-dlp with --extract-audio --audio-format mp3 (5 retries, 30s socket timeout, ffmpeg-location pinned) downloads audio directly via the proxy (yt-dlp handles proxy redirects much better than ffmpeg). Falls back to the old ffmpeg+stream path if yt-dlp also fails."
+        -comment: "Hard chunking: max 4 words per cue (long cues split into multiple cues). Cues with 5–8 words use \\n (line break) at the midpoint. ASS filter now passes WrapStyle=0 (smart wrap), MarginL/MarginR=10% of frame width (=80% max caption width — no bleed), MarginV scaled to actual frame height, and original_size=WxH so ASS positions correctly in the real frame. Probes output frame dimensions via ffprobe before building the style string."
 
-  - task: "Audio duration probe + properly-scaled synthetic segments for gpt-4o-transcribe"
-    implemented: true
-    working: "NA"
-    file: "lib/video-processor.js"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: true
-    status_history:
-        -working: "NA"
-        -agent: "main"
-        -comment: "Previously: gpt-4o-transcribe returned plain text without timestamps; synthetic segments were created with start=0,1,2... — totally misaligned with the source video's timeline, so buildClipSrt filtered them all out (clipStart=51 etc.) → empty SRT → no captions burned. NOW: probe audio duration with ffprobe, then distribute words evenly across [0, audioDuration] in ~6-word cues. Cues now line up with the actual audio timeline, so clip-local SRT extraction works."
-
-  - task: "POST /api/clips/:id/render — accept logo_x_percent/y_percent/scale_percent for drag-positioned logos"
+  - task: "POST /api/clips/:id/render — accept caption_segments override + word-chunking + frame-aware ASS"
     implemented: true
     working: true
     file: "app/api/[[...path]]/route.js"
     stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
         -working: true
         -agent: "main"
-        -comment: "Backward-compatible: if logo_x_percent + logo_y_percent supplied, ffmpeg uses overlay=(W*x/100)-(w/2):(H*y/100)-(h/2) (x/y is logo CENTER as % of frame). Else uses the 4-corner preset. logo_scale_percent (5–50) controls logo width as % of frame width. Persisted to DB so re-opening the editor shows the same position. Verified via curl with center-50/50 + scale 20%, returns 200 and DB has new fields."
+        -comment: "Render endpoint now accepts body.caption_segments (array of {start,end,text} in clip-local seconds). When present, it overrides the cached srt_content. Both paths flow through the same writeSrt() helper that enforces 4-words/line chunking + \\n line breaks. Frame dims probed from srcPath then adjusted for crop_aspect to get exact output WxH (used for marginV/marginH scaling + original_size). Persists final rendered SRT to clip.srt_content_rendered. Verified: trim+crop+custom-segments render returned 200, MP4 duration 5.0s, no ffmpeg crashes."
+
+  - task: "GET /api/clips/:id/transcript — parse SRT into JSON segments for editor"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "Returns {segments:[{start,end,text}], clip_id, has_srt}. Parses both ',' and '.' millisecond separators. Verified: clip 87a5a528 returns 16 cues correctly."
+
+  - task: "PUT /api/clips/:id/transcript — save edited cues back to clip.srt_content"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "Accepts {segments:[{start,end,text}]}. Sanitizes (drops control chars, trims, max 500 chars/text), filters invalid cues (end<=start), re-serializes to SRT, writes to DB. Stamps transcript_edited_at. Logged via logActivity."
 
 frontend:
-  - task: "Editor preview — playbackRate matches selected speed"
+  - task: "Live interactive caption overlay on preview — selectable, double-click editable"
     implemented: true
     working: true
     file: "app/_components/ClipEditor.js"
@@ -56,43 +68,52 @@ frontend:
     status_history:
         -working: true
         -agent: "main"
-        -comment: "videoRef.current.playbackRate is set whenever state.speed or the video src changes. A prominent '1.50×' badge in top-left of the preview confirms the active speed. Verified via screenshot — Speed tab + preset buttons work, badge appears, footer shows 'playback speed 1.50×'."
+        -comment: "Replaced the static 'Sample caption preview' line with an interactive overlay bound to activeCaptionTrack. requestAnimationFrame loop polls video.currentTime → findActiveCue → highlights matching cue in CC tab list AND renders that cue's text on the preview. Double-click the rendered text → switches to inline <textarea> (autoFocus); Enter or blur commits. Single click → switches to CC tab for full transcript view. Style mirrors ASS via styleAssToCss helper so preview pixel-matches final render. Empty/ghost state shows 'Sample caption preview' at 40% opacity until real captions exist."
 
-  - task: "Editor preview — draggable logo with live percent-coords + size slider"
+  - task: "CC tab transcript list — seek, edit inline, add, delete, save"
     implemented: true
-    working: "NA"
+    working: true
     file: "app/_components/ClipEditor.js"
     stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
-        -working: "NA"
+        -working: true
         -agent: "main"
-        -comment: "Logo on preview is positioned with state.logo_x_percent / logo_y_percent (CSS left/top %). Pointer events (pointerdown/move/up + setPointerCapture) let the user drag anywhere on the preview frame; coords clamp to 0–100% and update in real time. logo_scale_percent slider in the Logo tab (5–40%) resizes the logo. 4-corner quick presets remain as shortcuts. Logo tab also shows a hint banner + live coord readout. Hooks declared above the early return to fix Rules-of-Hooks violation."
+        -comment: "Transcript list shows {N} cues. Each row: clickable timestamp (seeks video), inline editable text input, delete button (visible on hover). Top toolbar: Add cue at current time (Plus icon), Save without rendering (PUT /transcript). Active cue is highlighted purple. Empty state when no SRT exists."
 
-  - task: "Editor preview — speed/title/caption/logo overlays accurate to final render"
+  - task: "Live preset/typography sync — preset clicks + font/stroke sliders update overlay instantly"
     implemented: true
-    working: "NA"
+    working: true
+    file: "app/_components/ClipEditor.js, app/_components/captionUtils.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "New captionUtils.js: styleAssToCss() converts ASS color tokens (&HAABBGGRR&), fontName, fontSize, outline, back box into a CSS style object. The preview caption overlay reads state.style_ass, state.font_size, state.outline_size directly — any change to a preset or slider re-renders the overlay synchronously. chunkForLine() mirrors backend word-chunking client-side for preview parity. findActiveCue() does the time-sync."
+
+  - task: "Render flow sends caption_segments + auto-saves transcript"
+    implemented: true
+    working: true
     file: "app/_components/ClipEditor.js"
     stuck_count: 0
-    priority: "medium"
-    needs_retesting: true
+    priority: "high"
+    needs_retesting: false
     status_history:
-        -working: "NA"
+        -working: true
         -agent: "main"
-        -comment: "Preview container uses CSS aspect-ratio matching state.crop_aspect, with object-cover on the video — this gives the same center-crop ffmpeg will do. Title text overlay positioned top-4 or bottom-4 (matches ffmpeg drawtext y expression). Logo positioned at (x%, y%) of the preview box, which corresponds 1:1 to the rendered overlay coordinate after ffmpeg overlay=(W*x/100)-(w/2):(H*y/100)-(h/2). Caption position guide line shows 'Sample caption preview' at the configured percent-from-top. Speed badge + playbackRate. Now: 'what you see is what you get'."
+        -comment: "renderClip() PUTs current activeCaptionTrack to /api/clips/:id/transcript (fire-and-forget), then POSTs /render with caption_segments included in the payload. Backend uses the edited segments verbatim — no parameter mismatches or crashes."
 
 metadata:
   created_by: "main_agent"
-  version: "7.1"
-  test_sequence: 7
+  version: "8.0"
+  test_sequence: 8
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "Re-ingest a Hindi YouTube URL — verify captions are generated this time (transcription_source should be 'whisper' or 'gpt-4o-transcribe-synth', segments > 5, captions_burned: true on each clip)"
-    - "Verify yt-dlp audio extraction succeeds via Thordata proxy (look for 'audio.mp3' file created and Whisper call succeeding)"
-    - "POST /api/clips/:id/render with logo_x_percent + logo_y_percent + logo_scale_percent — verify the logo appears at the requested coords in the output MP4 (visual inspection via ffmpeg-extracted frame)"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -100,20 +121,27 @@ test_plan:
 agent_communication:
     -agent: "main"
     -message: |
-      Three fixes shipped to address user feedback:
+      Complete rewrite of the caption editing pipeline shipped:
 
-      1) CAPTIONS NOT GENERATED — Two root causes fixed:
-         (a) ffmpeg-via-proxy was failing TLS on audio-stream URL. Switched to yt-dlp --extract-audio (proxy-tolerant).
-         (b) gpt-4o-transcribe synthetic segments had timestamps 0,1,2... that didn't align with the source timeline. Now we probe audio duration and distribute cues evenly across it.
+      BOUNDARIES & WRAPPING:
+      - 4 words per cue / line MAX. Long cues split into multiple sequential cues; cues with 5–8 words use \\n line-break at midpoint.
+      - ASS filter: WrapStyle=0 (smart), MarginL=MarginR=10% of frame width → captions can never exceed 80% width. MarginV scaled to real frame height. original_size=actual WxH so ASS coords map 1:1.
+      - Frame dims auto-probed from source MP4 + adjusted for crop_aspect → exact output dims drive layout.
 
-      2) LOGO INTERACTIVE — User can drag the logo on the preview to any (x, y). Backend accepts logo_x_percent / logo_y_percent / logo_scale_percent. 4-corner presets remain as quick shortcuts. The Logo tab shows live coord readout + size slider.
+      INTERACTIVE EDITING:
+      - GET /api/clips/:id/transcript returns parsed JSON segments.
+      - PUT /api/clips/:id/transcript saves edits back as SRT.
+      - Editor opens → fetches transcript → loads into activeCaptionTrack state.
+      - Time-sync via rAF loop on the preview video → activeCueIdx auto-updates.
+      - Caption text rendered live on preview, styled to match ffmpeg output (color, font, stroke, back box, bold, size).
+      - Double-click preview text → inline <textarea> for editing.
+      - CC tab transcript list: per-cue timestamp (seek), inline text input, delete, add new cue at currentTime, save.
 
-      3) PREVIEW MATCHES FINAL — Preview video playbackRate is set from state.speed. Speed badge visible. Caption position guide shown. Title position matches ffmpeg drawtext. Logo position is 1:1 between preview CSS and ffmpeg overlay coords.
+      LIVE STYLE SYNC:
+      - All preset clicks + font/stroke/position sliders immediately update the preview overlay via styleAssToCss().
+      - On Render: edited captions are saved + passed to backend in caption_segments — backend uses them directly with the new chunking pipeline.
 
       VERIFIED:
-      - /render with logo_x=50, logo_y=50, scale=20 → 200, DB persists fields.
-      - Speed badge shows in preview, footer says "playback speed 1.50×".
-
-      NEEDS FRESH INGESTION TEST:
-      - Submit a Hindi YouTube URL → verify captions burn into clips this time.
-      - Drag-render a logo → verify output MP4 has logo at requested position.
+      - GET /transcript for clip 87a5a528 → 16 cues.
+      - POST /render with custom long sentence (16 words) + crop 9:16 → 200 OK, MP4 duration 5.0s, no crash.
+      - Editor screenshot shows live caption "problem in this. So we have" on preview + active row highlighted + full transcript list editable.

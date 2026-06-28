@@ -11,8 +11,9 @@ import { Badge } from '@/components/ui/badge'
 import { toast } from 'sonner'
 import {
   Palette, Captions, Type, Camera, Film, Crop, Droplet, Hash, Image as ImageIcon,
-  Gauge, Scissors, X, Loader2, Upload, Sparkles, Check,
+  Gauge, Scissors, X, Loader2, Upload, Sparkles, Check, MessageSquareText, Save as SaveIcon, Plus, Trash2,
 } from 'lucide-react'
+import { styleAssToCss, chunkForLine, findActiveCue } from './captionUtils'
 
 // Caption-style presets (the "Big idea" grid in the reference)
 const PRESETS = [
@@ -100,16 +101,37 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   const [rendering, setRendering] = useState(false)
   const [uploadingLogo, setUploadingLogo] = useState(false)
   const [probedDuration, setProbedDuration] = useState(null)
+  // Active caption track — the editable list of {start, end, text} for the live preview overlay.
+  const [activeCaptionTrack, setActiveCaptionTrack] = useState([])
+  const [activeCueIdx, setActiveCueIdx] = useState(-1)
+  const [editingCueIdx, setEditingCueIdx] = useState(-1)
+  const [transcriptLoading, setTranscriptLoading] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
   const fileRef = useRef(null)
-  // Refs for preview interactions — declared before any early return
   const videoRef = useRef(null)
   const previewBoxRef = useRef(null)
   const draggingRef = useRef(false)
+  const inlineEditRef = useRef(null)
 
-  useEffect(() => { setState(initial); setTab('presets'); setProbedDuration(null) }, [initial])
+  useEffect(() => {
+    setState(initial); setTab('presets'); setProbedDuration(null)
+    setActiveCaptionTrack([]); setActiveCueIdx(-1); setEditingCueIdx(-1); setCurrentTime(0)
+  }, [initial])
+
+  // Fetch the clip's transcript when editor opens
+  useEffect(() => {
+    if (!clip?.id) return
+    let cancelled = false
+    setTranscriptLoading(true)
+    fetch(`/api/clips/${clip.id}/transcript`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) setActiveCaptionTrack(Array.isArray(d.segments) ? d.segments : []) })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setTranscriptLoading(false) })
+    return () => { cancelled = true }
+  }, [clip?.id])
 
   // Probe actual MP4 duration from the video element once metadata loads
-  // (DB's end-start may not match if previous trims have shrunk the file)
   useEffect(() => {
     if (!clip?.storage_url_mp4) return
     const v = document.createElement('video')
@@ -138,6 +160,22 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       try { v.playbackRate = Math.max(0.5, Math.min(2.0, state.speed)) } catch { /* noop */ }
     }
   }, [state?.speed, clip?.storage_url_mp4, clip?.render_version])
+
+  // Sync current time → which cue is active (60 fps capped via requestAnimationFrame loop)
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    let raf = 0
+    const tick = () => {
+      const t = v.currentTime || 0
+      setCurrentTime(t)
+      const { idx } = findActiveCue(activeCaptionTrack, t)
+      setActiveCueIdx(prev => prev !== idx ? idx : prev)
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [activeCaptionTrack, clip?.storage_url_mp4, clip?.render_version])
 
   if (!clip || !state) return null
 
@@ -171,6 +209,15 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   async function renderClip() {
     setRendering(true)
     try {
+      // Save any pending caption edits first
+      if (activeCaptionTrack && activeCaptionTrack.length > 0) {
+        try {
+          await fetch(`/api/clips/${clip.id}/transcript`, {
+            method: 'PUT', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ segments: activeCaptionTrack }),
+          })
+        } catch (e) { console.warn('Save transcript failed (continuing render):', e) }
+      }
       const payload = {
         trim_start: state.trim_start,
         trim_end: state.trim_end,
@@ -190,6 +237,8 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         title_position: state.title_position,
         clip_title: state.clip_title,
         template_id: state.template_id,
+        // Pass the edited caption track so the backend uses the user's edits (not the cached srt)
+        caption_segments: activeCaptionTrack,
       }
       const r = await fetch(`/api/clips/${clip.id}/render`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -202,6 +251,40 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       onClose?.()
     } catch (e) { toast.error('Render failed', { description: e.message }) }
     finally { setRendering(false) }
+  }
+
+  // ============ Caption editing helpers ============
+  function updateCueText(idx, newText) {
+    setActiveCaptionTrack(prev => prev.map((s, i) => i === idx ? { ...s, text: newText } : s))
+  }
+  function deleteCue(idx) {
+    setActiveCaptionTrack(prev => prev.filter((_, i) => i !== idx))
+    if (activeCueIdx === idx) setActiveCueIdx(-1)
+    if (editingCueIdx === idx) setEditingCueIdx(-1)
+  }
+  function addCueAtCurrentTime() {
+    const t = currentTime
+    const newCue = { start: t, end: Math.min(t + 2, state?.duration || t + 2), text: 'New caption' }
+    setActiveCaptionTrack(prev => {
+      const next = [...prev, newCue].sort((a, b) => a.start - b.start)
+      return next
+    })
+  }
+  function seekToCue(idx) {
+    const s = activeCaptionTrack[idx]
+    if (s && videoRef.current) {
+      videoRef.current.currentTime = s.start + 0.01
+    }
+  }
+  async function saveTranscript() {
+    try {
+      const r = await fetch(`/api/clips/${clip.id}/transcript`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ segments: activeCaptionTrack }),
+      })
+      if (!r.ok) throw new Error('Save failed')
+      toast.success('Captions saved')
+    } catch (e) { toast.error('Save failed', { description: e.message }) }
   }
 
   const previewBg = clip.thumbnail_url || ''
@@ -299,14 +382,49 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   {state.title_text}
                 </div>
               )}
-              {/* Caption position guide */}
-              {state.caption_position_percent != null && (
-                <div className="absolute left-2 right-2 pointer-events-none" style={{ top: `${state.caption_position_percent}%`, transform: 'translateY(-50%)' }}>
-                  <div className="bg-black/70 text-white text-[10px] px-2 py-0.5 rounded text-center font-semibold" style={{ fontSize: `${Math.max(8, state.font_size * 0.5)}px` }}>
-                    Sample caption preview
+              {/* Caption position guide - INTERACTIVE ACTIVE CAPTION OVERLAY */}
+              {(() => {
+                const activeCue = activeCueIdx >= 0 ? activeCaptionTrack[activeCueIdx] : null
+                // Always show SOMETHING so user sees what styling will look like — fallback to a sample
+                const displayCue = activeCue || (activeCaptionTrack[0] ? { ...activeCaptionTrack[0], _ghost: true } : { text: 'Sample caption preview', _ghost: true, _idx: -1 })
+                const displayText = chunkForLine(displayCue.text || '', 4)
+                const cssStyle = styleAssToCss({
+                  styleAss: state.style_ass,
+                  fontSize: state.font_size,
+                  outlineSize: state.outline_size,
+                  frameWidth: previewBoxRef.current?.getBoundingClientRect?.().width || 360,
+                })
+                const isEditing = editingCueIdx === activeCueIdx && activeCueIdx >= 0
+                return (
+                  <div
+                    className="absolute left-[10%] right-[10%] pointer-events-auto text-center"
+                    style={{ top: `${state.caption_position_percent}%`, transform: 'translateY(-50%)' }}
+                  >
+                    {isEditing ? (
+                      <textarea
+                        ref={inlineEditRef}
+                        defaultValue={activeCue?.text || ''}
+                        autoFocus
+                        rows={2}
+                        className="w-full bg-black/80 text-white text-center rounded outline-none border-2 border-primary px-2 py-1 resize-none"
+                        style={{ fontSize: cssStyle.fontSize, fontFamily: cssStyle.fontFamily, fontWeight: cssStyle.fontWeight }}
+                        onBlur={(e) => { updateCueText(activeCueIdx, e.target.value); setEditingCueIdx(-1) }}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.blur() } }}
+                      />
+                    ) : (
+                      <span
+                        title={activeCue ? 'Double-click to edit this caption' : 'Generate captions to see them here'}
+                        className={`whitespace-pre-line cursor-text transition-opacity ${displayCue._ghost ? 'opacity-40' : 'opacity-100'} hover:ring-2 hover:ring-primary/60 hover:rounded`}
+                        style={cssStyle}
+                        onDoubleClick={() => { if (activeCue) setEditingCueIdx(activeCueIdx) }}
+                        onClick={() => { if (activeCue) setTab('cc') }}
+                      >
+                        {displayText}
+                      </span>
+                    )}
                   </div>
-                </div>
-              )}
+                )
+              })()}
               {/* Logo overlay — draggable. The frame logo position is the CENTER of the logo. */}
               {state.logo_url && (
                 <div
@@ -366,7 +484,7 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 </div>
               </TabsContent>
 
-              {/* CC — fine-tune captions */}
+              {/* CC — fine-tune captions + edit transcript */}
               <TabsContent value="cc" className="p-4 overflow-y-auto max-h-[55vh] mt-0 space-y-5">
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
@@ -384,7 +502,7 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 </div>
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
-                    <Label>Caption position (from bottom)</Label>
+                    <Label>Caption position (from top)</Label>
                     <span className="text-muted-foreground">{state.caption_position_percent}%</span>
                   </div>
                   <Slider min={5} max={95} step={1} value={[state.caption_position_percent]} onValueChange={([v]) => patch({ caption_position_percent: v })} />
@@ -393,6 +511,49 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                       <Button key={p.l} size="sm" variant={Math.abs(state.caption_position_percent - p.v) < 5 ? 'default' : 'outline'} onClick={() => patch({ caption_position_percent: p.v })}>{p.l}</Button>
                     ))}
                   </div>
+                </div>
+
+                {/* TRANSCRIPT EDITOR — list of cues, click to seek, double-click / inline edit */}
+                <div className="space-y-2 pt-3 border-t border-border">
+                  <div className="flex items-center justify-between">
+                    <Label className="flex items-center gap-1.5"><MessageSquareText className="h-3.5 w-3.5" /> Transcript ({activeCaptionTrack.length} cues)</Label>
+                    <div className="flex gap-1">
+                      <Button size="sm" variant="outline" onClick={addCueAtCurrentTime} title="Add a cue at the current playback time">
+                        <Plus className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={saveTranscript} title="Save edits without re-rendering">
+                        <SaveIcon className="h-3.5 w-3.5 mr-1" /> Save
+                      </Button>
+                    </div>
+                  </div>
+                  {transcriptLoading ? (
+                    <div className="flex items-center justify-center py-6 text-muted-foreground gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" /> loading…</div>
+                  ) : activeCaptionTrack.length === 0 ? (
+                    <div className="text-xs text-muted-foreground text-center py-4 border border-dashed border-border rounded">No captions yet — ingestion didn't produce a transcript for this clip.</div>
+                  ) : (
+                    <div className="space-y-1 max-h-[280px] overflow-y-auto pr-1">
+                      {activeCaptionTrack.map((cue, i) => {
+                        const active = i === activeCueIdx
+                        return (
+                          <div key={i} className={`group flex items-center gap-2 px-2 py-1.5 rounded text-xs border transition-colors cursor-pointer ${active ? 'border-primary bg-primary/10' : 'border-transparent hover:border-border hover:bg-muted/40'}`}>
+                            <button onClick={() => seekToCue(i)} className="font-mono text-[10px] text-muted-foreground tabular-nums w-12 text-left hover:text-foreground">
+                              {Math.floor(cue.start / 60)}:{String(Math.floor(cue.start % 60)).padStart(2, '0')}
+                            </button>
+                            <input
+                              value={cue.text}
+                              onChange={(e) => updateCueText(i, e.target.value)}
+                              onFocus={() => seekToCue(i)}
+                              className="flex-1 bg-transparent outline-none border-0 focus:bg-card focus:ring-1 focus:ring-primary rounded px-1 py-0.5"
+                            />
+                            <button onClick={() => deleteCue(i)} className="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 transition-opacity">
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                  <div className="text-[10px] text-muted-foreground">{'💡 Captions auto-wrap to max 4 words/line · click any row to seek · edit text inline · double-click the caption on the preview to edit there'}</div>
                 </div>
               </TabsContent>
 
