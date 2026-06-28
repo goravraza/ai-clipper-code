@@ -20,6 +20,14 @@ async function getDb() {
   cachedClient = client
   const db = client.db(DB_NAME)
   await seedIfEmpty(db)
+  // STARTUP CLEANUP: any in-progress jobs from BEFORE this boot are dead (process was killed).
+  // Mark them failed so the user's UI shows an actionable error instead of polling forever.
+  try {
+    await db.collection('videos_processed').updateMany(
+      { status: { $in: ['queued', 'downloading', 'downloaded', 'transcribing', 'analyzing', 'cutting'] }, created_at: { $lt: new Date(Date.now() - 60 * 1000) } },
+      { $set: { status: 'failed', error_message: 'Processing was interrupted by a server restart (likely memory limit). Please re-submit the URL.', failed_at: new Date() } }
+    )
+  } catch (e) { console.warn('Stale-job cleanup failed:', e.message) }
   return db
 }
 

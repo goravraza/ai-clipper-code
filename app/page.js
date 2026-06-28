@@ -350,6 +350,19 @@ export default function HomePage() {
     } catch (e) { toast.error('Restyle failed', { description: e.message }) }
   }
 
+  // Parse response as JSON; if server returned an HTML error page (e.g. during a dev-server restart
+  // or a 500), surface a clean message instead of "Unexpected token '<' in JSON".
+  async function safeJson(r) {
+    const text = await r.text()
+    try { return JSON.parse(text) } catch {
+      const isHtml = /^\s*<!DOCTYPE|<html/i.test(text)
+      const snippet = text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 160)
+      throw new Error(isHtml
+        ? `Server returned an error page (HTTP ${r.status}). ${snippet || 'The dev server may have just restarted — please retry in 10 seconds.'}`
+        : `Bad response: ${snippet || r.statusText}`)
+    }
+  }
+
   // ===== ACTUAL BACKEND SUBMISSIONS =====
   async function submitIngest({ url }, wizardConfig) {
     setIsIngesting(true)
@@ -366,7 +379,7 @@ export default function HomePage() {
           overlays_config: wizardConfig?.overlays_config,
         })
       })
-      const data = await r.json()
+      const data = await safeJson(r)
       if (!r.ok) throw new Error(data.error || 'AI failed')
       const videoId = data.video_id
       toast.info('Processing started — downloading, transcribing, then cutting with FFmpeg', { description: 'This usually takes 1–3 minutes for short videos.' })
@@ -374,8 +387,15 @@ export default function HomePage() {
       const startTs = Date.now()
       while (Date.now() - startTs < 8 * 60 * 1000) {
         await new Promise(r => setTimeout(r, 2500))
-        const sr = await fetch(`/api/videos/${videoId}`)
-        const sd = await sr.json()
+        let sd
+        try {
+          const sr = await fetch(`/api/videos/${videoId}`)
+          sd = await safeJson(sr)
+        } catch (pollErr) {
+          // Don't kill the whole flow on a transient hiccup — just retry next tick
+          console.warn('Poll hiccup:', pollErr.message)
+          continue
+        }
         setProcessing({ status: sd.status, progress: sd.progress || 0, title: sd.title })
         if (sd.status === 'completed') {
           toast.success(`✅ ${sd.clip_count || sd.clips?.length || 0} clips ready! (${sd.credits_charged || 0} credits used)`, { description: `From: ${sd.title || url.slice(0,50)}` })
