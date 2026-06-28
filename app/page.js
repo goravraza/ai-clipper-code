@@ -8,7 +8,7 @@ import {
   Flame, TrendingUp, Zap, Settings2, Type, Palette, Wand2, Coins,
   Youtube, Instagram, Music2, ShieldCheck, ChevronRight, Loader2, Play,
   Languages, Smile, Pencil, Check, LogIn, LogOut, User as UserIcon,
-  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud, Sliders,
+  Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud, Sliders, Maximize2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -909,6 +909,10 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
   const [title, setTitle] = useState(clip.clip_title)
   const [scheduledTime, setScheduledTime] = useState(clip.scheduled_time || '')
   const [platform, setPlatform] = useState('youtube_shorts')
+  // Inline preview state — toggle thumbnail → playing video
+  const [inlinePlaying, setInlinePlaying] = useState(false)
+  const [lightboxOpen, setLightboxOpen] = useState(false)
+  const isPlayable = clip.storage_url_mp4?.startsWith('/api/files/')
 
   async function saveTitle() {
     if (title === clip.clip_title) return
@@ -971,17 +975,41 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
     : t.no_hook
 
   return (
+    <>
     <Card className="overflow-hidden group">
-      <div className="relative aspect-[9/16] bg-zinc-900 overflow-hidden">
-        {clip.thumbnail_url && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={clip.thumbnail_url} alt={clip.clip_title} className="absolute inset-0 h-full w-full object-cover opacity-80 group-hover:opacity-100 group-hover:scale-105 transition-all" />
+      <div className="relative aspect-[9/16] bg-zinc-900 overflow-hidden cursor-pointer" onClick={() => isPlayable && setInlinePlaying(true)}>
+        {inlinePlaying && isPlayable ? (
+          <video
+            src={`${clip.storage_url_mp4}?v=${clip.render_version || 0}`}
+            className="absolute inset-0 h-full w-full object-cover bg-black"
+            controls
+            autoPlay
+            playsInline
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <>
+            {clip.thumbnail_url && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={clip.thumbnail_url} alt={clip.clip_title} className="absolute inset-0 h-full w-full object-cover opacity-80 group-hover:opacity-100 group-hover:scale-105 transition-all" />
+            )}
+            <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
+          </>
         )}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
-        <Badge className={`absolute top-2 left-2 ${scoreColor} text-white border-transparent`}><Flame className="h-3 w-3 mr-1" /> {score}</Badge>
-        <div className="absolute top-2 right-2 rounded-md bg-black/60 backdrop-blur px-2 py-0.5 text-xs text-white flex items-center gap-1">
+        <Badge className={`absolute top-2 left-2 ${scoreColor} text-white border-transparent z-10`}><Flame className="h-3 w-3 mr-1" /> {score}</Badge>
+        <div className="absolute top-2 right-2 rounded-md bg-black/60 backdrop-blur px-2 py-0.5 text-xs text-white flex items-center gap-1 z-10">
           <Clock className="h-3 w-3" /> {clip.end_time_seconds - clip.start_time_seconds}s
         </div>
+        {/* Expand to lightbox button — visible on hover */}
+        {isPlayable && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setLightboxOpen(true) }}
+            className="absolute top-10 right-2 rounded-md bg-black/60 backdrop-blur p-1.5 text-white hover:bg-black/80 z-10 opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Open in larger preview"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </button>
+        )}
         {/* Meme hook preview overlay */}
         {clip.hook_type === 'meme' && hookMeme && (
           <div className="absolute bottom-12 left-2 right-2 rounded-md bg-black/70 backdrop-blur-md p-1.5 flex items-center gap-2 border border-primary/40">
@@ -1049,6 +1077,33 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
         </div>
       </CardContent>
     </Card>
+
+    {/* LIGHTBOX PREVIEW — opens via Expand icon, larger player */}
+    <Dialog open={lightboxOpen} onOpenChange={(o) => setLightboxOpen(o)}>
+      <DialogContent className="max-w-2xl p-0 overflow-hidden bg-black border-zinc-800">
+        <div className="relative w-full" style={{ aspectRatio: '9/16', maxHeight: '88vh' }}>
+          {lightboxOpen && isPlayable && (
+            <video
+              src={`${clip.storage_url_mp4}?v=${clip.render_version || 0}&lb=1`}
+              className="absolute inset-0 h-full w-full object-contain bg-black"
+              controls
+              autoPlay
+              playsInline
+            />
+          )}
+        </div>
+        <div className="px-4 py-3 flex items-center justify-between bg-zinc-950 text-white">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold truncate">{clip.clip_title}</div>
+            <div className="text-[11px] text-zinc-400">{clip.end_time_seconds - clip.start_time_seconds}s · Score {score}</div>
+          </div>
+          <Button size="sm" variant="outline" className="bg-transparent text-white border-zinc-700 hover:bg-zinc-800" onClick={() => { setLightboxOpen(false); onEdit?.(clip) }}>
+            <Sliders className="h-3.5 w-3.5 mr-1" /> Edit
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+    </>
   )
 }
 

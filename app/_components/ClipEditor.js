@@ -94,6 +94,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       // NEW: drag-positioned caption coords (center anchor, % of frame)
       caption_x_percent: Number.isFinite(clip.caption_x_percent) ? clip.caption_x_percent : 50,
       caption_y_percent: Number.isFinite(clip.caption_y_percent) ? clip.caption_y_percent : (clip.overlays_config?.caption?.position_percent ?? 78),
+      // Fill mode for 9:16 portrait when source is landscape
+      fill_mode: clip.fill_mode || 'crop',
+      fill_color: clip.fill_color || '#000000',
       clip_title: clip.clip_title || '',
       duration: dur,
     }
@@ -233,6 +236,8 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         caption_position_percent: state.caption_position_percent,
         caption_x_percent: state.caption_x_percent,
         caption_y_percent: state.caption_y_percent,
+        fill_mode: state.fill_mode,
+        fill_color: state.fill_color,
         logo_url: state.logo_url,
         logo_position: state.logo_position,
         logo_x_percent: state.logo_x_percent,
@@ -339,6 +344,31 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     e.currentTarget.releasePointerCapture?.(e.pointerId)
   }
 
+  // Caption RESIZE handlers — drag any corner dot to scale font_size proportionally.
+  const resizeRef = { current: null }  // { startX, startY, startFontSize, corner }
+  const onResizePointerDown = (e, corner) => {
+    e.preventDefault()
+    e.stopPropagation()
+    resizeRef.current = { startX: e.clientX, startY: e.clientY, startFontSize: state.font_size, corner }
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+  }
+  const onResizePointerMove = (e) => {
+    if (!resizeRef.current) return
+    e.stopPropagation()
+    const dx = e.clientX - resizeRef.current.startX
+    const dy = e.clientY - resizeRef.current.startY
+    // Use diagonal distance — outward = bigger
+    const corner = resizeRef.current.corner
+    const sign = (corner === 'br' || corner === 'tr') ? 1 : -1
+    const delta = sign * (Math.abs(dx) > Math.abs(dy) ? dx : (corner.startsWith('t') ? -dy : dy))
+    const next = Math.max(10, Math.min(60, Math.round(resizeRef.current.startFontSize + delta / 6)))
+    patch({ font_size: next })
+  }
+  const onResizePointerUp = (e) => {
+    resizeRef.current = null
+    e.currentTarget.releasePointerCapture?.(e.pointerId)
+  }
+
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose?.()}>
       <DialogContent className="max-w-5xl w-[96vw] max-h-[92vh] overflow-hidden p-0">
@@ -409,7 +439,7 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   {state.title_text}
                 </div>
               )}
-              {/* INTERACTIVE ACTIVE CAPTION OVERLAY — draggable on the canvas */}
+              {/* INTERACTIVE ACTIVE CAPTION OVERLAY — bounding box with corner handles */}
               {(() => {
                 const activeCue = activeCueIdx >= 0 ? activeCaptionTrack[activeCueIdx] : null
                 const displayCue = activeCue || (activeCaptionTrack[0] ? { ...activeCaptionTrack[0], _ghost: true } : { text: 'Sample caption preview', _ghost: true, _idx: -1 })
@@ -421,9 +451,10 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   frameWidth: previewBoxRef.current?.getBoundingClientRect?.().width || 360,
                 })
                 const isEditing = editingCueIdx === activeCueIdx && activeCueIdx >= 0
+                const selected = !!activeCue && !displayCue._ghost
                 return (
                   <div
-                    className={`absolute pointer-events-auto text-center ${isEditing ? '' : 'cursor-move'} hover:ring-2 hover:ring-primary/40 rounded`}
+                    className={`absolute pointer-events-auto text-center ${isEditing ? '' : selected ? 'cursor-move' : ''}`}
                     style={{
                       left: `${state.caption_x_percent}%`,
                       top: `${state.caption_y_percent}%`,
@@ -437,6 +468,31 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                     onPointerCancel={onCapPointerUp}
                     title={activeCue ? 'Drag to reposition · double-click to edit text' : 'Generate captions to see them here'}
                   >
+                    {/* SELECTION BOUNDING BOX (visible only when a real cue is active) */}
+                    {selected && !isEditing && (
+                      <>
+                        <div className="absolute -inset-3 border border-white/80 pointer-events-none rounded-sm" />
+                        {/* Corner handles */}
+                        {['tl','tr','bl','br'].map((pos) => (
+                          <div
+                            key={pos}
+                            className={`absolute h-3 w-3 rounded-full bg-white border-2 border-black shadow ${pos === 'tl' ? '-left-4 -top-4' : pos === 'tr' ? '-right-4 -top-4' : pos === 'bl' ? '-left-4 -bottom-4' : '-right-4 -bottom-4'}`}
+                            style={{ cursor: pos === 'tl' || pos === 'br' ? 'nwse-resize' : 'nesw-resize', touchAction: 'none' }}
+                            onPointerDown={(e) => onResizePointerDown(e, pos)}
+                            onPointerMove={onResizePointerMove}
+                            onPointerUp={onResizePointerUp}
+                          />
+                        ))}
+                        {/* Delete × button at top-left */}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deleteCue(activeCueIdx) }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          className="absolute -top-7 -left-6 h-5 w-5 rounded-full bg-white text-black text-[11px] font-bold flex items-center justify-center shadow hover:bg-red-500 hover:text-white"
+                          title="Delete this cue"
+                        >×</button>
+                      </>
+                    )}
+
                     {isEditing ? (
                       <textarea
                         ref={inlineEditRef}
@@ -450,7 +506,7 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                       />
                     ) : (
                       <span
-                        className={`whitespace-pre-line transition-opacity ${displayCue._ghost ? 'opacity-40' : 'opacity-100'}`}
+                        className={`whitespace-pre-line transition-opacity inline-block ${displayCue._ghost ? 'opacity-40' : 'opacity-100'}`}
                         style={cssStyle}
                         onDoubleClick={(e) => { e.stopPropagation(); if (activeCue) setEditingCueIdx(activeCueIdx) }}
                       >
@@ -614,18 +670,49 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 )}
               </TabsContent>
 
-              {/* Crop */}
-              <TabsContent value="crop" className="p-4 overflow-y-auto max-h-[55vh] mt-0">
-                <div className="grid grid-cols-3 gap-3">
-                  {ASPECTS.map(a => (
-                    <button key={a.value} onClick={() => patch({ crop_aspect: a.value })}
-                      className={`relative rounded-lg border-2 p-4 flex flex-col items-center gap-2 transition-colors ${state.crop_aspect === a.value ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}`}>
-                      <div className={`${a.tw} w-14 bg-muted-foreground/30 rounded`} />
-                      <div className="text-xs font-medium">{a.label}</div>
-                    </button>
-                  ))}
+              {/* Crop + Fill Mode */}
+              <TabsContent value="crop" className="p-4 overflow-y-auto max-h-[55vh] mt-0 space-y-5">
+                <div>
+                  <Label className="text-sm font-medium mb-2 block">Aspect ratio</Label>
+                  <div className="grid grid-cols-3 gap-3">
+                    {ASPECTS.map(a => (
+                      <button key={a.value} onClick={() => patch({ crop_aspect: a.value })}
+                        className={`relative rounded-lg border-2 p-4 flex flex-col items-center gap-2 transition-colors ${state.crop_aspect === a.value ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}`}>
+                        <div className={`${a.tw} w-14 bg-muted-foreground/30 rounded`} />
+                        <div className="text-xs font-medium">{a.label}</div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div className="text-[11px] text-muted-foreground mt-3">Crops from the center. For 1:1 / 16:9, the original 9:16 frame is letter/pillar-boxed by ffmpeg.</div>
+
+                <div className="pt-4 border-t border-border">
+                  <Label className="text-sm font-medium mb-2 block">Background fill (for non-matching source ratios)</Label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { id: 'crop',  label: 'Crop',  hint: 'Cut sides' },
+                      { id: 'blur',  label: 'Blur',  hint: 'Reels-style' },
+                      { id: 'color', label: 'Color', hint: 'Solid bars' },
+                    ].map(m => (
+                      <button key={m.id} onClick={() => patch({ fill_mode: m.id })}
+                        className={`relative rounded-lg border-2 p-3 flex flex-col items-center gap-1 transition-colors ${state.fill_mode === m.id ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}`}>
+                        <div className="text-xs font-bold">{m.label}</div>
+                        <div className="text-[10px] text-muted-foreground">{m.hint}</div>
+                      </button>
+                    ))}
+                  </div>
+                  {state.fill_mode === 'color' && (
+                    <div className="mt-3 flex items-center gap-3">
+                      <Label className="text-xs">Bar color</Label>
+                      <input type="color" value={state.fill_color} onChange={(e) => patch({ fill_color: e.target.value })} className="h-9 w-14 cursor-pointer rounded border border-border bg-transparent" />
+                      <Input value={state.fill_color} onChange={(e) => patch({ fill_color: e.target.value })} className="font-mono text-xs h-9 w-28" />
+                    </div>
+                  )}
+                  <div className="text-[10px] text-muted-foreground mt-3">
+                    {state.fill_mode === 'crop' && '🔪 Center-crops the source. Best when the action is in the middle.'}
+                    {state.fill_mode === 'blur' && '🌫 Original video centered with a blurred copy filling the bars — Instagram Reels look.'}
+                    {state.fill_mode === 'color' && '⬛ Solid color bars top/bottom. Pick your brand color above.'}
+                  </div>
+                </div>
               </TabsContent>
 
               {/* Trim */}

@@ -935,6 +935,9 @@ async function handle(request, { params }) {
       // If caption_y_percent is set, it overrides captionPos (which is legacy position-from-top).
       const captionXPercent = Number.isFinite(body.caption_x_percent) ? Math.max(5, Math.min(95, Number(body.caption_x_percent))) : 50
       const captionYPercent = Number.isFinite(body.caption_y_percent) ? Math.max(5, Math.min(95, Number(body.caption_y_percent))) : captionPos
+      // FILL MODE for aspect-ratio change: 'crop' (default), 'blur' (blurred background), 'color' (solid bars)
+      const fillMode = ['crop', 'blur', 'color'].includes(body.fill_mode) ? body.fill_mode : 'crop'
+      const fillColor = /^#[0-9a-f]{6}$/i.test(String(body.fill_color || '')) ? body.fill_color : '#000000'
       const fontSize = Number(body.font_size) || (body.style_ass?.fontSize) || 18
       const outlineSize = Number.isFinite(body.outline_size) ? Number(body.outline_size) : 2
       const styleAss = { ...(body.style_ass || clip.style_ass || {}) }
@@ -1091,15 +1094,38 @@ async function handle(request, { params }) {
           try { const finalSrt = await fs.readFile(srtPath, 'utf-8'); await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { srt_content_rendered: finalSrt } }) } catch {}
         }
 
-        // Build video filter chain: crop → scale to TARGET 1080p HD → setpts → subtitles → drawtext (title)
-        const vfilters = []
+        // Build video filter chain: crop/scale → setpts → subtitles → drawtext (title)
+        // Supports three FILL MODES for aspect-ratio change:
+        //   'crop'  — center crop (loses sides)
+        //   'blur'  — blurred copy of original as background, foreground letterboxed (Reels-style)
+        //   'color' — solid color bars top/bottom or left/right
+        let vfilters = []
+        let useFilterComplex = false
+        let filterComplex = null
         const targetW = cropAspect === '16:9' ? 1920 : 1080
         const targetH = cropAspect === '9:16' ? 1920 : cropAspect === '1:1' ? 1080 : cropAspect === '16:9' ? 1080 : 1920
         if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
           const [aw, ah] = cropAspect.split(':').map(Number)
-          vfilters.push(`crop='min(iw\\,ih*${aw}/${ah})':'min(ih\\,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2`)
-          // Upscale to clean HD output — Lanczos for crisp upscaling
-          vfilters.push(`scale=${targetW}:${targetH}:flags=lanczos`)
+          if (fillMode === 'crop') {
+            vfilters.push(`crop='min(iw\\,ih*${aw}/${ah})':'min(ih\\,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2`)
+            vfilters.push(`scale=${targetW}:${targetH}:flags=lanczos`)
+          } else if (fillMode === 'blur') {
+            // Build via filter_complex: [main] = scaled-to-fit; [bg] = scaled-to-cover + boxblur; overlay center.
+            // foreground is letterboxed; background is the blurred full-bleed of the original.
+            const fc = []
+            fc.push(`[0:v]split=2[v0][v1]`)
+            // background: scale to cover, then strong blur
+            fc.push(`[v0]scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH},boxblur=luma_radius=30:luma_power=2,setsar=1[bg]`)
+            // foreground: scale to fit inside target frame
+            fc.push(`[v1]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,setsar=1[fg]`)
+            fc.push(`[bg][fg]overlay=(W-w)/2:(H-h)/2[out]`)
+            filterComplex = fc.join(';')
+            useFilterComplex = true
+          } else if (fillMode === 'color') {
+            // Letterbox / pillarbox with a solid color bar.
+            vfilters.push(`scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`)
+            vfilters.push(`pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:color=${fillColor}`)
+          }
         } else {
           vfilters.push(`scale='min(iw,1080)':'-2':flags=lanczos`)
         }
@@ -1116,12 +1142,14 @@ async function handle(request, { params }) {
           vfilters.push(`drawtext=fontfile=${fontfile}:text='${esc}':fontcolor=white:fontsize=42:borderw=4:bordercolor=black:box=1:boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=${yExpr}`)
         }
 
-        // Logo overlay: download if URL, then -i + overlay filter
+        // Logo overlay + filter chain orchestration.
+        // Cases: (A) no logo + no blur → -vf chain  (B) no logo + blur → -filter_complex with blur+overlay
+        //        (C) logo + no blur → existing -filter_complex with vf→logo overlay
+        //        (D) logo + blur → combined blur fill + remaining vfilters + logo overlay
         const args = ['-y', '-ss', String(trimStart), '-to', String(trimEnd), '-i', srcPath]
         let logoTmp = null
         if (logoUrl) {
           try {
-            // logoUrl can be /api/files/logos/<id>.png — resolve to local path
             if (logoUrl.startsWith('/api/files/')) {
               logoTmp = path.join(UPLOAD_DIR, logoUrl.replace(/^\/api\/files\//, ''))
             } else if (/^https?:\/\//.test(logoUrl)) {
@@ -1132,26 +1160,44 @@ async function handle(request, { params }) {
                 await fs.writeFile(logoTmp, buf)
               } else logoTmp = null
             }
-            if (logoTmp && await fs.stat(logoTmp).catch(()=>null)) {
-              args.push('-i', logoTmp)
-              // If custom % coords supplied, use them. Else use the corner preset.
-              // Logo is scaled to (logoScale)% of frame WIDTH.
-              const logoW = `iw*${logoScale}/100`
-              let xExpr, yExpr
-              if (logoX !== null && logoY !== null) {
-                // logoX/Y is the CENTER of the logo as % of frame
-                xExpr = `(W*${logoX}/100)-(w/2)`
-                yExpr = `(H*${logoY}/100)-(h/2)`
-              } else {
-                xExpr = logoPosition.endsWith('right') ? 'W-w-20' : '20'
-                yExpr = logoPosition.startsWith('bottom') ? 'H-h-20' : '20'
-              }
-              const vfChain = vfilters.length ? vfilters.join(',') : 'null'
-              args.push('-filter_complex', `[0:v]${vfChain}[v];[1:v]scale=${logoW}:-1[lg];[v][lg]overlay=${xExpr}:${yExpr}`)
-            } else if (vfilters.length) {
-              args.push('-vf', vfilters.join(','))
-            }
-          } catch (logoErr) { console.error('logo prep failed', logoErr.message); if (vfilters.length) args.push('-vf', vfilters.join(',')) }
+          } catch (e) { console.error('logo prep failed', e.message); logoTmp = null }
+        }
+        const hasLogo = logoTmp && (await fs.stat(logoTmp).catch(()=>null))
+        if (hasLogo) args.push('-i', logoTmp)
+
+        // Compute logo overlay coords (used in cases C & D)
+        let logoFilter = null
+        if (hasLogo) {
+          const logoW = `iw*${logoScale}/100`
+          let xExpr, yExpr
+          if (logoX !== null && logoY !== null) {
+            xExpr = `(W*${logoX}/100)-(w/2)`
+            yExpr = `(H*${logoY}/100)-(h/2)`
+          } else {
+            xExpr = logoPosition.endsWith('right') ? 'W-w-20' : '20'
+            yExpr = logoPosition.startsWith('bottom') ? 'H-h-20' : '20'
+          }
+          logoFilter = { logoW, xExpr, yExpr }
+        }
+
+        if (useFilterComplex) {
+          // BLUR FILL — start from filterComplex (which produces [out]), then apply remaining vfilters (subtitles, drawtext, etc.)
+          // then optionally overlay logo.
+          let fc = filterComplex  // ends with ...[out]
+          const remainingVf = vfilters.length ? vfilters.join(',') : null
+          if (remainingVf) fc += `;[out]${remainingVf}[vfilt]`
+          const mainLabel = remainingVf ? '[vfilt]' : '[out]'
+          if (hasLogo) {
+            fc += `;[1:v]scale=${logoFilter.logoW}:-1[lg];${mainLabel}[lg]overlay=${logoFilter.xExpr}:${logoFilter.yExpr}`
+          } else {
+            // Need to map [out]/[vfilt] as the final video — use null filter to make it the primary stream
+            fc += `;${mainLabel}null[vout]`
+            args.push('-map', '[vout]', '-map', '0:a?')
+          }
+          args.push('-filter_complex', fc)
+        } else if (hasLogo) {
+          const vfChain = vfilters.length ? vfilters.join(',') : 'null'
+          args.push('-filter_complex', `[0:v]${vfChain}[v];[1:v]scale=${logoFilter.logoW}:-1[lg];[v][lg]overlay=${logoFilter.xExpr}:${logoFilter.yExpr}`)
         } else if (vfilters.length) {
           args.push('-vf', vfilters.join(','))
         }
@@ -1188,6 +1234,7 @@ async function handle(request, { params }) {
           trim_start: trimStart, trim_end: trimEnd, crop_aspect: cropAspect, speed,
           style_preset: stylePreset, style_ass: styleAss, font_size: fontSize, outline_size: outlineSize,
           caption_x_percent: captionXPercent, caption_y_percent: captionYPercent,
+          fill_mode: fillMode, fill_color: fillColor,
           logo_url: logoUrl, logo_position: logoUrl ? logoPosition : null,
           logo_x_percent: logoX, logo_y_percent: logoY, logo_scale_percent: logoScale,
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
