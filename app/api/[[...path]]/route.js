@@ -434,6 +434,136 @@ async function handle(request, { params }) {
       const list = await db.collection('generated_clips').find({ user_id: user.id }).sort({ created_at: -1, virality_score: -1 }).toArray()
       return NextResponse.json(list.map(strip))
     }
+
+    // ============= PROJECTS (group clips by their parent source video) =============
+    // GET /api/projects — list of source-video projects with clip counts + preview thumbs
+    if (path_ === '/projects' && method === 'GET') {
+      const user = await getUser(request, db)
+      const videos = await db.collection('videos_processed').find({ user_id: user.id }).sort({ created_at: -1 }).toArray()
+      const allClips = await db.collection('generated_clips').find({ user_id: user.id }).sort({ created_at: -1, virality_score: -1 }).toArray()
+
+      // Index clips by video_id
+      const byVid = new Map()
+      for (const c of allClips) {
+        const k = c.video_id || '__orphan__'
+        if (!byVid.has(k)) byVid.set(k, [])
+        byVid.get(k).push(c)
+      }
+
+      const projects = videos.map(v => {
+        const cs = byVid.get(v.id) || []
+        return {
+          id: v.id,
+          title: v.title || v.original_url || 'Untitled project',
+          original_url: v.original_url || null,
+          source_type: v.source_type || 'other',
+          thumbnail_url: v.thumbnail_url || (cs[0]?.thumbnail_url || null),
+          status: v.status || 'completed',
+          progress: v.progress ?? null,
+          error_message: v.error_message || null,
+          clip_length_range: v.clip_length_range || null,
+          created_at: v.created_at,
+          updated_at: v.updated_at || v.created_at,
+          clip_count: cs.length,
+          clip_thumbnails: cs.slice(0, 4).map(c => c.thumbnail_url).filter(Boolean),
+          avg_virality: cs.length ? Math.round(cs.reduce((a, c) => a + (c.virality_score || 0), 0) / cs.length) : 0,
+        }
+      })
+
+      // Build a virtual "Unsorted" project for clips whose parent video was deleted
+      const orphans = byVid.get('__orphan__') || []
+      // Also include clips whose video_id doesn't match any existing video
+      const knownIds = new Set(videos.map(v => v.id))
+      const extraOrphans = []
+      for (const [k, list] of byVid.entries()) {
+        if (k === '__orphan__') continue
+        if (!knownIds.has(k)) extraOrphans.push(...list)
+      }
+      const allOrphans = [...orphans, ...extraOrphans]
+      if (allOrphans.length > 0) {
+        projects.push({
+          id: '__unsorted__',
+          title: 'Unsorted Clips',
+          original_url: null,
+          source_type: 'other',
+          thumbnail_url: allOrphans[0]?.thumbnail_url || null,
+          status: 'completed',
+          progress: null,
+          error_message: null,
+          clip_length_range: null,
+          created_at: allOrphans[0]?.created_at || new Date(0),
+          updated_at: allOrphans[0]?.created_at || new Date(0),
+          clip_count: allOrphans.length,
+          clip_thumbnails: allOrphans.slice(0, 4).map(c => c.thumbnail_url).filter(Boolean),
+          avg_virality: Math.round(allOrphans.reduce((a, c) => a + (c.virality_score || 0), 0) / allOrphans.length),
+          is_virtual: true,
+        })
+      }
+
+      return NextResponse.json(projects)
+    }
+
+    // GET /api/projects/:id — one project with all its clips
+    if (path_.startsWith('/projects/') && method === 'GET') {
+      const user = await getUser(request, db)
+      const id = segments[1]
+      if (id === '__unsorted__') {
+        const allClips = await db.collection('generated_clips').find({ user_id: user.id }).sort({ virality_score: -1, created_at: -1 }).toArray()
+        const videos = await db.collection('videos_processed').find({ user_id: user.id }, { projection: { id: 1 } }).toArray()
+        const known = new Set(videos.map(v => v.id))
+        const orphans = allClips.filter(c => !c.video_id || !known.has(c.video_id))
+        return NextResponse.json({
+          id: '__unsorted__',
+          title: 'Unsorted Clips',
+          source_type: 'other',
+          status: 'completed',
+          is_virtual: true,
+          clips: orphans.map(strip),
+        })
+      }
+      const v = await db.collection('videos_processed').findOne({ id, user_id: user.id })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const clips = await db.collection('generated_clips').find({ video_id: id, user_id: user.id }).sort({ virality_score: -1, start_time_seconds: 1 }).toArray()
+      return NextResponse.json({ ...strip(v), clips: clips.map(strip) })
+    }
+
+    // DELETE /api/projects/:id — delete a project + all its clips (R2 + DB)
+    if (path_.startsWith('/projects/') && method === 'DELETE') {
+      const user = await getUser(request, db)
+      const id = segments[1]
+      if (id === '__unsorted__') return NextResponse.json({ error: 'cannot delete virtual unsorted project' }, { status: 400 })
+      const v = await db.collection('videos_processed').findOne({ id, user_id: user.id })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const clips = await db.collection('generated_clips').find({ video_id: id, user_id: user.id }).toArray()
+      // Best-effort R2 cleanup
+      try {
+        const { deleteFromR2 } = await import('@/lib/r2')
+        for (const c of clips) {
+          if (c.r2_key) { try { await deleteFromR2({ db, key: c.r2_key }) } catch {} }
+        }
+        if (v.r2_key) { try { await deleteFromR2({ db, key: v.r2_key }) } catch {} }
+      } catch {}
+      await db.collection('generated_clips').deleteMany({ video_id: id, user_id: user.id })
+      await db.collection('videos_processed').deleteOne({ id, user_id: user.id })
+      await logActivity(db, user.id, 'project_deleted', request, { project_id: id, title: v.title, clips_deleted: clips.length })
+      return NextResponse.json({ ok: true, deleted_clips: clips.length })
+    }
+
+    // PUT /api/projects/:id — rename a project (only the title field for now)
+    if (path_.startsWith('/projects/') && method === 'PUT') {
+      const user = await getUser(request, db)
+      const id = segments[1]
+      if (id === '__unsorted__') return NextResponse.json({ error: 'cannot rename virtual unsorted project' }, { status: 400 })
+      const body = await request.json()
+      const updates = {}
+      if (typeof body.title === 'string' && body.title.trim().length > 0) updates.title = body.title.trim().slice(0, 200)
+      if (Object.keys(updates).length === 0) return NextResponse.json({ error: 'no valid fields' }, { status: 400 })
+      updates.updated_at = new Date()
+      const r = await db.collection('videos_processed').updateOne({ id, user_id: user.id }, { $set: updates })
+      if (r.matchedCount === 0) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const v = await db.collection('videos_processed').findOne({ id })
+      return NextResponse.json(strip(v))
+    }
     if (path_.startsWith('/clips/') && method === 'PUT') {
       const id = segments[1]
       const body = await request.json()

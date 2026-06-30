@@ -9,6 +9,7 @@ import {
   Youtube, Instagram, Music2, ShieldCheck, ChevronRight, Loader2, Play,
   Languages, Smile, Pencil, Check, LogIn, LogOut, User as UserIcon,
   Scissors, Crop, Captions, AArrowDown, AArrowUp, Pause, X, Cloud, Sliders, Maximize2,
+  Folder, FolderOpen, ArrowLeft, Trash2, MoreVertical, Film, AlertTriangle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -142,6 +143,13 @@ export default function HomePage() {
   const [isAuthed, setIsAuthed] = useState(false)
   const [packages, setPackages] = useState([])
   const [clips, setClips] = useState([])
+  const [projects, setProjects] = useState([])
+  // 'projects' = grouped view (default), 'all' = flat list of every clip
+  const [clipsView, setClipsView] = useState('projects')
+  // when set to a project id, we drill into that project's clips
+  const [activeProjectId, setActiveProjectId] = useState(null)
+  const [renamingProjectId, setRenamingProjectId] = useState(null)
+  const [renameTitle, setRenameTitle] = useState('')
   const [memes, setMemes] = useState([])
   const [sliderMinutes, setSliderMinutes] = useState([1000])
   const [billingCycle, setBillingCycle] = useState('month')
@@ -181,10 +189,19 @@ export default function HomePage() {
       fetch('/api/pricing-packages').then(r => r.json()),
       fetch('/api/clips').then(r => r.json()),
       fetch('/api/memes').then(r => r.json()),
-    ]).then(([g, me, pk, c, m]) => {
-      setGeo(g); setProfile(me.user); setIsAuthed(!!me.is_authenticated); setPackages(pk); setClips(c); setMemes(m)
+      fetch('/api/projects').then(r => r.json()).catch(() => []),
+    ]).then(([g, me, pk, c, m, pj]) => {
+      setGeo(g); setProfile(me.user); setIsAuthed(!!me.is_authenticated); setPackages(pk); setClips(c); setMemes(m); setProjects(Array.isArray(pj) ? pj : [])
     }).catch(() => toast.error('Failed to load workspace'))
   }, [])
+
+  async function refreshProjects() {
+    try {
+      const r = await fetch('/api/projects')
+      const data = await r.json()
+      if (Array.isArray(data)) setProjects(data)
+    } catch {}
+  }
 
   // Translate UI when uiLanguage changes
   useEffect(() => {
@@ -347,6 +364,7 @@ export default function HomePage() {
       // refresh the clips list so the new MP4 reloads (cache-bust query)
       const fresh = await fetch('/api/clips').then(r => r.json())
       setClips(fresh)
+      refreshProjects()
     } catch (e) { toast.error('Restyle failed', { description: e.message }) }
   }
 
@@ -404,6 +422,7 @@ export default function HomePage() {
             fetch('/api/auth/me').then(r => r.json()),
           ])
           setClips(fresh); setProfile(me.user)
+          refreshProjects()
           setUrlInput('')
           break
         }
@@ -449,6 +468,7 @@ export default function HomePage() {
             fetch('/api/auth/me').then(r => r.json()),
           ])
           setClips(fresh); setProfile(me.user)
+          refreshProjects()
           break
         }
         if (sd.status === 'failed') {
@@ -668,24 +688,130 @@ export default function HomePage() {
             </Card>
 
             <div>
-              <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-xl font-semibold">{t.your_clips}</h3>
+              <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <h3 className="text-xl font-semibold">{activeProjectId ? '' : t.your_clips}</h3>
+                  {/* View toggle: hidden when drilled-in */}
+                  {!activeProjectId && (
+                    <Tabs value={clipsView} onValueChange={(v) => setClipsView(v)}>
+                      <TabsList className="h-8">
+                        <TabsTrigger value="projects" className="text-xs gap-1.5"><FolderOpen className="h-3.5 w-3.5" /> Projects ({projects.length})</TabsTrigger>
+                        <TabsTrigger value="all" className="text-xs gap-1.5"><Film className="h-3.5 w-3.5" /> All Clips ({clips.length})</TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  )}
+                </div>
                 <Badge variant="secondary"><TrendingUp className="h-3 w-3 mr-1" />{t.ranked_virality}</Badge>
               </div>
-              <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                {clips.map((clip) => (
-                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
-                    onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
-                    onEdit={(c) => setEditorClip(c)}
-                    onRestyle={(c) => {
-                    setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
-                    setPendingSubmit(() => (config) => submitRestyle(c, config))
-                    setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
-                    setWizardMode('restyle')
-                    setWizardOpen(true)
-                  }} />
-                ))}
-              </div>
+
+              {/* PROJECTS GRID */}
+              {clipsView === 'projects' && !activeProjectId && (
+                projects.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border bg-muted/20 py-16 text-center">
+                    <FolderOpen className="h-10 w-10 mx-auto mb-3 text-muted-foreground" />
+                    <div className="text-sm font-medium">No projects yet</div>
+                    <div className="text-xs text-muted-foreground mt-1">Paste a video URL or upload a file above to start your first project.</div>
+                  </div>
+                ) : (
+                  <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {projects.map((p) => (
+                      <ProjectCard key={p.id} project={p} t={t}
+                        onOpen={() => setActiveProjectId(p.id)}
+                        onRename={() => { setRenamingProjectId(p.id); setRenameTitle(p.title || '') }}
+                        onDelete={async () => {
+                          if (p.is_virtual) return toast.error('Cannot delete the Unsorted bucket')
+                          if (!confirm(`Delete project "${p.title}" and all ${p.clip_count} clip(s)? This cannot be undone.`)) return
+                          const r = await fetch(`/api/projects/${p.id}`, { method: 'DELETE' })
+                          if (!r.ok) { toast.error('Delete failed'); return }
+                          toast.success('Project deleted')
+                          const [pj, cl] = await Promise.all([
+                            fetch('/api/projects').then(r=>r.json()).catch(()=>[]),
+                            fetch('/api/clips').then(r=>r.json()).catch(()=>[]),
+                          ])
+                          setProjects(Array.isArray(pj)?pj:[]); setClips(cl)
+                        }}
+                      />
+                    ))}
+                  </div>
+                )
+              )}
+
+              {/* DRILLED-IN PROJECT — show breadcrumb + its clips */}
+              {clipsView === 'projects' && activeProjectId && (() => {
+                const proj = projects.find(p => p.id === activeProjectId)
+                const projClips = activeProjectId === '__unsorted__'
+                  ? clips.filter(c => !c.video_id || !projects.some(p => p.id === c.video_id && !p.is_virtual))
+                  : clips.filter(c => c.video_id === activeProjectId)
+                return (
+                  <div>
+                    <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Button size="sm" variant="ghost" onClick={() => setActiveProjectId(null)} className="gap-1.5 -ml-2">
+                          <ArrowLeft className="h-4 w-4" /> Projects
+                        </Button>
+                        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold truncate">{proj?.title || 'Project'}</div>
+                          <div className="text-xs text-muted-foreground truncate">{projClips.length} clip{projClips.length === 1 ? '' : 's'}{proj?.original_url ? ` · ${proj.original_url.slice(0, 60)}` : ''}</div>
+                        </div>
+                      </div>
+                      {proj?.status && proj.status !== 'completed' && (
+                        <Badge variant={proj.status === 'failed' ? 'destructive' : 'secondary'} className="capitalize">
+                          {proj.status === 'failed' ? <AlertTriangle className="h-3 w-3 mr-1" /> : <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+                          {proj.status}{proj.progress ? ` ${proj.progress}%` : ''}
+                        </Badge>
+                      )}
+                    </div>
+                    {projClips.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-border bg-muted/20 py-12 text-center">
+                        <div className="text-sm">No clips in this project yet.</div>
+                        {proj?.error_message && <div className="mt-2 text-xs text-destructive max-w-md mx-auto break-words">{proj.error_message.slice(0, 200)}</div>}
+                      </div>
+                    ) : (
+                      <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {projClips.map((clip) => (
+                          <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                            onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+                            onEdit={(c) => setEditorClip(c)}
+                            onRestyle={(c) => {
+                              setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
+                              setPendingSubmit(() => (config) => submitRestyle(c, config))
+                              setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
+                              setWizardMode('restyle')
+                              setWizardOpen(true)
+                            }} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              {/* ALL CLIPS — flat list */}
+              {clipsView === 'all' && (
+                clips.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border bg-muted/20 py-16 text-center">
+                    <Film className="h-10 w-10 mx-auto mb-3 text-muted-foreground" />
+                    <div className="text-sm font-medium">No clips yet</div>
+                    <div className="text-xs text-muted-foreground mt-1">Generated clips from all your projects will show up here.</div>
+                  </div>
+                ) : (
+                  <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {clips.map((clip) => (
+                      <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                        onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+                        onEdit={(c) => setEditorClip(c)}
+                        onRestyle={(c) => {
+                          setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
+                          setPendingSubmit(() => (config) => submitRestyle(c, config))
+                          setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
+                          setWizardMode('restyle')
+                          setWizardOpen(true)
+                        }} />
+                    ))}
+                  </div>
+                )
+              )}
             </div>
           </div>
 
@@ -901,7 +1027,143 @@ export default function HomePage() {
         onClose={() => setEditorClip(null)}
         onSaved={(c) => setClips(prev => prev.map(x => x.id === c.id ? c : x))}
       />
+
+      {/* RENAME PROJECT MODAL */}
+      <Dialog open={!!renamingProjectId} onOpenChange={(o) => { if (!o) { setRenamingProjectId(null); setRenameTitle('') } }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Rename project</DialogTitle>
+            <DialogDescription>Give this project a clearer name. Won&apos;t affect the underlying clips.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Label className="text-xs">Project title</Label>
+            <Input value={renameTitle} onChange={(e) => setRenameTitle(e.target.value)} placeholder="e.g. Joe Rogan x Elon Podcast" autoFocus maxLength={200} />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => { setRenamingProjectId(null); setRenameTitle('') }}>Cancel</Button>
+            <Button onClick={async () => {
+              const id = renamingProjectId
+              const title = renameTitle.trim()
+              if (!id || !title) return
+              const r = await fetch(`/api/projects/${id}`, { method: 'PUT', headers: { 'content-type':'application/json' }, body: JSON.stringify({ title }) })
+              if (!r.ok) { const d = await r.json().catch(()=>({})); toast.error('Rename failed', { description: d.error }); return }
+              toast.success('Project renamed')
+              setRenamingProjectId(null); setRenameTitle('')
+              refreshProjects()
+            }}>Save</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
+  )
+}
+
+function ProjectCard({ project, t, onOpen, onRename, onDelete }) {
+  const p = project
+  const isVirtual = !!p.is_virtual
+  const status = p.status || 'completed'
+  const isProcessing = status !== 'completed' && status !== 'failed'
+  const isFailed = status === 'failed'
+
+  const PlatformIcon = (() => {
+    const url = (p.original_url || '').toLowerCase()
+    if (/youtu\.?be|youtube/.test(url)) return Youtube
+    if (/tiktok/.test(url)) return Music2
+    if (/instagram/.test(url)) return Instagram
+    return Film
+  })()
+
+  const thumb = p.thumbnail_url || p.clip_thumbnails?.[0] || null
+  const moreThumbs = (p.clip_thumbnails || []).slice(1, 4)
+
+  return (
+    <Card className="group overflow-hidden hover:border-primary/50 transition-colors">
+      <button onClick={onOpen} className="block w-full text-left" aria-label={`Open project ${p.title}`}>
+        <div className="relative aspect-video bg-gradient-to-br from-zinc-900 to-zinc-800 overflow-hidden">
+          {thumb ? (
+            <img src={thumb} alt="" className="w-full h-full object-cover transition-transform group-hover:scale-105" />
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center text-zinc-600">
+              <FolderOpen className="h-12 w-12" />
+            </div>
+          )}
+          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent" />
+          {/* Top-left source badge */}
+          <div className="absolute top-2 left-2">
+            <Badge variant="secondary" className="bg-background/85 backdrop-blur gap-1 text-[10px] px-1.5 py-0.5">
+              <PlatformIcon className="h-3 w-3" /> {isVirtual ? 'Unsorted' : (p.source_type || 'video').replace('_', ' ')}
+            </Badge>
+          </div>
+          {/* Top-right status */}
+          <div className="absolute top-2 right-2">
+            {isProcessing && (
+              <Badge className="bg-blue-500/90 text-white gap-1 text-[10px] px-1.5 py-0.5">
+                <Loader2 className="h-3 w-3 animate-spin" /> {status}{p.progress ? ` ${p.progress}%` : ''}
+              </Badge>
+            )}
+            {isFailed && (
+              <Badge variant="destructive" className="gap-1 text-[10px] px-1.5 py-0.5">
+                <AlertTriangle className="h-3 w-3" /> failed
+              </Badge>
+            )}
+            {!isProcessing && !isFailed && p.clip_count > 0 && (
+              <Badge className="bg-emerald-500/90 text-white gap-1 text-[10px] px-1.5 py-0.5">
+                <Check className="h-3 w-3" /> {p.clip_count} clip{p.clip_count === 1 ? '' : 's'}
+              </Badge>
+            )}
+          </div>
+          {/* Bottom-left title */}
+          <div className="absolute bottom-0 left-0 right-0 p-3">
+            <div className="text-sm font-semibold text-white line-clamp-2 leading-tight">{p.title}</div>
+          </div>
+        </div>
+      </button>
+      <CardContent className="p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground min-w-0">
+            <Film className="h-3.5 w-3.5 shrink-0" />
+            <span>{p.clip_count} clip{p.clip_count === 1 ? '' : 's'}</span>
+            {p.avg_virality > 0 && (
+              <>
+                <span>·</span>
+                <Flame className="h-3.5 w-3.5 text-orange-400 shrink-0" />
+                <span>{p.avg_virality}% avg</span>
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            {moreThumbs.length > 0 && (
+              <div className="flex -space-x-1.5 mr-1">
+                {moreThumbs.map((u, i) => (
+                  <img key={i} src={u} alt="" className="h-5 w-5 rounded-full border-2 border-card object-cover" />
+                ))}
+              </div>
+            )}
+            {!isVirtual && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="ghost" className="h-7 w-7 p-0"><MoreVertical className="h-3.5 w-3.5" /></Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={onOpen}><FolderOpen className="h-3.5 w-3.5 mr-2" /> Open</DropdownMenuItem>
+                  <DropdownMenuItem onClick={onRename}><Pencil className="h-3.5 w-3.5 mr-2" /> Rename</DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={onDelete} className="text-destructive focus:text-destructive">
+                    <Trash2 className="h-3.5 w-3.5 mr-2" /> Delete project
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </div>
+        </div>
+        {isFailed && p.error_message && (
+          <div className="text-[11px] text-destructive/90 line-clamp-2">{p.error_message}</div>
+        )}
+        <Button size="sm" variant="outline" className="w-full h-8 text-xs" onClick={onOpen}>
+          Open project <ChevronRight className="h-3.5 w-3.5 ml-1" />
+        </Button>
+      </CardContent>
+    </Card>
   )
 }
 

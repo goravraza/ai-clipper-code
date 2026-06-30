@@ -6,22 +6,10 @@
 # END - Testing Protocol - DO NOT EDIT OR REMOVE THIS SECTION
 #====================================================================================================
 
-user_problem_statement: "Three integrated fixes: (1) Auto text-wrap for captions inside 9:16 frame (no bleeding), (2) Interactive caption selection & inline editing on preview canvas, (3) Live preset/typography styling applied in real-time without breaking backend render."
+user_problem_statement: "Add a Projects categorization view to the workspace that groups generated_clips by their parent source video (videos_processed). Users should be able to switch between a Projects grid (default) and an All-Clips flat list. Clicking a project opens that project's clips with a back button. Support rename + delete on projects."
 
 backend:
-  - task: "buildClipSrt + ffmpegSubtitleFilter — auto-chunk 4 words/line, ASS WrapStyle, 10% horizontal guards"
-    implemented: true
-    working: true
-    file: "lib/video-processor.js"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-        -working: true
-        -agent: "main"
-        -comment: "Hard chunking: max 4 words per cue (long cues split into multiple cues). Cues with 5–8 words use \\n (line break) at the midpoint. ASS filter now passes WrapStyle=0 (smart wrap), MarginL/MarginR=10% of frame width (=80% max caption width — no bleed), MarginV scaled to actual frame height, and original_size=WxH so ASS positions correctly in the real frame. Probes output frame dimensions via ffprobe before building the style string."
-
-  - task: "POST /api/clips/:id/render — accept caption_segments override + word-chunking + frame-aware ASS"
+  - task: "GET /api/projects — list source-video projects with clip count + thumbnails for current user"
     implemented: true
     working: true
     file: "app/api/[[...path]]/route.js"
@@ -29,11 +17,14 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "Render endpoint now accepts body.caption_segments (array of {start,end,text} in clip-local seconds). When present, it overrides the cached srt_content. Both paths flow through the same writeSrt() helper that enforces 4-words/line chunking + \\n line breaks. Frame dims probed from srcPath then adjusted for crop_aspect to get exact output WxH (used for marginV/marginH scaling + original_size). Persists final rendered SRT to clip.srt_content_rendered. Verified: trim+crop+custom-segments render returned 200, MP4 duration 5.0s, no ffmpeg crashes."
+        -comment: "New endpoint. Fetches user's videos_processed sorted by created_at desc, joins each with their generated_clips, returns: {id,title,original_url,source_type,thumbnail_url,status,progress,error_message,clip_length_range,created_at,updated_at,clip_count,clip_thumbnails (up to 4),avg_virality}. Also appends a virtual __unsorted__ project for orphan clips (clips whose video_id no longer exists in videos_processed)."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED all tests. Returns array with 65 projects. All required fields present (id, title, original_url, source_type, thumbnail_url, status, clip_count, clip_thumbnails, avg_virality, created_at). clip_count matches actual DB count. Sorted by created_at desc. clip_thumbnails is array with up to 4 items. Virtual __unsorted__ project correctly has is_virtual=true when orphan clips exist."
 
-  - task: "GET /api/clips/:id/transcript — parse SRT into JSON segments for editor"
+  - task: "GET /api/projects/:id — one project with all its clips"
     implemented: true
     working: true
     file: "app/api/[[...path]]/route.js"
@@ -41,79 +32,116 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "Returns {segments:[{start,end,text}], clip_id, has_srt}. Parses both ',' and '.' millisecond separators. Verified: clip 87a5a528 returns 16 cues correctly."
+        -comment: "Returns full videos_processed doc + clips sorted by virality_score desc then start_time asc. Special id '__unsorted__' returns clips that have no matching parent video. 404 if not found / not owned by user."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED all tests. Returns project object with clips array. All clips have correct video_id matching the project. Clips sorted correctly by virality_score desc, then start_time_seconds asc. Special __unsorted__ endpoint returns {id:'__unsorted__', title:'Unsorted Clips', is_virtual:true, clips:[...]} with orphan clips only. Nonexistent project returns 404 with {error:'not found'}."
 
-  - task: "PUT /api/clips/:id/transcript — save edited cues back to clip.srt_content"
+  - task: "PUT /api/projects/:id — rename project (title only)"
     implemented: true
     working: true
     file: "app/api/[[...path]]/route.js"
     stuck_count: 0
-    priority: "high"
+    priority: "medium"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "Accepts {segments:[{start,end,text}]}. Sanitizes (drops control chars, trims, max 500 chars/text), filters invalid cues (end<=start), re-serializes to SRT, writes to DB. Stamps transcript_edited_at. Logged via logActivity."
+        -comment: "Updates videos_processed.title (max 200 chars, trimmed). Stamps updated_at. Rejects empty titles. Cannot rename __unsorted__ virtual project (returns 400). 404 if id not owned by user."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED all tests. Successfully renames project with {title:'Test Renamed Project'}, returns updated project with fresh updated_at timestamp. Rename persists in GET /api/projects list. Empty title {title:''} correctly returns 400 with {error:'no valid fields'}. Attempting to rename __unsorted__ correctly returns 400. Restored original title after test to keep DB clean."
+
+  - task: "DELETE /api/projects/:id — delete project + all its clips (R2 + DB cleanup)"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Deletes all generated_clips with video_id=id, then deletes videos_processed doc. Best-effort R2 cleanup for any clip.r2_key + video.r2_key (wrapped in try/catch so DB cleanup never blocks). Cannot delete __unsorted__. Logs activity 'project_deleted'."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED all tests. Created test project with 2 clips in DB. DELETE returned 200 with {ok:true, deleted_clips:2}. Verified in DB: project completely removed from videos_processed, all 2 clips removed from generated_clips (count=0). Attempting to delete __unsorted__ correctly returns 400. R2 cleanup is best-effort (wrapped in try/catch) so DB cleanup always succeeds."
 
 frontend:
-  - task: "Live interactive caption overlay on preview — selectable, double-click editable"
+  - task: "Projects tab + All Clips tab toggle in workspace clips list"
     implemented: true
-    working: true
-    file: "app/_components/ClipEditor.js"
+    working: "NA"
+    file: "app/page.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "Replaced the static 'Sample caption preview' line with an interactive overlay bound to activeCaptionTrack. requestAnimationFrame loop polls video.currentTime → findActiveCue → highlights matching cue in CC tab list AND renders that cue's text on the preview. Double-click the rendered text → switches to inline <textarea> (autoFocus); Enter or blur commits. Single click → switches to CC tab for full transcript view. Style mirrors ASS via styleAssToCss helper so preview pixel-matches final render. Empty/ghost state shows 'Sample caption preview' at 40% opacity until real captions exist."
+        -comment: "Added Tabs (Projects / All Clips) above the clips grid. Default view is Projects. Counts shown in tab labels. Hidden when drilled into a project. Verified via screenshot: 'Projects (65) | All Clips (77)' rendered on workspace."
 
-  - task: "CC tab transcript list — seek, edit inline, add, delete, save"
+  - task: "ProjectCard component — thumbnail, source badge, status, clip count, kebab menu (Open/Rename/Delete)"
     implemented: true
-    working: true
-    file: "app/_components/ClipEditor.js"
+    working: "NA"
+    file: "app/page.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "Transcript list shows {N} cues. Each row: clickable timestamp (seeks video), inline editable text input, delete button (visible on hover). Top toolbar: Add cue at current time (Plus icon), Save without rendering (PUT /transcript). Active cue is highlighted purple. Empty state when no SRT exists."
+        -comment: "Card has 16:9 thumbnail (project.thumbnail_url with fallback to first clip thumbnail), platform icon auto-detected from original_url (Youtube/TikTok/Instagram/Film fallback), status badge (processing/failed/completed-with-count), title overlay, footer with clip-count + avg virality + thumbnail dots avatar stack + 3-dot menu. Click anywhere on the thumbnail or 'Open project' button drills in."
 
-  - task: "Live preset/typography sync — preset clicks + font/stroke sliders update overlay instantly"
+  - task: "Drill-in view with back button + breadcrumb + filtered clip grid"
     implemented: true
-    working: true
-    file: "app/_components/ClipEditor.js, app/_components/captionUtils.js"
+    working: "NA"
+    file: "app/page.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "New captionUtils.js: styleAssToCss() converts ASS color tokens (&HAABBGGRR&), fontName, fontSize, outline, back box into a CSS style object. The preview caption overlay reads state.style_ass, state.font_size, state.outline_size directly — any change to a preset or slider re-renders the overlay synchronously. chunkForLine() mirrors backend word-chunking client-side for preview parity. findActiveCue() does the time-sync."
+        -comment: "When activeProjectId is set, shows back arrow + 'Projects' button + ChevronRight + project title + clip count subtitle + status badge if processing/failed. Clips filtered locally from clips state (clip.video_id === activeProjectId, or orphan logic for __unsorted__). Verified via screenshot: drill-in works, displays 'I was 19 in debt' project with 2 clips and 'Failed 80%' badge."
 
-  - task: "Render flow sends caption_segments + auto-saves transcript"
+  - task: "Rename project Dialog modal"
     implemented: true
-    working: true
-    file: "app/_components/ClipEditor.js"
+    working: "NA"
+    file: "app/page.js"
     stuck_count: 0
-    priority: "high"
+    priority: "medium"
     needs_retesting: false
     status_history:
-        -working: true
+        -working: "NA"
         -agent: "main"
-        -comment: "renderClip() PUTs current activeCaptionTrack to /api/clips/:id/transcript (fire-and-forget), then POSTs /render with caption_segments included in the payload. Backend uses the edited segments verbatim — no parameter mismatches or crashes."
+        -comment: "Dialog opens via Pencil menu item. Input field with max 200 chars, autoFocus. Save calls PUT /api/projects/:id. Refreshes project list on success."
+
+  - task: "refreshProjects() called after ingestion/restyle completion"
+    implemented: true
+    working: "NA"
+    file: "app/page.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Added refreshProjects helper. Called after every successful URL ingest, file upload, and restyle. Keeps the Projects tab count and thumbnails in sync without a page reload."
 
 metadata:
   created_by: "main_agent"
-  version: "8.0"
-  test_sequence: 8
+  version: "10.0"
+  test_sequence: 10
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "GET /api/projects — list source-video projects with clip count + thumbnails for current user"
+    - "GET /api/projects/:id — one project with all its clips"
+    - "PUT /api/projects/:id — rename project (title only)"
+    - "DELETE /api/projects/:id — delete project + all its clips (R2 + DB cleanup)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -121,27 +149,75 @@ test_plan:
 agent_communication:
     -agent: "main"
     -message: |
-      Complete rewrite of the caption editing pipeline shipped:
+      Added Projects categorization feature (no Bright Data work — user moved to Thordata).
 
-      BOUNDARIES & WRAPPING:
-      - 4 words per cue / line MAX. Long cues split into multiple sequential cues; cues with 5–8 words use \\n line-break at midpoint.
-      - ASS filter: WrapStyle=0 (smart), MarginL=MarginR=10% of frame width → captions can never exceed 80% width. MarginV scaled to real frame height. original_size=actual WxH so ASS coords map 1:1.
-      - Frame dims auto-probed from source MP4 + adjusted for crop_aspect → exact output dims drive layout.
+      BACKEND — new endpoints (all gated by getUser):
+      1. GET  /api/projects             → list of user's source videos w/ clip stats + virtual __unsorted__ bucket for orphans
+      2. GET  /api/projects/:id         → one project with full clip list (or orphan clips for __unsorted__)
+      3. PUT  /api/projects/:id         → rename project (title only, max 200 chars)
+      4. DELETE /api/projects/:id       → delete project + all child clips (best-effort R2 cleanup)
 
-      INTERACTIVE EDITING:
-      - GET /api/clips/:id/transcript returns parsed JSON segments.
-      - PUT /api/clips/:id/transcript saves edits back as SRT.
-      - Editor opens → fetches transcript → loads into activeCaptionTrack state.
-      - Time-sync via rAF loop on the preview video → activeCueIdx auto-updates.
-      - Caption text rendered live on preview, styled to match ffmpeg output (color, font, stroke, back box, bold, size).
-      - Double-click preview text → inline <textarea> for editing.
-      - CC tab transcript list: per-cue timestamp (seek), inline text input, delete, add new cue at currentTime, save.
+      FRONTEND:
+      - Tabs above clip grid: "Projects (N) | All Clips (M)" — default = Projects.
+      - ProjectCard: 16:9 thumbnail, platform icon (YouTube/TikTok/IG/Film), status badge (processing/failed/completed), clip count + avg virality, kebab menu (Open/Rename/Delete).
+      - Drill-in: back arrow → "Projects" + breadcrumb → project title + clip count + source URL → status badge if processing/failed → grid of that project's clips.
+      - Rename Dialog with text input.
+      - refreshProjects() wired to all ingestion + restyle completions.
 
-      LIVE STYLE SYNC:
-      - All preset clicks + font/stroke/position sliders immediately update the preview overlay via styleAssToCss().
-      - On Render: edited captions are saved + passed to backend in caption_segments — backend uses them directly with the new chunking pipeline.
+      VERIFIED via screenshot:
+      - Workspace renders "Your Generated Clips" with tabs "Projects (65) | All Clips (77)".
+      - Project cards display thumbnail + 'youtube' badge + status badge + title + clip count + 3-dot menu.
+      - Clicking a card drills in: shows back button + 'I was 19 in debt.' title + '2 clips · URL' + 'Failed 80%' status + clip grid.
 
-      VERIFIED:
-      - GET /transcript for clip 87a5a528 → 16 cues.
-      - POST /render with custom long sentence (16 words) + crop 9:16 → 200 OK, MP4 duration 5.0s, no crash.
-      - Editor screenshot shows live caption "problem in this. So we have" on preview + active row highlighted + full transcript list editable.
+      PLEASE TEST (backend only, do NOT test frontend):
+      - GET /api/projects returns array with at least one project for the default user (the seed creates one)
+      - GET /api/projects/:id returns the project with its clips array
+      - GET /api/projects/__unsorted__ returns { is_virtual: true, clips: [...] }
+      - PUT /api/projects/:id with {title:"New Name"} updates title and returns the updated project
+      - PUT /api/projects/__unsorted__ returns 400
+      - DELETE /api/projects/:id removes both the project and all its child clips (verify counts)
+      - DELETE /api/projects/__unsorted__ returns 400
+      - Auth: endpoints should still work for the default user (getUser falls back to DEFAULT_USER_ID when no session)
+
+      DO NOT touch the Bright Data / Thordata proxy code — user is iterating on that separately.
+    -agent: "testing"
+    -message: |
+      ✅ ALL BACKEND TESTS PASSED (10/10)
+      
+      Tested all 4 Projects endpoints comprehensively:
+      
+      1. GET /api/projects ✅
+         - Returns array with 65 projects
+         - All required fields present (id, title, original_url, source_type, thumbnail_url, status, clip_count, clip_thumbnails, avg_virality, created_at)
+         - clip_count matches actual DB count
+         - Sorted by created_at desc
+         - clip_thumbnails is array with up to 4 items
+         - Virtual __unsorted__ project has is_virtual=true when orphan clips exist
+      
+      2. GET /api/projects/:id ✅
+         - Returns project object with clips array
+         - All clips have correct video_id
+         - Clips sorted by virality_score desc, then start_time_seconds asc
+         - Special __unsorted__ endpoint works correctly
+         - Nonexistent project returns 404 with {error:'not found'}
+      
+      3. PUT /api/projects/:id ✅
+         - Successfully renames project
+         - Returns updated project with fresh updated_at
+         - Rename persists in list
+         - Empty title returns 400 with {error:'no valid fields'}
+         - Cannot rename __unsorted__ (returns 400)
+      
+      4. DELETE /api/projects/:id ✅
+         - Successfully deletes project and all clips
+         - Returns {ok:true, deleted_clips:2}
+         - Verified in DB: project removed, all clips removed
+         - Cannot delete __unsorted__ (returns 400)
+      
+      5. Regression tests ✅
+         - GET /api/clips still works (returns 79 clips)
+         - GET /api/videos/:id still works
+      
+      Auth note: All endpoints work correctly with default user (no session cookie needed).
+      
+      NO ISSUES FOUND. All endpoints working as specified.
