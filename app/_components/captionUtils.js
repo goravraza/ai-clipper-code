@@ -12,19 +12,29 @@ export function assToCss(c) {
 
 // Build a CSS style object that visually approximates ASS subtitle rendering.
 // Used by the live caption overlay during preview so what-you-see-IS-what-renders.
-export function styleAssToCss({ styleAss, fontSize, outlineSize, frameWidth = 360 }) {
+//
+// IMPORTANT — pixel-size math:
+// At render time we write a real .ass file with PlayResY = output frame height (e.g. 1920 for 9:16).
+// The user-facing `fontSize` value (10..48) is treated as "ASS points in default 288-tall PlayResY",
+// so the rendered pixel height = fontSize * (outputFrameH / 288).
+// For the preview to be pixel-proportional we use the SAME ratio scaled to the preview box:
+//   previewPx = fontSize * (previewBoxHeight / 288)
+// This makes the preview WYSIWYG with the final render output.
+export function styleAssToCss({ styleAss, fontSize, outlineSize, previewBoxHeight = 462, frameWidth }) {
+  // Back-compat: if caller still passes `frameWidth` (old signature) use a fallback height.
+  const refH = previewBoxHeight || (frameWidth ? Math.round(frameWidth * 16 / 9) : 462)
   const ass = styleAss || {}
   const fontFamily = ass.fontName || 'DejaVu Sans'
   const color = assToCss(ass.primary) || '#ffffff'
   const stroke = assToCss(ass.outlineColour) || '#000000'
   const back = ass.back ? assToCss(ass.back) : null
   const bold = ass.bold ? 800 : 400
-  // The actual font size during render is in ASS points relative to original_size.
-  // Scale roughly: 1 ass point ≈ frameWidth/40 px. Use a sensible multiplier so preview matches output.
-  const px = Math.max(10, Math.round((Number(fontSize) || ass.fontSize || 20) * (frameWidth / 540)))
-  const outlinePx = Math.max(0, Math.round((Number(outlineSize) || ass.outline || 2)))
+  // Match render: previewPx = fontSize * (previewBoxHeight / 288)
+  const px = Math.max(8, Math.round((Number(fontSize) || ass.fontSize || 20) * (refH / 288)))
+  // Outline scales by the same ratio (capped so it doesn't dominate at small fonts)
+  const outlinePx = Math.max(0, Math.min(8, Math.round((Number(outlineSize) || ass.outline || 2) * (refH / 288) / 2)))
   const stroked = outlinePx > 0 ? {
-    // Sharp outlines only — no blurred drop-shadow. Eight directions for clean stroke effect.
+    // Sharp outlines only — eight directions for clean stroke effect.
     textShadow: [
       `-${outlinePx}px -${outlinePx}px 0 ${stroke}`,
       `${outlinePx}px -${outlinePx}px 0 ${stroke}`,
@@ -42,7 +52,7 @@ export function styleAssToCss({ styleAss, fontSize, outlineSize, frameWidth = 36
     fontWeight: bold,
     fontSize: `${px}px`,
     background: back || 'transparent',
-    padding: back ? '4px 10px' : '0',
+    padding: back ? `${Math.round(px * 0.15)}px ${Math.round(px * 0.4)}px` : '0',
     borderRadius: back ? '4px' : 0,
     lineHeight: 1.15,
     display: 'inline-block',

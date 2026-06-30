@@ -113,10 +113,16 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   const [editingCueIdx, setEditingCueIdx] = useState(-1)
   const [transcriptLoading, setTranscriptLoading] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
+  // Measured preview box rect — used so captions/logos scale & position in real pixels
+  const [previewRect, setPreviewRect] = useState({ width: 260, height: 462 })
   const fileRef = useRef(null)
   const videoRef = useRef(null)
   const previewBoxRef = useRef(null)
   const draggingRef = useRef(false)
+  // CRITICAL: these MUST be useRef. Plain objects get re-created on every React render → drag breaks
+  // mid-gesture because each render resets `.current` back to its initial value.
+  const captionDraggingRef = useRef(false)
+  const resizeRef = useRef(null)
   const inlineEditRef = useRef(null)
 
   useEffect(() => {
@@ -182,6 +188,20 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
   }, [activeCaptionTrack, clip?.storage_url_mp4, clip?.render_version])
+
+  // Measure the preview box so caption pixel sizes scale correctly w/ aspect ratio + responsive layout.
+  useEffect(() => {
+    const el = previewBoxRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const update = () => {
+      const r = el.getBoundingClientRect()
+      if (r.width > 0 && r.height > 0) setPreviewRect({ width: r.width, height: r.height })
+    }
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [open, state?.crop_aspect])
 
   if (!clip || !state) return null
 
@@ -323,7 +343,6 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   }
 
   // Caption drag handlers — move the caption block anywhere on the canvas.
-  const captionDraggingRef = { current: false }
   const onCapPointerDown = (e) => {
     if (editingCueIdx >= 0) return
     e.preventDefault()
@@ -345,7 +364,6 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   }
 
   // Caption RESIZE handlers — drag any corner dot to scale font_size proportionally.
-  const resizeRef = { current: null }  // { startX, startY, startFontSize, corner }
   const onResizePointerDown = (e, corner) => {
     e.preventDefault()
     e.stopPropagation()
@@ -412,30 +430,55 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
           <div className="border-r border-border p-4 flex flex-col items-center bg-zinc-950">
             <div
               ref={previewBoxRef}
-              className={`relative w-full max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800 bg-black select-none`}
-              style={{ aspectRatio: state.crop_aspect.replace(':','/') }}
+              className={`relative w-full max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800 select-none`}
+              style={{
+                aspectRatio: state.crop_aspect.replace(':','/'),
+                background: state.fill_mode === 'color' ? state.fill_color : '#000000',
+              }}
             >
+              {/* BLUR FILL UNDERLAY — duplicate of the video, scaled to cover, heavily blurred.
+                  Shown only when fill_mode is 'blur' AND we have a real video source. */}
+              {videoSrc && state.fill_mode === 'blur' && (
+                <video
+                  src={videoSrc}
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+                  style={{ filter: 'blur(20px) brightness(0.85)', transform: 'scale(1.15)' }}
+                  muted
+                  playsInline
+                  preload="metadata"
+                  ref={(el) => {
+                    if (!el || !videoRef.current) return
+                    // Mirror playback of the main video so blur backdrop stays in sync
+                    const main = videoRef.current
+                    const sync = () => { try { el.currentTime = main.currentTime; if (!main.paused) el.play().catch(()=>{}); else el.pause() } catch {} }
+                    main.addEventListener('seeked', sync)
+                    main.addEventListener('play', sync)
+                    main.addEventListener('pause', sync)
+                    sync()
+                  }}
+                />
+              )}
               {videoSrc ? (
                 <video
                   ref={videoRef}
                   key={videoSrc}
                   src={videoSrc}
-                  className="absolute inset-0 w-full h-full object-cover"
+                  className={`absolute inset-0 w-full h-full ${state.fill_mode === 'crop' ? 'object-cover' : 'object-contain'}`}
                   controls
                   playsInline
                   preload="metadata"
                 />
               ) : (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={previewBg} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                <img src={previewBg} alt="" className={`absolute inset-0 w-full h-full ${state.fill_mode === 'crop' ? 'object-cover' : 'object-contain'}`} />
               )}
               {/* Speed indicator */}
               {Math.abs(state.speed - 1) > 0.01 && (
-                <Badge className="absolute top-2 left-2 bg-amber-500 text-black font-bold">{state.speed.toFixed(2)}×</Badge>
+                <Badge className="absolute top-2 left-2 bg-amber-500 text-black font-bold z-10">{state.speed.toFixed(2)}×</Badge>
               )}
               {/* Title overlay live preview */}
               {state.title_text && (
-                <div className={`absolute left-1/2 -translate-x-1/2 ${state.title_position === 'bottom' ? 'bottom-4' : 'top-4'} px-3 py-1.5 bg-black/70 text-white text-xs font-bold tracking-wide rounded`}>
+                <div className={`absolute left-1/2 -translate-x-1/2 ${state.title_position === 'bottom' ? 'bottom-4' : 'top-4'} px-3 py-1.5 bg-black/70 text-white text-xs font-bold tracking-wide rounded z-10`}>
                   {state.title_text}
                 </div>
               )}
@@ -448,13 +491,13 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   styleAss: state.style_ass,
                   fontSize: state.font_size,
                   outlineSize: state.outline_size,
-                  frameWidth: previewBoxRef.current?.getBoundingClientRect?.().width || 360,
+                  previewBoxHeight: previewRect.height,
                 })
                 const isEditing = editingCueIdx === activeCueIdx && activeCueIdx >= 0
                 const selected = !!activeCue && !displayCue._ghost
                 return (
                   <div
-                    className={`absolute pointer-events-auto text-center ${isEditing ? '' : selected ? 'cursor-move' : ''}`}
+                    className={`absolute pointer-events-auto text-center z-20 ${isEditing ? '' : selected ? 'cursor-move' : ''}`}
                     style={{
                       left: `${state.caption_x_percent}%`,
                       top: `${state.caption_y_percent}%`,

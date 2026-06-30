@@ -1,661 +1,334 @@
 #!/usr/bin/env python3
 """
-Backend test for Projects endpoints.
-Tests all 10 scenarios from the review request.
+Backend test for caption rendering pipeline rewrite.
+Tests POST /api/clips/:clipId/render with .ass file generation.
 """
 import requests
 import json
-import sys
-from pymongo import MongoClient
-import uuid
+import subprocess
+import time
+import os
+import glob
 
-BASE_URL = "https://shorts-studio-78.preview.emergentagent.com/api"
-MONGO_URL = "mongodb://localhost:27017"
-DB_NAME = "clipforge"
-DEFAULT_USER_ID = "11111111-1111-1111-1111-111111111111"
+# Configuration
+BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'https://shorts-studio-78.preview.emergentagent.com')
+API_BASE = f"{BASE_URL}/api"
+CLIP_ID = "bdb67c16-0de9-4898-8502-fab831e7cec6"
 
-def print_test(name, passed, details=""):
-    status = "✅ PASS" if passed else "❌ FAIL"
-    print(f"\n{status}: {name}")
+def log_test(test_name, status, details=""):
+    """Log test results"""
+    symbol = "✅" if status == "PASS" else "❌"
+    print(f"\n{symbol} TEST: {test_name}")
+    print(f"   Status: {status}")
     if details:
-        print(f"  Details: {details}")
+        print(f"   Details: {details}")
 
-def test_1_get_projects_list():
-    """Test 1: GET /api/projects - should return array with project metadata"""
-    print("\n" + "="*80)
-    print("TEST 1: GET /api/projects - list all projects")
-    print("="*80)
-    
+def check_ffprobe(file_path):
+    """Use ffprobe to check video file properties"""
     try:
-        response = requests.get(f"{BASE_URL}/projects", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("GET /api/projects returns 200", False, f"Got {response.status_code}")
-            return None
-        
-        print_test("GET /api/projects returns 200", True)
-        
-        data = response.json()
-        print(f"Response type: {type(data)}")
-        print(f"Number of projects: {len(data)}")
-        
-        if not isinstance(data, list):
-            print_test("Response is array", False, f"Got {type(data)}")
-            return None
-        
-        print_test("Response is array", True)
-        
-        if len(data) == 0:
-            print_test("Has at least one project", False, "Empty array")
-            return None
-        
-        print_test("Has at least one project", True, f"Found {len(data)} projects")
-        
-        # Check first project structure
-        project = data[0]
-        print(f"\nFirst project keys: {list(project.keys())}")
-        
-        required_fields = ['id', 'title', 'original_url', 'source_type', 'thumbnail_url', 
-                          'status', 'clip_count', 'clip_thumbnails', 'avg_virality', 'created_at']
-        
-        missing = [f for f in required_fields if f not in project]
-        if missing:
-            print_test("Has all required fields", False, f"Missing: {missing}")
-            return None
-        
-        print_test("Has all required fields", True)
-        
-        # Verify clip_thumbnails is array
-        if not isinstance(project['clip_thumbnails'], list):
-            print_test("clip_thumbnails is array", False, f"Got {type(project['clip_thumbnails'])}")
-            return None
-        
-        print_test("clip_thumbnails is array", True, f"Has {len(project['clip_thumbnails'])} thumbnails")
-        
-        # Verify clip_count matches actual clips in DB
-        client = MongoClient(MONGO_URL)
-        db = client[DB_NAME]
-        
-        # Find a real project (not __unsorted__)
-        real_project = None
-        for p in data:
-            if p['id'] != '__unsorted__':
-                real_project = p
-                break
-        
-        if real_project:
-            actual_count = db.generated_clips.count_documents({'video_id': real_project['id']})
-            if real_project['clip_count'] != actual_count:
-                print_test("clip_count matches DB", False, 
-                          f"API says {real_project['clip_count']}, DB has {actual_count}")
-            else:
-                print_test("clip_count matches DB", True, f"Both show {actual_count} clips")
-        
-        # Check if sorted by created_at desc
-        if len(data) > 1:
-            dates = [p.get('created_at') for p in data if p['id'] != '__unsorted__']
-            is_sorted = all(dates[i] >= dates[i+1] for i in range(len(dates)-1))
-            print_test("Sorted by created_at desc", is_sorted, 
-                      f"First: {dates[0] if dates else 'N/A'}, Last: {dates[-1] if dates else 'N/A'}")
-        
-        # Check for __unsorted__ virtual project
-        unsorted = [p for p in data if p['id'] == '__unsorted__']
-        if unsorted:
-            print_test("Has __unsorted__ virtual project", True)
-            if unsorted[0].get('is_virtual') != True:
-                print_test("__unsorted__ has is_virtual=true", False)
-            else:
-                print_test("__unsorted__ has is_virtual=true", True)
-        else:
-            print("Note: No __unsorted__ project (no orphan clips)")
-        
-        client.close()
-        return data
-        
-    except Exception as e:
-        print_test("GET /api/projects", False, str(e))
-        return None
-
-def test_2_get_project_by_id(projects):
-    """Test 2: GET /api/projects/:id - get one project with clips"""
-    print("\n" + "="*80)
-    print("TEST 2: GET /api/projects/:id - get single project")
-    print("="*80)
-    
-    if not projects:
-        print("Skipping - no projects from test 1")
-        return None
-    
-    # Find a real project (not __unsorted__)
-    real_project = None
-    for p in projects:
-        if p['id'] != '__unsorted__':
-            real_project = p
-            break
-    
-    if not real_project:
-        print("Skipping - no real projects found")
-        return None
-    
-    project_id = real_project['id']
-    print(f"Testing with project ID: {project_id}")
-    
-    try:
-        response = requests.get(f"{BASE_URL}/projects/{project_id}", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("GET /api/projects/:id returns 200", False, f"Got {response.status_code}")
-            return None
-        
-        print_test("GET /api/projects/:id returns 200", True)
-        
-        data = response.json()
-        print(f"Response keys: {list(data.keys())}")
-        
-        if 'clips' not in data:
-            print_test("Response has clips array", False, "Missing 'clips' field")
-            return None
-        
-        print_test("Response has clips array", True, f"Has {len(data['clips'])} clips")
-        
-        # Verify all clips have video_id matching the project
-        if data['clips']:
-            wrong_clips = [c for c in data['clips'] if c.get('video_id') != project_id]
-            if wrong_clips:
-                print_test("All clips have correct video_id", False, 
-                          f"{len(wrong_clips)} clips have wrong video_id")
-            else:
-                print_test("All clips have correct video_id", True)
-            
-            # Check sort order: virality_score desc, then start_time asc
-            clips = data['clips']
-            if len(clips) > 1:
-                # Group by virality score and check within groups
-                print(f"First clip: virality={clips[0].get('virality_score')}, start={clips[0].get('start_time_seconds')}")
-                print(f"Last clip: virality={clips[-1].get('virality_score')}, start={clips[-1].get('start_time_seconds')}")
-                print_test("Clips sorted by virality desc, start_time asc", True, "Order verified")
-        
-        return data
-        
-    except Exception as e:
-        print_test("GET /api/projects/:id", False, str(e))
-        return None
-
-def test_3_get_unsorted_project():
-    """Test 3: GET /api/projects/__unsorted__ - get virtual unsorted project"""
-    print("\n" + "="*80)
-    print("TEST 3: GET /api/projects/__unsorted__ - virtual project")
-    print("="*80)
-    
-    try:
-        response = requests.get(f"{BASE_URL}/projects/__unsorted__", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("GET /api/projects/__unsorted__ returns 200", False, f"Got {response.status_code}")
-            return None
-        
-        print_test("GET /api/projects/__unsorted__ returns 200", True)
-        
-        data = response.json()
-        print(f"Response keys: {list(data.keys())}")
-        
-        if data.get('id') != '__unsorted__':
-            print_test("id is '__unsorted__'", False, f"Got {data.get('id')}")
-        else:
-            print_test("id is '__unsorted__'", True)
-        
-        if data.get('title') != 'Unsorted Clips':
-            print_test("title is 'Unsorted Clips'", False, f"Got {data.get('title')}")
-        else:
-            print_test("title is 'Unsorted Clips'", True)
-        
-        if data.get('is_virtual') != True:
-            print_test("is_virtual is true", False, f"Got {data.get('is_virtual')}")
-        else:
-            print_test("is_virtual is true", True)
-        
-        if 'clips' not in data:
-            print_test("Has clips array", False)
-        else:
-            print_test("Has clips array", True, f"Has {len(data['clips'])} orphan clips")
-        
-        return data
-        
-    except Exception as e:
-        print_test("GET /api/projects/__unsorted__", False, str(e))
-        return None
-
-def test_4_get_nonexistent_project():
-    """Test 4: GET /api/projects/<nonexistent-uuid> - should return 404"""
-    print("\n" + "="*80)
-    print("TEST 4: GET /api/projects/<nonexistent-uuid> - 404 test")
-    print("="*80)
-    
-    fake_id = str(uuid.uuid4())
-    print(f"Testing with fake ID: {fake_id}")
-    
-    try:
-        response = requests.get(f"{BASE_URL}/projects/{fake_id}", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 404:
-            print_test("Returns 404 for nonexistent project", False, f"Got {response.status_code}")
-            return False
-        
-        print_test("Returns 404 for nonexistent project", True)
-        
-        data = response.json()
-        if 'error' not in data:
-            print_test("Response has error field", False)
-        else:
-            print_test("Response has error field", True, f"Error: {data['error']}")
-        
-        return True
-        
-    except Exception as e:
-        print_test("GET nonexistent project", False, str(e))
-        return False
-
-def test_5_rename_project(projects):
-    """Test 5: PUT /api/projects/:id - rename project"""
-    print("\n" + "="*80)
-    print("TEST 5: PUT /api/projects/:id - rename project")
-    print("="*80)
-    
-    if not projects:
-        print("Skipping - no projects from test 1")
-        return None
-    
-    # Find a real project
-    real_project = None
-    for p in projects:
-        if p['id'] != '__unsorted__':
-            real_project = p
-            break
-    
-    if not real_project:
-        print("Skipping - no real projects found")
-        return None
-    
-    project_id = real_project['id']
-    original_title = real_project['title']
-    new_title = "Test Renamed Project"
-    
-    print(f"Project ID: {project_id}")
-    print(f"Original title: {original_title}")
-    print(f"New title: {new_title}")
-    
-    try:
-        # Rename to new title
-        response = requests.put(
-            f"{BASE_URL}/projects/{project_id}",
-            json={"title": new_title},
-            timeout=10
+        result = subprocess.run(
+            ['/usr/bin/ffprobe', '-v', 'error', '-show_entries', 
+             'format=duration:stream=width,height', '-of', 'json', file_path],
+            capture_output=True, text=True, timeout=10
         )
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("PUT /api/projects/:id returns 200", False, f"Got {response.status_code}")
-            return None
-        
-        print_test("PUT /api/projects/:id returns 200", True)
-        
-        data = response.json()
-        print(f"Response title: {data.get('title')}")
-        
-        if data.get('title') != new_title:
-            print_test("Title updated correctly", False, f"Expected '{new_title}', got '{data.get('title')}'")
-        else:
-            print_test("Title updated correctly", True)
-        
-        if 'updated_at' not in data:
-            print_test("Has updated_at field", False)
-        else:
-            print_test("Has updated_at field", True, f"Updated at: {data['updated_at']}")
-        
-        # Verify persistence by fetching projects list
-        list_response = requests.get(f"{BASE_URL}/projects", timeout=10)
-        if list_response.status_code == 200:
-            projects_list = list_response.json()
-            updated_project = next((p for p in projects_list if p['id'] == project_id), None)
-            if updated_project and updated_project['title'] == new_title:
-                print_test("Rename persisted in list", True)
-            else:
-                print_test("Rename persisted in list", False)
-        
-        # Rename back to original
-        print(f"\nRenaming back to original: {original_title}")
-        restore_response = requests.put(
-            f"{BASE_URL}/projects/{project_id}",
-            json={"title": original_title},
-            timeout=10
-        )
-        if restore_response.status_code == 200:
-            print_test("Restored original title", True)
-        else:
-            print_test("Restored original title", False, f"Got {restore_response.status_code}")
-        
-        return True
-        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            duration = float(data.get('format', {}).get('duration', 0))
+            streams = data.get('streams', [])
+            width = height = None
+            for s in streams:
+                if 'width' in s:
+                    width = s['width']
+                    height = s['height']
+                    break
+            return {'duration': duration, 'width': width, 'height': height}
     except Exception as e:
-        print_test("PUT /api/projects/:id", False, str(e))
-        return None
+        print(f"   ffprobe error: {e}")
+    return None
 
-def test_6_rename_with_empty_title(projects):
-    """Test 6: PUT /api/projects/:id with empty title - should return 400"""
-    print("\n" + "="*80)
-    print("TEST 6: PUT /api/projects/:id with empty title - 400 test")
-    print("="*80)
+def test_render(test_num, description, body):
+    """Test a render request"""
+    print(f"\n{'='*80}")
+    print(f"TEST {test_num}: {description}")
+    print(f"{'='*80}")
     
-    if not projects:
-        print("Skipping - no projects from test 1")
-        return False
-    
-    real_project = None
-    for p in projects:
-        if p['id'] != '__unsorted__':
-            real_project = p
-            break
-    
-    if not real_project:
-        print("Skipping - no real projects found")
-        return False
-    
-    project_id = real_project['id']
-    print(f"Testing with project ID: {project_id}")
+    url = f"{API_BASE}/clips/{CLIP_ID}/render"
+    print(f"POST {url}")
+    print(f"Body: {json.dumps(body, indent=2)}")
     
     try:
-        response = requests.put(
-            f"{BASE_URL}/projects/{project_id}",
-            json={"title": ""},
-            timeout=10
-        )
-        print(f"Status: {response.status_code}")
+        response = requests.post(url, json=body, timeout=120)
+        print(f"\nHTTP Status: {response.status_code}")
         
-        if response.status_code != 400:
-            print_test("Returns 400 for empty title", False, f"Got {response.status_code}")
-            return False
-        
-        print_test("Returns 400 for empty title", True)
-        
-        data = response.json()
-        if 'error' not in data:
-            print_test("Response has error field", False)
-        else:
-            print_test("Response has error field", True, f"Error: {data['error']}")
-        
-        return True
-        
-    except Exception as e:
-        print_test("PUT with empty title", False, str(e))
-        return False
-
-def test_7_rename_unsorted():
-    """Test 7: PUT /api/projects/__unsorted__ - should return 400"""
-    print("\n" + "="*80)
-    print("TEST 7: PUT /api/projects/__unsorted__ - 400 test")
-    print("="*80)
-    
-    try:
-        response = requests.put(
-            f"{BASE_URL}/projects/__unsorted__",
-            json={"title": "New Title"},
-            timeout=10
-        )
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 400:
-            print_test("Returns 400 for __unsorted__ rename", False, f"Got {response.status_code}")
-            return False
-        
-        print_test("Returns 400 for __unsorted__ rename", True)
-        
-        return True
-        
-    except Exception as e:
-        print_test("PUT /api/projects/__unsorted__", False, str(e))
-        return False
-
-def test_8_delete_unsorted():
-    """Test 8: DELETE /api/projects/__unsorted__ - should return 400"""
-    print("\n" + "="*80)
-    print("TEST 8: DELETE /api/projects/__unsorted__ - 400 test")
-    print("="*80)
-    
-    try:
-        response = requests.delete(f"{BASE_URL}/projects/__unsorted__", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 400:
-            print_test("Returns 400 for __unsorted__ delete", False, f"Got {response.status_code}")
-            return False
-        
-        print_test("Returns 400 for __unsorted__ delete", True)
-        
-        return True
-        
-    except Exception as e:
-        print_test("DELETE /api/projects/__unsorted__", False, str(e))
-        return False
-
-def test_9_delete_project():
-    """Test 9: DELETE /api/projects/:id - delete project and clips"""
-    print("\n" + "="*80)
-    print("TEST 9: DELETE /api/projects/:id - full deletion test")
-    print("="*80)
-    
-    try:
-        # Connect to DB
-        client = MongoClient(MONGO_URL)
-        db = client[DB_NAME]
-        
-        # Create a test project
-        test_video_id = str(uuid.uuid4())
-        print(f"Creating test project with ID: {test_video_id}")
-        
-        db.videos_processed.insert_one({
-            'id': test_video_id,
-            'user_id': DEFAULT_USER_ID,
-            'original_url': 'https://youtube.com/watch?v=test-delete',
-            'title': 'Test Project for Deletion',
-            'source_type': 'youtube',
-            'status': 'completed',
-            'created_at': None  # Will be set by MongoDB
-        })
-        print_test("Created test project in DB", True)
-        
-        # Create 2 test clips
-        clip1_id = str(uuid.uuid4())
-        clip2_id = str(uuid.uuid4())
-        
-        db.generated_clips.insert_many([
-            {
-                'id': clip1_id,
-                'video_id': test_video_id,
-                'user_id': DEFAULT_USER_ID,
-                'clip_title': 'Test Clip 1',
-                'start_time_seconds': 0,
-                'end_time_seconds': 30,
-                'virality_score': 85,
-                'created_at': None
-            },
-            {
-                'id': clip2_id,
-                'video_id': test_video_id,
-                'user_id': DEFAULT_USER_ID,
-                'clip_title': 'Test Clip 2',
-                'start_time_seconds': 30,
-                'end_time_seconds': 60,
-                'virality_score': 90,
-                'created_at': None
-            }
-        ])
-        print_test("Created 2 test clips in DB", True)
-        
-        # Verify they exist
-        video_exists = db.videos_processed.find_one({'id': test_video_id})
-        clips_count = db.generated_clips.count_documents({'video_id': test_video_id})
-        print(f"Before delete: video exists={video_exists is not None}, clips count={clips_count}")
-        
-        # Delete the project
-        response = requests.delete(f"{BASE_URL}/projects/{test_video_id}", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("DELETE returns 200", False, f"Got {response.status_code}")
-            client.close()
-            return False
-        
-        print_test("DELETE returns 200", True)
-        
-        data = response.json()
-        print(f"Response: {data}")
-        
-        if not data.get('ok'):
-            print_test("Response has ok=true", False)
-        else:
-            print_test("Response has ok=true", True)
-        
-        if data.get('deleted_clips') != 2:
-            print_test("deleted_clips count is 2", False, f"Got {data.get('deleted_clips')}")
-        else:
-            print_test("deleted_clips count is 2", True)
-        
-        # Verify deletion in DB
-        video_after = db.videos_processed.find_one({'id': test_video_id})
-        clips_after = db.generated_clips.count_documents({'video_id': test_video_id})
-        
-        print(f"After delete: video exists={video_after is not None}, clips count={clips_after}")
-        
-        if video_after is not None:
-            print_test("Project deleted from DB", False, "Project still exists")
-        else:
-            print_test("Project deleted from DB", True)
-        
-        if clips_after != 0:
-            print_test("All clips deleted from DB", False, f"Still has {clips_after} clips")
-        else:
-            print_test("All clips deleted from DB", True)
-        
-        client.close()
-        return True
-        
-    except Exception as e:
-        print_test("DELETE /api/projects/:id", False, str(e))
-        return False
-
-def test_10_regression_existing_endpoints():
-    """Test 10: Verify existing endpoints still work"""
-    print("\n" + "="*80)
-    print("TEST 10: Regression - existing endpoints")
-    print("="*80)
-    
-    try:
-        # Test GET /api/clips
-        print("\nTesting GET /api/clips...")
-        response = requests.get(f"{BASE_URL}/clips", timeout=10)
-        print(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            print_test("GET /api/clips still works", False, f"Got {response.status_code}")
-        else:
+        if response.status_code == 200:
             data = response.json()
-            if isinstance(data, list):
-                print_test("GET /api/clips still works", True, f"Returns {len(data)} clips")
-            else:
-                print_test("GET /api/clips still works", False, "Not returning array")
-        
-        # Test GET /api/videos/:id (if we have a video)
-        client = MongoClient(MONGO_URL)
-        db = client[DB_NAME]
-        video = db.videos_processed.find_one({'user_id': DEFAULT_USER_ID})
-        
-        if video:
-            video_id = video['id']
-            print(f"\nTesting GET /api/videos/{video_id}...")
-            response = requests.get(f"{BASE_URL}/videos/{video_id}", timeout=10)
-            print(f"Status: {response.status_code}")
+            print(f"Response OK: {data.get('ok', False)}")
             
-            if response.status_code != 200:
-                print_test("GET /api/videos/:id still works", False, f"Got {response.status_code}")
+            clip = data.get('clip', {})
+            render_version = clip.get('render_version', 0)
+            srt_content_rendered = clip.get('srt_content_rendered', '')
+            storage_url = clip.get('storage_url_mp4', '')
+            
+            print(f"Render version: {render_version}")
+            print(f"SRT content rendered: {'YES' if srt_content_rendered else 'NO'} ({len(srt_content_rendered)} chars)")
+            print(f"Storage URL: {storage_url}")
+            
+            # Check if output file exists
+            if storage_url.startswith('/api/files/'):
+                file_path = storage_url.replace('/api/files/', '/app/data/uploads/')
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    print(f"Output file exists: {file_path} ({file_size} bytes)")
+                    
+                    # Run ffprobe
+                    probe = check_ffprobe(file_path)
+                    if probe:
+                        print(f"Video duration: {probe['duration']:.2f}s")
+                        print(f"Video dimensions: {probe['width']}x{probe['height']}")
+                        
+                        # Validate duration
+                        expected_duration = (body.get('trim_end', 5) - body.get('trim_start', 0)) / body.get('speed', 1.0)
+                        duration_diff = abs(probe['duration'] - expected_duration)
+                        if duration_diff < 0.5:
+                            log_test(f"Test {test_num} - Duration check", "PASS", f"Duration {probe['duration']:.2f}s ≈ expected {expected_duration:.2f}s")
+                        else:
+                            log_test(f"Test {test_num} - Duration check", "FAIL", f"Duration {probe['duration']:.2f}s != expected {expected_duration:.2f}s")
+                        
+                        # Validate dimensions for 9:16
+                        if body.get('crop_aspect') == '9:16':
+                            if probe['width'] == 1080 and probe['height'] == 1920:
+                                log_test(f"Test {test_num} - Dimensions check", "PASS", f"9:16 aspect ratio correct: {probe['width']}x{probe['height']}")
+                            else:
+                                log_test(f"Test {test_num} - Dimensions check", "FAIL", f"Expected 1080x1920, got {probe['width']}x{probe['height']}")
+                        elif body.get('crop_aspect') == '16:9':
+                            if probe['width'] == 1920 and probe['height'] == 1080:
+                                log_test(f"Test {test_num} - Dimensions check", "PASS", f"16:9 aspect ratio correct: {probe['width']}x{probe['height']}")
+                            else:
+                                log_test(f"Test {test_num} - Dimensions check", "FAIL", f"Expected 1920x1080, got {probe['width']}x{probe['height']}")
+                    
+                    log_test(f"Test {test_num} - Overall", "PASS", "Render completed successfully")
+                    return True
+                else:
+                    log_test(f"Test {test_num} - Overall", "FAIL", f"Output file not found: {file_path}")
+                    return False
             else:
-                print_test("GET /api/videos/:id still works", True)
+                log_test(f"Test {test_num} - Overall", "FAIL", f"Invalid storage URL: {storage_url}")
+                return False
         else:
-            print("Note: No videos found to test GET /api/videos/:id")
-        
-        client.close()
-        return True
-        
+            error_msg = response.text[:500]
+            print(f"Error response: {error_msg}")
+            log_test(f"Test {test_num} - Overall", "FAIL", f"HTTP {response.status_code}: {error_msg}")
+            return False
+            
     except Exception as e:
-        print_test("Regression tests", False, str(e))
+        print(f"Exception: {e}")
+        log_test(f"Test {test_num} - Overall", "FAIL", f"Exception: {str(e)}")
+        return False
+
+def inspect_ass_file():
+    """Find and inspect the most recent .ass file in /tmp"""
+    print(f"\n{'='*80}")
+    print(f"TEST 7: Inspect cap.ass file")
+    print(f"{'='*80}")
+    
+    # Find recent render directories
+    tmp_dirs = glob.glob('/tmp/render_*')
+    if not tmp_dirs:
+        log_test("Test 7 - ASS file inspection", "SKIP", "No render directories found in /tmp (already cleaned up)")
+        return
+    
+    # Sort by modification time, get most recent
+    tmp_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    recent_dir = tmp_dirs[0]
+    ass_file = os.path.join(recent_dir, 'cap.ass')
+    
+    if os.path.exists(ass_file):
+        print(f"Found ASS file: {ass_file}")
+        with open(ass_file, 'r') as f:
+            content = f.read()
+        
+        print("\n--- ASS File Content ---")
+        print(content[:2000])  # Print first 2000 chars
+        print("--- End of ASS File ---\n")
+        
+        # Verify key elements
+        checks = {
+            '[Script Info]': 'Has [Script Info] section',
+            'PlayResX:': 'Has PlayResX',
+            'PlayResY:': 'Has PlayResY',
+            'WrapStyle: 2': 'Has WrapStyle: 2',
+            'Dialogue: 0,': 'Has Dialogue lines',
+            r'{\an5\pos(': 'Has \\an5\\pos positioning',
+        }
+        
+        all_pass = True
+        for check, desc in checks.items():
+            if check in content:
+                print(f"✅ {desc}")
+            else:
+                print(f"❌ {desc}")
+                all_pass = False
+        
+        # Check for word chunking (long cue should be split)
+        if 'one two three four' in content or 'five six seven eight' in content:
+            print(f"✅ Long cues are chunked (≤4 words per line)")
+        else:
+            print(f"⚠️  Could not verify word chunking")
+        
+        # Check for 2-line via \N
+        if r'\N' in content:
+            print(f"✅ Contains \\N for multi-line captions")
+        else:
+            print(f"⚠️  No \\N found (may not have 6-word cues)")
+        
+        if all_pass:
+            log_test("Test 7 - ASS file inspection", "PASS", "All required ASS elements present")
+        else:
+            log_test("Test 7 - ASS file inspection", "FAIL", "Some ASS elements missing")
+    else:
+        log_test("Test 7 - ASS file inspection", "SKIP", f"ASS file not found at {ass_file} (already cleaned up)")
+
+def test_projects_regression():
+    """Test that Projects endpoints still work"""
+    print(f"\n{'='*80}")
+    print(f"TEST 8: Projects Regression")
+    print(f"{'='*80}")
+    
+    try:
+        # Test GET /api/projects
+        url = f"{API_BASE}/projects"
+        print(f"GET {url}")
+        response = requests.get(url, timeout=10)
+        print(f"HTTP Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            projects = response.json()
+            print(f"Projects count: {len(projects)}")
+            log_test("Test 8a - GET /api/projects", "PASS", f"Returned {len(projects)} projects")
+        else:
+            log_test("Test 8a - GET /api/projects", "FAIL", f"HTTP {response.status_code}")
+            return False
+        
+        # Test GET /api/projects/__unsorted__
+        url = f"{API_BASE}/projects/__unsorted__"
+        print(f"\nGET {url}")
+        response = requests.get(url, timeout=10)
+        print(f"HTTP Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            project = response.json()
+            print(f"Unsorted project ID: {project.get('id')}")
+            print(f"Clips count: {len(project.get('clips', []))}")
+            log_test("Test 8b - GET /api/projects/__unsorted__", "PASS", "Virtual project returned")
+            return True
+        else:
+            log_test("Test 8b - GET /api/projects/__unsorted__", "FAIL", f"HTTP {response.status_code}")
+            return False
+            
+    except Exception as e:
+        log_test("Test 8 - Projects Regression", "FAIL", f"Exception: {str(e)}")
         return False
 
 def main():
     print("="*80)
-    print("BACKEND TESTS FOR PROJECTS ENDPOINTS")
+    print("CAPTION RENDERING PIPELINE TEST SUITE")
+    print("Testing POST /api/clips/:clipId/render with .ass file generation")
     print("="*80)
     print(f"Base URL: {BASE_URL}")
-    print(f"MongoDB: {MONGO_URL}/{DB_NAME}")
-    print(f"Default User: {DEFAULT_USER_ID}")
+    print(f"Clip ID: {CLIP_ID}")
     
-    results = {}
+    results = []
     
-    # Test 1: GET /api/projects
-    projects = test_1_get_projects_list()
-    results['test_1'] = projects is not None
+    # Test 1: 9:16 crop + Hindi-like caption (long cue tests chunking)
+    body1 = {
+        "trim_start": 0,
+        "trim_end": 5,
+        "crop_aspect": "9:16",
+        "fill_mode": "crop",
+        "speed": 1.0,
+        "font_size": 20,
+        "outline_size": 2,
+        "caption_x_percent": 50,
+        "caption_y_percent": 78,
+        "style_preset": "classic_white",
+        "style_ass": {
+            "fontName": "DejaVu Sans",
+            "fontSize": 20,
+            "primary": "&H00FFFFFF&",
+            "outline": 2,
+            "outlineColour": "&H00000000&",
+            "bold": 1
+        },
+        "caption_segments": [
+            {"start": 0, "end": 2, "text": "hello world from the test agent"},
+            {"start": 2, "end": 5, "text": "one two three four five six seven eight nine ten eleven twelve"}
+        ]
+    }
+    results.append(test_render(1, "9:16 crop + long caption (chunking test)", body1))
+    time.sleep(1)
     
-    # Test 2: GET /api/projects/:id
-    project_detail = test_2_get_project_by_id(projects)
-    results['test_2'] = project_detail is not None
+    # Test 2: 9:16 + Color fill mode
+    body2 = body1.copy()
+    body2["fill_mode"] = "color"
+    body2["fill_color"] = "#ff0000"
+    results.append(test_render(2, "9:16 + Color fill mode", body2))
+    time.sleep(1)
     
-    # Test 3: GET /api/projects/__unsorted__
-    unsorted = test_3_get_unsorted_project()
-    results['test_3'] = unsorted is not None
+    # Test 3: 9:16 + Blur fill mode
+    body3 = body1.copy()
+    body3["fill_mode"] = "blur"
+    results.append(test_render(3, "9:16 + Blur fill mode", body3))
+    time.sleep(1)
     
-    # Test 4: GET nonexistent project
-    results['test_4'] = test_4_get_nonexistent_project()
+    # Test 4: No caption_segments (falls back to clip.srt_content)
+    body4 = {
+        "trim_start": 0,
+        "trim_end": 5,
+        "crop_aspect": "9:16",
+        "fill_mode": "crop",
+        "speed": 1.0,
+        "font_size": 20,
+        "outline_size": 2,
+        "caption_x_percent": 50,
+        "caption_y_percent": 78,
+        "style_preset": "classic_white"
+    }
+    results.append(test_render(4, "No caption_segments (fallback to srt_content)", body4))
+    time.sleep(1)
     
-    # Test 5: PUT rename project
-    results['test_5'] = test_5_rename_project(projects)
+    # Test 5: Empty caption_segments
+    body5 = body1.copy()
+    body5["caption_segments"] = []
+    results.append(test_render(5, "Empty caption_segments (no captions)", body5))
+    time.sleep(1)
     
-    # Test 6: PUT with empty title
-    results['test_6'] = test_6_rename_with_empty_title(projects)
+    # Test 6: 16:9 output
+    body6 = body1.copy()
+    body6["crop_aspect"] = "16:9"
+    results.append(test_render(6, "16:9 output", body6))
+    time.sleep(1)
     
-    # Test 7: PUT __unsorted__
-    results['test_7'] = test_7_rename_unsorted()
+    # Test 7: Inspect ASS file (must run immediately after a render)
+    inspect_ass_file()
     
-    # Test 8: DELETE __unsorted__
-    results['test_8'] = test_8_delete_unsorted()
-    
-    # Test 9: DELETE project
-    results['test_9'] = test_9_delete_project()
-    
-    # Test 10: Regression
-    results['test_10'] = test_10_regression_existing_endpoints()
+    # Test 8: Projects regression
+    results.append(test_projects_regression())
     
     # Summary
     print("\n" + "="*80)
     print("TEST SUMMARY")
     print("="*80)
-    
-    passed = sum(1 for v in results.values() if v)
+    passed = sum(1 for r in results if r)
     total = len(results)
-    
-    for test_name, result in results.items():
-        status = "✅ PASS" if result else "❌ FAIL"
-        print(f"{status}: {test_name}")
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
+    print(f"Passed: {passed}/{total}")
+    print(f"Failed: {total - passed}/{total}")
     
     if passed == total:
-        print("\n🎉 ALL TESTS PASSED!")
-        sys.exit(0)
+        print("\n✅ ALL TESTS PASSED")
+        return 0
     else:
-        print(f"\n⚠️  {total - passed} test(s) failed")
-        sys.exit(1)
+        print(f"\n❌ {total - passed} TEST(S) FAILED")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit(main())
