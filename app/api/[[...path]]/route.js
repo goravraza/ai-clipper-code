@@ -1383,8 +1383,12 @@ ${events}
         if (speed !== 1.0) {
           args.push('-filter:a', `atempo=${speed}`)
         }
-        // HD-quality encoding: CRF 18 (visual-lossless), preset slow, target ~6Mbps for shorts
-        args.push('-c:v', 'libx264', '-preset', 'slow', '-crf', '18', '-pix_fmt', 'yuv420p',
+        // HD encoding tuned for SPEED — preset 'veryfast' + CRF 21 gives ~visually-transparent quality
+        // at 2–3× the encode speed of preset 'fast' and ~8× preset 'slow'. Necessary to stay safely under
+        // the upstream proxy/ingress timeout (~30–60s) for 30-second 1080×1920 clips on CPU-only containers.
+        // For users who want maximum quality, we can later add a "Quality" toggle.
+        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p',
+          '-tune', 'fastdecode', '-threads', '0',
           '-maxrate', '8000k', '-bufsize', '12000k',
           '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
           '-movflags', '+faststart', tmpOut)

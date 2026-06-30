@@ -274,6 +274,16 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       })
+      // Defensive parse — if the upstream proxy times out / errors, the body is an HTML page,
+      // not JSON. Surface a useful message instead of "Unexpected token '<'".
+      const ctype = r.headers.get('content-type') || ''
+      if (!ctype.includes('application/json')) {
+        const text = await r.text().catch(() => '')
+        if (r.status === 504 || r.status === 502 || r.status === 524) {
+          throw new Error('Render timed out at the gateway. Try a shorter trim window, "Crop" fill mode, or retry — the server may still be processing.')
+        }
+        throw new Error(`Render failed (HTTP ${r.status}). Server returned non-JSON response${text ? ': ' + text.slice(0, 120) : ''}`)
+      }
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'Render failed')
       toast.success('✨ Clip rendered', { description: `Final duration ${Number(data.final_duration).toFixed(1)}s` })
