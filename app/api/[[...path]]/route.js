@@ -429,7 +429,9 @@ async function handle(request, { params }) {
     // ============= CLIPS =============
     if (path_ === '/clips' && method === 'GET') {
       const user = await getUser(request, db)
-      const list = await db.collection('generated_clips').find({ user_id: user.id }).sort({ virality_score: -1 }).toArray()
+      // Newest first so freshly-generated clips appear at the top after ingestion.
+      // Within the same video, sort by virality_score desc.
+      const list = await db.collection('generated_clips').find({ user_id: user.id }).sort({ created_at: -1, virality_score: -1 }).toArray()
       return NextResponse.json(list.map(strip))
     }
     if (path_.startsWith('/clips/') && method === 'PUT') {
