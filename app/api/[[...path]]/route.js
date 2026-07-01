@@ -1006,19 +1006,40 @@ async function handle(request, { params }) {
           return NextResponse.json({ error: result?.error || 'Transcription failed', hint: result?.hint }, { status: 500 })
         }
         await db.collection('generated_clips').updateOne({ id: clipId }, {
-          $set: { srt_content: result.srt_content, transcription_source: 'whisper_on_demand', transcribed_at: new Date() }
+          $set: {
+            srt_content: result.srt_content,
+            caption_segments: result.segments || null,
+            transcription_source: 'whisper_on_demand',
+            transcribed_at: new Date(),
+          }
         })
-        return NextResponse.json({ ok: true, srt_content: result.srt_content, segments_count: result.segments_count, source: 'whisper_on_demand' })
+        return NextResponse.json({ ok: true, srt_content: result.srt_content, segments: result.segments || [], segments_count: result.segments_count, source: 'whisper_on_demand' })
       } catch (e) {
         return NextResponse.json({ error: 'Transcription failed', message: e.message }, { status: 500 })
       }
     }
 
-    // GET /api/clips/:id/transcript — return parsed segments [{start, end, text}] for the editor
+    // GET /api/clips/:id/transcript — return parsed segments [{start, end, text, words?}] for the editor.
+    // Prefers `caption_segments` (which carries word-level timings for karaoke highlighting) if stored;
+    // falls back to parsing `srt_content` for legacy clips.
     if (path_.startsWith('/clips/') && path_.endsWith('/transcript') && method === 'GET') {
       const clipId = segments[1]
       const clip = await db.collection('generated_clips').findOne({ id: clipId })
       if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      // Prefer stored caption_segments (has word timings)
+      if (Array.isArray(clip.caption_segments) && clip.caption_segments.length > 0) {
+        return NextResponse.json({
+          segments: clip.caption_segments.map(s => ({
+            start: Number(s.start) || 0,
+            end: Number(s.end) || 0,
+            text: String(s.text || ''),
+            words: Array.isArray(s.words) ? s.words : [],
+          })),
+          clip_id: clipId,
+          has_srt: true,
+          has_word_timings: clip.caption_segments.some(s => Array.isArray(s.words) && s.words.length > 0),
+        })
+      }
       const src = clip.srt_content || ''
       const segs = []
       if (src.trim()) {
@@ -1035,10 +1056,10 @@ async function handle(request, { params }) {
           const textLines = []
           while (i < lines.length && lines[i].trim() !== '') { textLines.push(lines[i++]) }
           i++
-          segs.push({ start: startS, end: endS, text: textLines.join(' ').trim() })
+          segs.push({ start: startS, end: endS, text: textLines.join(' ').trim(), words: [] })
         }
       }
-      return NextResponse.json({ segments: segs, clip_id: clipId, has_srt: !!src.trim() })
+      return NextResponse.json({ segments: segs, clip_id: clipId, has_srt: !!src.trim(), has_word_timings: false })
     }
 
     // PUT /api/clips/:id/transcript — save edited segments back; rebuilds srt_content
@@ -1251,23 +1272,32 @@ async function handle(request, { params }) {
             return `${hh}:${mm}:${ss}.${cs}`
           }
           const MAX_WORDS_PER_LINE = 4
+          // Chunked cues carry through the ORIGINAL cue's `words` array (word-level timing) if the
+          // upstream transcriber provided it. This is needed to emit karaoke-style word highlighting.
           const chunked = []
           for (const c of cues) {
             const text = String(c.text || '').replace(/\s+/g, ' ').trim()
             if (!text || !(c.end > c.start)) continue
             const words = text.split(/\s+/)
+            // Word-level timings, if any. Shape: [{start, end, text}]. Timings are in the SAME frame as `c.start/end`.
+            const wordTimings = Array.isArray(c.words) ? c.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end)) : []
             if (words.length <= MAX_WORDS_PER_LINE) {
-              chunked.push({ start: c.start, end: c.end, text })
+              chunked.push({ start: c.start, end: c.end, text, words: wordTimings })
             } else if (words.length <= MAX_WORDS_PER_LINE * 2) {
               const half = Math.ceil(words.length / 2)
               // Use literal \N for ASS line break inside Dialogue text
-              chunked.push({ start: c.start, end: c.end, text: words.slice(0, half).join(' ') + '\\N' + words.slice(half).join(' ') })
+              chunked.push({ start: c.start, end: c.end, text: words.slice(0, half).join(' ') + '\\N' + words.slice(half).join(' '), words: wordTimings })
             } else {
               const numChunks = Math.ceil(words.length / MAX_WORDS_PER_LINE)
               const per = (c.end - c.start) / numChunks
               for (let k = 0; k < numChunks; k++) {
                 const slice = words.slice(k * MAX_WORDS_PER_LINE, (k + 1) * MAX_WORDS_PER_LINE).join(' ')
-                if (slice) chunked.push({ start: c.start + k * per, end: c.start + (k + 1) * per, text: slice })
+                if (slice) {
+                  const chunkStart = c.start + k * per
+                  const chunkEnd = c.start + (k + 1) * per
+                  const chunkWords = wordTimings.filter(w => w.start >= chunkStart - 0.05 && w.end <= chunkEnd + 0.05)
+                  chunked.push({ start: chunkStart, end: chunkEnd, text: slice, words: chunkWords })
+                }
               }
             }
           }
@@ -1284,19 +1314,104 @@ async function handle(request, { params }) {
             ...(styleAss || {}),
           }
           const primary = stripTrailAmp(s.primary || '&H00FFFFFF')
-          const outlineCol = stripTrailAmp(s.outlineColour || '&H00000000')
-          const back = s.back ? stripTrailAmp(s.back) : '&H80000000'
+          // libass 0.17.x QUIRK: for BorderStyle=3 (opaque box), the field used to color the box is
+          // actually `OutlineColour` (\3c), NOT `BackColour`. This contradicts the VSFilter/ASS spec
+          // but is how libass has implemented it since ~0.14. So when the preset has a `back` color
+          // (which is our high-level "background box color" concept), we plug it into the OutlineColour
+          // slot of the .ass Style row. `BackColour` becomes the drop-shadow color instead.
+          const styleBack = s.back ? stripTrailAmp(s.back) : null
+          const styleOutlineCol = stripTrailAmp(s.outlineColour || '&H00000000')
+          const outlineCol = styleBack || styleOutlineCol   // if back defined, it fills the opaque box
+          const back = styleBack ? '&H80000000' : '&H80000000'  // shadow color; not used visually
           // borderStyle: 1 = outline+drop-shadow, 3 = opaque box (for "back" presets)
           const borderStyle = s.borderStyle || (s.back ? 3 : 1)
           const bold = s.bold ? -1 : 0
+          // CRITICAL: For BorderStyle=3 (opaque box), the "Outline" field is actually the PADDING
+          // between the text and the edges of the box. If it's 0, the box collapses and becomes
+          // invisible — you get plain text with no background. So we ENFORCE a minimum padding of
+          // ~1/6 of the font size when using a background box style.
+          // ADDITIONAL: libass 0.17.x requires Shadow > 0 for BorderStyle=3 boxes to actually render.
+          // When Shadow=0 in this build, the opaque box is silently skipped — leaving plain text with
+          // no background. So we force a small Shadow value (matching Outline scale) when back is set.
+          let effectiveOutline = assOutline
+          let effectiveShadow = 0
+          if (borderStyle === 3) {
+            const minPad = Math.max(10, Math.round(assFontSize / 6))
+            effectiveOutline = Math.max(minPad, assOutline)
+            // Small shadow to force libass to draw the box (0 disables the box in libass 0.17.1)
+            effectiveShadow = Math.max(2, Math.round(assFontSize / 40))
+          }
+          // Word-level accent color — used for karaoke-style word highlight (see writeAssWithWords below).
+          // Fallback to a bright yellow if user didn't provide one.
+          const accentColour = stripTrailAmp(s.accent || s.accentColour || '&H0000FFFF&') // ASS = &HAABBGGRR → 00FFFF = pure yellow (RR=FF GG=FF BB=00 → RGB(0xFF, 0xFF, 0x00) is wrong; correct: &H0000FFFF = alpha 00 blue 00 green FF red FF → RGB(255,255,0) YELLOW ✓)
           // Style.MarginL/R/V are unused because we override per-cue with \pos. Set generous side margins anyway.
           const styleMarginH = Math.round(frameW * 0.05)
-          const styleLine = `Style: Default,${s.fontName},${assFontSize},${primary},&H000000FF,${outlineCol},${back},${bold},0,0,0,100,100,0,0,${borderStyle},${assOutline},0,5,${styleMarginH},${styleMarginH},0,1`
+          const styleLine = `Style: Default,${s.fontName},${assFontSize},${primary},&H000000FF,${outlineCol},${back},${bold},0,0,0,100,100,0,0,${borderStyle},${effectiveOutline},${effectiveShadow},5,${styleMarginH},${styleMarginH},0,1`
 
-          // Per-cue Dialogue with \pos override (acts as if the cue had no margins)
-          const events = chunked.map(c =>
-            `Dialogue: 0,${fmt(c.start)},${fmt(c.end)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${c.text}`
-          ).join('\n')
+          // Word-level HIGHLIGHTING (Vizard/Opus-Clip style) — when we have per-word timings,
+          // emit one Dialogue line PER active word window. Each line renders the FULL cue text with
+          // one word colored in the accent color (default yellow) so the "spoken word" pulses through.
+          // If no word timings are available, we fall back to a single Dialogue per cue.
+          const wordHighlight = body.word_highlight !== false // default ON when word timings exist
+          const events = []
+          for (const c of chunked) {
+            const usableWords = wordHighlight && Array.isArray(c.words) && c.words.length > 0
+              ? c.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start && w.end > c.start && w.start < c.end)
+              : []
+            if (usableWords.length === 0) {
+              // No word timings → single static cue
+              events.push(`Dialogue: 0,${fmt(c.start)},${fmt(c.end)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${c.text}`)
+              continue
+            }
+            // Split the cue text into "renderable tokens" that align with word timings.
+            // Explicit \N line breaks are preserved.
+            const cueTextTokens = c.text.split(/(\\N|\s+)/).filter(t => t.length > 0)  // words, spaces, line breaks
+            // Map WORD tokens to word-timing entries by order (spaces / \N don't consume timings).
+            const wordTokenIndices = []
+            for (let i = 0; i < cueTextTokens.length; i++) {
+              const t = cueTextTokens[i]
+              if (t === '\\N') continue
+              if (/^\s+$/.test(t)) continue
+              wordTokenIndices.push(i)
+            }
+            const timedWords = usableWords.slice(0, wordTokenIndices.length)
+            // For each timed word, emit a Dialogue line covering that word's time window.
+            // The active word gets accent color + slight bold outline; other words stay primary.
+            let prevEnd = c.start
+            for (let wi = 0; wi < timedWords.length; wi++) {
+              const w = timedWords[wi]
+              const activeIdx = wordTokenIndices[wi]
+              const wStart = Math.max(c.start, Math.min(c.end - 0.01, w.start))
+              const wEnd = Math.max(wStart + 0.05, Math.min(c.end, w.end))
+              // If there's a gap before this word (start of cue OR gap between words), emit a
+              // "no-highlight" filler so the text is visible with all words in primary color.
+              if (wStart > prevEnd + 0.02) {
+                const noHi = cueTextTokens.join('')
+                events.push(`Dialogue: 0,${fmt(prevEnd)},${fmt(wStart)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${noHi}`)
+              }
+              // Build the highlighted variant — rebuild the text with an accent-color override
+              // wrapping the active word ONLY. We only change PrimaryColour (\c) — NOT the outline
+              // (\3c) — because with BorderStyle=3 the "outline" is the box padding and changing its
+              // color would draw a giant accent-colored box over the word text.
+              const parts = []
+              for (let ti = 0; ti < cueTextTokens.length; ti++) {
+                const tok = cueTextTokens[ti]
+                if (ti === activeIdx) {
+                  // Accent text color, then \r resets to Default style for the rest.
+                  parts.push(`{\\c${accentColour}}${tok}{\\r}`)
+                } else {
+                  parts.push(tok)
+                }
+              }
+              events.push(`Dialogue: 0,${fmt(wStart)},${fmt(wEnd)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${parts.join('')}`)
+              prevEnd = wEnd
+            }
+            // Trailing tail after the last word — show the cue with all words in primary until c.end
+            if (prevEnd < c.end - 0.02) {
+              events.push(`Dialogue: 0,${fmt(prevEnd)},${fmt(c.end)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${cueTextTokens.join('')}`)
+            }
+          }
+          const eventsBlock = events.join('\n')
 
           const ass = `[Script Info]
 ScriptType: v4.00+
@@ -1311,23 +1426,43 @@ ${styleLine}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-${events}
+${eventsBlock}
 `
           const assPath = path.join(tmpDir, 'cap.ass')
           await fs.writeFile(assPath, ass, 'utf-8')
+          // DEBUG: keep a copy at a stable path for inspection while iterating on styles.
+          try { await fs.writeFile('/tmp/last_cap.ass', ass, 'utf-8') } catch {}
           return { assPath, chunked }
         }
 
         let assResult = null
         if (userCaptionSegments && userCaptionSegments.length > 0) {
           // Editor passes already-clip-local cues. Adjust for trim window + speed.
+          // Preserve `words[]` (word-level timings for karaoke highlighting) and re-map their
+          // timings by the same (trim+speed) transform we apply to the cue itself.
           const adjusted = userCaptionSegments.map(s => {
             const startS = Math.max(0, Number(s.start) || 0)
             const endS = Math.max(startS + 0.1, Number(s.end) || startS + 0.5)
             const ns = startS - trimStart
             const ne = endS - trimStart
             if (ne <= 0 || ns >= (trimEnd - trimStart)) return null
-            return { start: Math.max(0, ns) / speed, end: Math.min(trimEnd - trimStart, ne) / speed, text: String(s.text || '') }
+            const cueStart = Math.max(0, ns) / speed
+            const cueEnd = Math.min(trimEnd - trimStart, ne) / speed
+            // Re-map words (if present) into clip-local + speed-adjusted time
+            let words = null
+            if (Array.isArray(s.words) && s.words.length > 0) {
+              words = s.words.map(w => {
+                const ws = Math.max(0, Number(w.start) || 0) - trimStart
+                const we = Math.max(ws + 0.05, Number(w.end) || ws + 0.1) - trimStart
+                if (we <= 0 || ws >= (trimEnd - trimStart)) return null
+                return {
+                  start: Math.max(0, ws) / speed,
+                  end: Math.min(trimEnd - trimStart, we) / speed,
+                  text: String(w.text || w.word || '').trim(),
+                }
+              }).filter(Boolean)
+            }
+            return { start: cueStart, end: cueEnd, text: String(s.text || ''), words }
           }).filter(Boolean)
           assResult = await writeAss(adjusted)
         } else if (clip.srt_content && clip.srt_content.trim().length > 0) {
