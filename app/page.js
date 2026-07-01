@@ -1025,7 +1025,16 @@ export default function HomePage() {
         open={!!editorClip}
         clip={editorClip}
         onClose={() => setEditorClip(null)}
-        onSaved={(c) => setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+        onSaved={(c, meta) => {
+          setClips(prev => prev.map(x => x.id === c.id ? c : x))
+          // Live-update the credit balance in the header after a paid render
+          if (meta?.credits_remaining != null) {
+            setProfile(prev => prev ? { ...prev, credit_balance_minutes: meta.credits_remaining } : prev)
+          } else {
+            // Fallback: refetch profile
+            fetch('/api/auth/me').then(r => r.json()).then(m => { if (m?.user) setProfile(m.user) }).catch(() => {})
+          }
+        }}
       />
 
       {/* RENAME PROJECT MODAL */}
@@ -1239,15 +1248,18 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
   return (
     <>
     <Card className="overflow-hidden group">
-      <div className="relative aspect-[9/16] bg-zinc-900 overflow-hidden cursor-pointer" onClick={() => isPlayable && setInlinePlaying(true)}>
+      <div className="relative aspect-[9/16] bg-zinc-900 overflow-hidden cursor-pointer" onClick={() => isPlayable && setInlinePlaying(true)} onContextMenu={(e) => e.preventDefault()}>
         {inlinePlaying && isPlayable ? (
           <video
             src={`${clip.storage_url_mp4}?v=${clip.render_version || 0}`}
             className="absolute inset-0 h-full w-full object-cover bg-black"
             controls
+            controlsList="nodownload noplaybackrate noremoteplayback"
+            disablePictureInPicture
             autoPlay
             playsInline
             onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
           />
         ) : (
           <>
@@ -1283,12 +1295,8 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
             </div>
           </div>
         )}
-        {clip.hook_type === 'text' && clip.hook_text && (
-          <div className="absolute bottom-12 left-2 right-2 rounded-md bg-black/70 backdrop-blur-md p-1.5 border border-amber-400/40">
-            <div className="text-[10px] text-amber-400 font-semibold uppercase tracking-wide">Text Hook</div>
-            <div className="text-[11px] text-white line-clamp-2 font-medium">{clip.hook_text}</div>
-          </div>
-        )}
+        {/* NOTE: The "TEXT HOOK" overlay box that used to sit here was removed per UX cleanup —
+            the hook is still fully editable via the HookEditor button below the card. */}
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="h-14 w-14 rounded-full bg-white/90 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
             <Play className="h-6 w-6 text-black ml-1" fill="currentColor" />
@@ -1343,14 +1351,17 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
     {/* LIGHTBOX PREVIEW — opens via Expand icon, larger player */}
     <Dialog open={lightboxOpen} onOpenChange={(o) => setLightboxOpen(o)}>
       <DialogContent className="max-w-2xl p-0 overflow-hidden bg-black border-zinc-800">
-        <div className="relative w-full" style={{ aspectRatio: '9/16', maxHeight: '88vh' }}>
+        <div className="relative w-full" style={{ aspectRatio: '9/16', maxHeight: '88vh' }} onContextMenu={(e) => e.preventDefault()}>
           {lightboxOpen && isPlayable && (
             <video
               src={`${clip.storage_url_mp4}?v=${clip.render_version || 0}&lb=1`}
               className="absolute inset-0 h-full w-full object-contain bg-black"
               controls
+              controlsList="nodownload noplaybackrate noremoteplayback"
+              disablePictureInPicture
               autoPlay
               playsInline
+              onContextMenu={(e) => e.preventDefault()}
             />
           )}
         </div>
@@ -1551,7 +1562,7 @@ function PreviewButton({ clip, memes }) {
           <div className="relative max-h-[60vh] overflow-hidden rounded-lg border border-zinc-800" style={{aspectRatio: aspect.replace(':','/'), width: aspect === '16:9' ? '100%' : aspect === '1:1' ? '60%' : '45%'}}>
             {isRealClip ? (
               // eslint-disable-next-line jsx-a11y/media-has-caption
-              <video src={clip.storage_url_mp4} controls autoPlay className="absolute inset-0 h-full w-full object-cover bg-black" />
+              <video src={clip.storage_url_mp4} controls controlsList="nodownload noplaybackrate noremoteplayback" disablePictureInPicture autoPlay className="absolute inset-0 h-full w-full object-cover bg-black" onContextMenu={(e) => e.preventDefault()} />
             ) : (
               <>
                 {/* eslint-disable-next-line @next/next/no-img-element */}

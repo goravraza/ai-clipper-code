@@ -285,9 +285,19 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         throw new Error(`Render failed (HTTP ${r.status}). Server returned non-JSON response${text ? ': ' + text.slice(0, 120) : ''}`)
       }
       const data = await r.json()
+      if (r.status === 402) {
+        // Low credits — show clear billing CTA instead of generic error
+        toast.error(data.message || 'Low credits', {
+          description: `Need ${data.required?.toFixed?.(2) || ''} credits · Have ${data.available?.toFixed?.(2) || ''}. Head to Pricing to top up.`,
+          duration: 8000,
+        })
+        return
+      }
       if (!r.ok) throw new Error(data.error || 'Render failed')
-      toast.success('✨ Clip rendered', { description: `Final duration ${Number(data.final_duration).toFixed(1)}s` })
-      onSaved?.(data.clip)
+      toast.success('✨ Clip rendered', {
+        description: `Duration ${Number(data.final_duration).toFixed(1)}s · -${data.credits_charged?.toFixed?.(2) ?? '?'} credits · ${data.credits_remaining?.toFixed?.(2) ?? '?'} left`,
+      })
+      onSaved?.(data.clip, { credits_remaining: data.credits_remaining })
       onClose?.()
     } catch (e) { toast.error('Render failed', { description: e.message }) }
     finally { setRendering(false) }
@@ -445,6 +455,7 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                 aspectRatio: state.crop_aspect.replace(':','/'),
                 background: state.fill_mode === 'color' ? state.fill_color : '#000000',
               }}
+              onContextMenu={(e) => e.preventDefault()}
             >
               {/* BLUR FILL UNDERLAY — duplicate of the video, scaled to cover, heavily blurred.
                   Shown only when fill_mode is 'blur' AND we have a real video source. */}
@@ -475,8 +486,11 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   src={videoSrc}
                   className={`absolute inset-0 w-full h-full ${state.fill_mode === 'crop' ? 'object-cover' : 'object-contain'}`}
                   controls
+                  controlsList="nodownload noplaybackrate noremoteplayback"
+                  disablePictureInPicture
                   playsInline
                   preload="metadata"
+                  onContextMenu={(e) => e.preventDefault()}
                 />
               ) : (
                 // eslint-disable-next-line @next/next/no-img-element

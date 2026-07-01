@@ -262,7 +262,7 @@ function SourcePreview({ payload }) {
     )
   }
   if (payload.fileBlobUrl) {
-    return <video className="w-full h-full bg-black" src={payload.fileBlobUrl} controls />
+    return <video className="w-full h-full bg-black" src={payload.fileBlobUrl} controls controlsList="nodownload noplaybackrate noremoteplayback" disablePictureInPicture onContextMenu={(e) => e.preventDefault()} />
   }
   return <div className="aspect-video flex items-center justify-center text-muted-foreground text-sm">{payload.title || 'Source'}</div>
 }

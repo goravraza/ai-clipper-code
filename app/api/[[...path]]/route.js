@@ -1086,6 +1086,70 @@ async function handle(request, { params }) {
       const newClipTitle = body.clip_title ? String(body.clip_title).slice(0, 90) : null
       const templateId = body.template_id || clip.template_id || null
 
+      // ============= CREDIT CHECK & DEDUCTION (Double-Dip render billing) =============
+      // Rate: 0.25 credit-minutes per 1 second of EXPORTED clip duration (post trim + speed).
+      // Example: 45s output = 45 × 0.25 = 11.25 credits.
+      // Deducted atomically BEFORE ffmpeg starts. Refunded on render failure.
+      const outputDurationSec = Math.max(1, (trimEnd - trimStart) / speed)
+      const renderCost = Math.round(outputDurationSec * 0.25 * 100) / 100  // 2-decimal precision
+      let creditsDeducted = false
+      try {
+        const updated = await db.collection('profiles').findOneAndUpdate(
+          { id: user.id, credit_balance_minutes: { $gte: renderCost } },
+          { $inc: { credit_balance_minutes: -renderCost } },
+          { returnDocument: 'after' }
+        )
+        // Mongo driver v6 returns the doc directly; older versions return { value: doc }
+        const updatedDoc = updated?.value ?? updated
+        if (!updatedDoc) {
+          const fresh = await db.collection('profiles').findOne({ id: user.id }, { projection: { credit_balance_minutes: 1 } })
+          const have = fresh?.credit_balance_minutes ?? 0
+          return NextResponse.json({
+            error: 'insufficient_credits',
+            message: `Low credits — this ${Math.round(outputDurationSec)}s render costs ${renderCost} credits but you only have ${have.toFixed(2)}. Buy more credits to continue.`,
+            required: renderCost,
+            available: have,
+            duration_seconds: outputDurationSec,
+          }, { status: 402 })
+        }
+        creditsDeducted = true
+        // Audit trail
+        try {
+          await db.collection('credit_transactions').insertOne({
+            id: uuidv4(),
+            user_id: user.id,
+            clip_id: clipId,
+            amount: -renderCost,
+            reason: 'clip_render',
+            duration_seconds: outputDurationSec,
+            balance_after: updatedDoc.credit_balance_minutes,
+            created_at: new Date(),
+          })
+        } catch {}
+      } catch (creditErr) {
+        return NextResponse.json({ error: 'Credit check failed', message: creditErr.message }, { status: 500 })
+      }
+
+      // Helper to refund credits if the render fails downstream
+      const refundCredits = async (reason) => {
+        if (!creditsDeducted) return
+        try {
+          await db.collection('profiles').updateOne({ id: user.id }, { $inc: { credit_balance_minutes: renderCost } })
+          await db.collection('credit_transactions').insertOne({
+            id: uuidv4(),
+            user_id: user.id,
+            clip_id: clipId,
+            amount: renderCost,
+            reason: 'clip_render_refund',
+            error_reason: String(reason || 'unknown').slice(0, 200),
+            duration_seconds: outputDurationSec,
+            created_at: new Date(),
+          })
+          creditsDeducted = false
+        } catch {}
+      }
+      // =============================================================================
+
       // Source file
       const srcPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
       if (!(await fs.stat(srcPath).catch(()=>null))) return NextResponse.json({ error: 'Source MP4 missing on server' }, { status: 410 })
@@ -1434,12 +1498,21 @@ ${events}
         }
 
         try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
-        await logActivity(db, user.id, 'clip_rendered', request, { clip_id: clipId, trim: [trimStart, trimEnd], crop: cropAspect, speed, has_logo: !!logoUrl, has_title: !!titleText, template: templateId })
+        await logActivity(db, user.id, 'clip_rendered', request, { clip_id: clipId, trim: [trimStart, trimEnd], crop: cropAspect, speed, has_logo: !!logoUrl, has_title: !!titleText, template: templateId, credits_charged: renderCost })
         const updated = await db.collection('generated_clips').findOne({ id: clipId })
-        return NextResponse.json({ ok: true, clip: strip(updated), final_duration: (trimEnd - trimStart) / speed })
+        const freshProfile = await db.collection('profiles').findOne({ id: user.id }, { projection: { credit_balance_minutes: 1 } })
+        return NextResponse.json({
+          ok: true,
+          clip: strip(updated),
+          final_duration: (trimEnd - trimStart) / speed,
+          credits_charged: renderCost,
+          credits_remaining: freshProfile?.credit_balance_minutes ?? null,
+        })
       } catch (e) {
         try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
-        return NextResponse.json({ error: 'Render failed: ' + e.message }, { status: 500 })
+        // Refund credits since the render failed before completing
+        await refundCredits(e.message)
+        return NextResponse.json({ error: 'Render failed: ' + e.message, credits_refunded: renderCost }, { status: 500 })
       }
     }
 
