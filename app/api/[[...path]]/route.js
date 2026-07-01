@@ -974,6 +974,46 @@ async function handle(request, { params }) {
       }
     }
 
+    // POST /api/clips/:id/transcribe — on-demand per-clip transcription for clips that don't have one.
+    // Used when the original ingestion couldn't transcribe (e.g. YT blocked audio-only stream).
+    // Extracts audio from the clip's local MP4 and runs Groq/OpenAI Whisper on it. Free for now — we already
+    // charged for the source video ingestion. Returns the resulting segments + persists srt_content.
+    if (path_.startsWith('/clips/') && path_.endsWith('/transcribe') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      if (clip.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      // Idempotency — if we already have a transcript, just return it.
+      if (clip.srt_content && clip.srt_content.trim().length > 20) {
+        return NextResponse.json({ ok: true, already_transcribed: true, srt_content: clip.srt_content })
+      }
+      // Resolve local file path from storage_url_mp4 (/api/files/clips/<name>.mp4)
+      const mp4Match = /\/api\/files\/clips\/([^?]+\.mp4)/.exec(clip.storage_url_mp4 || '')
+      if (!mp4Match) return NextResponse.json({ error: 'Clip has no local MP4 to transcribe' }, { status: 400 })
+      const localMp4 = path.join('/app/data/uploads/clips', mp4Match[1])
+      try { await fs.access(localMp4) } catch { return NextResponse.json({ error: 'Local MP4 not found on disk' }, { status: 410 }) }
+      try {
+        const { transcribeClipOnDemand } = await import('@/lib/video-processor')
+        const result = await transcribeClipOnDemand({
+          db,
+          clipId,
+          clipPath: localMp4,
+          clipDuration: (clip.end_time_seconds - clip.start_time_seconds) || 30,
+          language: clip.language || 'auto',
+        })
+        if (!result?.ok) {
+          return NextResponse.json({ error: result?.error || 'Transcription failed', hint: result?.hint }, { status: 500 })
+        }
+        await db.collection('generated_clips').updateOne({ id: clipId }, {
+          $set: { srt_content: result.srt_content, transcription_source: 'whisper_on_demand', transcribed_at: new Date() }
+        })
+        return NextResponse.json({ ok: true, srt_content: result.srt_content, segments_count: result.segments_count, source: 'whisper_on_demand' })
+      } catch (e) {
+        return NextResponse.json({ error: 'Transcription failed', message: e.message }, { status: 500 })
+      }
+    }
+
     // GET /api/clips/:id/transcript — return parsed segments [{start, end, text}] for the editor
     if (path_.startsWith('/clips/') && path_.endsWith('/transcript') && method === 'GET') {
       const clipId = segments[1]

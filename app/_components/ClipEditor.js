@@ -130,18 +130,41 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     setActiveCaptionTrack([]); setActiveCueIdx(-1); setEditingCueIdx(-1); setCurrentTime(0)
   }, [initial])
 
-  // Fetch the clip's transcript when editor opens
+  // Fetch the clip's transcript when editor opens.
+  // If the clip has no srt yet (ingestion couldn't transcribe), auto-trigger a per-clip
+  // on-demand transcription via POST /api/clips/:id/transcribe (Groq Whisper on the local MP4).
   useEffect(() => {
     if (!clip?.id) return
     let cancelled = false
     setTranscriptLoading(true)
-    fetch(`/api/clips/${clip.id}/transcript`)
-      .then(r => r.json())
-      .then(d => { if (!cancelled) setActiveCaptionTrack(Array.isArray(d.segments) ? d.segments : []) })
-      .catch(() => {})
-      .finally(() => { if (!cancelled) setTranscriptLoading(false) })
+    ;(async () => {
+      try {
+        let r = await fetch(`/api/clips/${clip.id}/transcript`)
+        let d = await r.json()
+        if (cancelled) return
+        // If transcript is empty, trigger on-demand generation, then refetch
+        if ((!d.has_srt || !d.segments?.length) && clip.storage_url_mp4?.startsWith('/api/files/')) {
+          toast.info('🎙️ Generating transcript…', { description: 'Transcribing this clip with Whisper — this takes a few seconds.' })
+          const gen = await fetch(`/api/clips/${clip.id}/transcribe`, { method: 'POST' })
+          const genData = await gen.json().catch(() => ({}))
+          if (cancelled) return
+          if (gen.ok && genData.ok) {
+            toast.success(`✅ Transcript ready · ${genData.segments_count || '?'} segments`)
+            r = await fetch(`/api/clips/${clip.id}/transcript`)
+            d = await r.json()
+          } else if (genData.error) {
+            toast.error('Transcription failed', { description: genData.hint || genData.error })
+          }
+        }
+        if (!cancelled) setActiveCaptionTrack(Array.isArray(d.segments) ? d.segments : [])
+      } catch (e) {
+        if (!cancelled) console.warn('Load transcript failed:', e.message)
+      } finally {
+        if (!cancelled) setTranscriptLoading(false)
+      }
+    })()
     return () => { cancelled = true }
-  }, [clip?.id])
+  }, [clip?.id, clip?.storage_url_mp4])
 
   // Probe actual MP4 duration from the video element once metadata loads
   useEffect(() => {
