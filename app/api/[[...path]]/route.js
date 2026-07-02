@@ -1526,6 +1526,9 @@ ${eventsBlock}
           if (fillMode === 'crop') {
             vfilters.push(`crop='min(iw\\,ih*${aw}/${ah})':'min(ih\\,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2`)
             vfilters.push(`scale=${targetW}:${targetH}:flags=lanczos`)
+            // Subtle unsharp mask — sharpens edges after upscaling without adding grain.
+            // Params: luma_msize_x=3 luma_msize_y=3 luma_amount=0.5, chroma disabled (0.0).
+            vfilters.push(`unsharp=3:3:0.5:3:3:0.0`)
           } else if (fillMode === 'blur') {
             // Build via filter_complex: [main] = scaled-to-fit; [bg] = scaled-to-cover + boxblur; overlay center.
             // foreground is letterboxed; background is the blurred full-bleed of the original.
@@ -1533,18 +1536,20 @@ ${eventsBlock}
             fc.push(`[0:v]split=2[v0][v1]`)
             // background: scale to cover, then strong blur
             fc.push(`[v0]scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH},boxblur=luma_radius=30:luma_power=2,setsar=1[bg]`)
-            // foreground: scale to fit inside target frame
-            fc.push(`[v1]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,setsar=1[fg]`)
+            // foreground: scale to fit inside target frame, then subtle unsharp for crisp faces/text
+            fc.push(`[v1]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,unsharp=3:3:0.5:3:3:0.0,setsar=1[fg]`)
             fc.push(`[bg][fg]overlay=(W-w)/2:(H-h)/2[out]`)
             filterComplex = fc.join(';')
             useFilterComplex = true
           } else if (fillMode === 'color') {
             // Letterbox / pillarbox with a solid color bar.
             vfilters.push(`scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`)
+            vfilters.push(`unsharp=3:3:0.5:3:3:0.0`)
             vfilters.push(`pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:color=${fillColor}`)
           }
         } else {
           vfilters.push(`scale='min(iw,1080)':'-2':flags=lanczos`)
+          vfilters.push(`unsharp=3:3:0.5:3:3:0.0`)
         }
         if (speed !== 1.0) {
           vfilters.push(`setpts=PTS/${speed}`)
@@ -1622,13 +1627,16 @@ ${eventsBlock}
         if (speed !== 1.0) {
           args.push('-filter:a', `atempo=${speed}`)
         }
-        // HD encoding tuned for SPEED — preset 'veryfast' + CRF 21 gives ~visually-transparent quality
-        // at 2–3× the encode speed of preset 'fast' and ~8× preset 'slow'. Necessary to stay safely under
-        // the upstream proxy/ingress timeout (~30–60s) for 30-second 1080×1920 clips on CPU-only containers.
-        // For users who want maximum quality, we can later add a "Quality" toggle.
-        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p',
+        // HD encoding: preset 'veryfast' + CRF 20 gives near-lossless visual quality (per Senior Backend Video Engineer spec)
+        // at ~2× the encode speed of preset 'medium'. Comfortable under proxy timeouts for 30–45s clips.
+        // -vsync cfr forces a constant frame rate so subtitle ASS timestamps stay perfectly in sync with the video track
+        // (avoids drift when the source has variable-frame-rate). -async 1 keeps audio timestamps aligned.
+        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
           '-tune', 'fastdecode', '-threads', '0',
-          '-maxrate', '8000k', '-bufsize', '12000k',
+          '-profile:v', 'high', '-level', '4.1',
+          '-g', '48', '-keyint_min', '48', '-sc_threshold', '0',  // 2s GOP for smooth seeking
+          '-maxrate', '10000k', '-bufsize', '15000k',
+          '-vsync', 'cfr', '-async', '1',
           '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
           '-movflags', '+faststart', tmpOut)
 
@@ -1738,11 +1746,13 @@ ${eventsBlock}
         const args = ['-y', '-ss', String(trimStart), '-to', String(trimEnd), '-i', localPath]
         if (cropAspect && /^\d+:\d+$/.test(cropAspect)) {
           const [aw, ah] = cropAspect.split(':').map(Number)
-          // crop to target aspect from center, then scale to nearest even pixel
-          const cropExpr = `crop='min(iw,ih*${aw}/${ah})':'min(ih,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2,scale=trunc(iw/2)*2:trunc(ih/2)*2`
+          // crop to target aspect from center, apply subtle unsharp for crispness, then align to even pixels
+          const cropExpr = `crop='min(iw,ih*${aw}/${ah})':'min(ih,iw*${ah}/${aw})':(iw-out_w)/2:(ih-out_h)/2,unsharp=3:3:0.5:3:3:0.0,scale=trunc(iw/2)*2:trunc(ih/2)*2`
           args.push('-vf', cropExpr)
         }
-        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmpOut)
+        args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+          '-vsync', 'cfr', '-async', '1',
+          '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', tmpOut)
         await new Promise((resolve, reject) => {
           const p = spawn('/usr/bin/ffmpeg', args)
           let stderr = ''
