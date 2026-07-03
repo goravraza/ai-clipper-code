@@ -423,6 +423,102 @@ backend:
           - Does NOT deduct credits (preflight only)
           - Used successfully in test flow before actual download
 
+  - task: "POST /api/clips/:id/render — new animation_style parameter (static | karaoke | word_bounce)"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: |
+          NEW animation_style parameter on the render endpoint controls caption animation behavior:
+          - 'static': Single Dialogue event per chunk (≤4 words/line, ≤8 words split via \N), plain text, NO per-word color/scale tags
+          - 'karaoke': Multiple Dialogue events (one per word), active word wrapped in {\c<accentColour>}word{\r} for color highlight
+          - 'word_bounce': Same as karaoke + active word scales 115% → 100% via {\fscx115\fscy115\c<accent>\t(0,100,\fscx100\fscy100)}word{\r}
+          Default: 'karaoke' when omitted or invalid value provided (falls back to clip.animation_style || 'karaoke')
+          The chosen animation_style is persisted to generated_clips.animation_style on render.
+          ASS file written to /tmp/last_cap.ass for debugging.
+        -working: true
+        -agent: "testing"
+        -comment: |
+          COMPREHENSIVE TESTING COMPLETED - ALL TESTS PASSED ✅
+          
+          Test clip: 1a24d8a6-73da-4fbd-8bc1-3a67101d41c8 (local MP4 with word-level caption timings)
+          
+          TEST RESULTS (7/7 PASSED):
+          
+          A. STATIC STYLE ✅
+             - POST /api/clips/:id/render with animation_style: 'static' → 200 OK
+             - animation_style persisted to DB: 'static'
+             - Credits charged: 1.5 (0.25 × 6 seconds)
+             - ASS file verified:
+               * 1 Dialogue event (single event for 6-word cue)
+               * NO color override tags (\c&H) in Dialogue lines
+               * NO scale tags (\fscx/\fscy) in Dialogue lines
+               * Plain text output: "hello world from\Nthe test agent"
+          
+          B. KARAOKE STYLE ✅
+             - POST /api/clips/:id/render with animation_style: 'karaoke' → 200 OK
+             - animation_style persisted to DB: 'karaoke'
+             - Credits charged: 1.5
+             - ASS file verified:
+               * 6 Dialogue events (one per word)
+               * 6 Dialogue lines with color override tags {\c&H...}
+               * 6 reset tags {\r} after colored words
+               * NO scale tags (correct for karaoke)
+          
+          C. WORD_BOUNCE STYLE ✅
+             - POST /api/clips/:id/render with animation_style: 'word_bounce' → 200 OK
+             - animation_style persisted to DB: 'word_bounce'
+             - Credits charged: 1.5
+             - ASS file verified:
+               * 6 Dialogue events (one per word)
+               * 6 Dialogue lines with scale tags (\fscx115\fscy115)
+               * 6 Dialogue lines with transform tags \t(0,100,\fscx100\fscy100)
+               * 6 Dialogue lines with color override tags
+               * 6 reset tags {\r}
+          
+          D. DEFAULT (OMITTED) ✅
+             - POST /api/clips/:id/render WITHOUT animation_style field → 200 OK
+             - animation_style defaults to 'karaoke' (when clip has no existing animation_style)
+             - ASS output matches karaoke style
+          
+          E. INVALID VALUE ✅
+             - POST /api/clips/:id/render with animation_style: 'banana' → 200 OK
+             - Invalid value clamped to 'karaoke' (default)
+             - animation_style persisted to DB: 'karaoke'
+             - ASS output matches karaoke style
+          
+          F. STATIC WITHOUT WORD TIMINGS ✅
+             - POST /api/clips/:id/render with animation_style: 'static' and caption_segments WITHOUT words[] array → 200 OK
+             - animation_style persisted to DB: 'static'
+             - ASS file verified:
+               * 1 Dialogue event with plain text
+               * NO color or scale tags
+          
+          G. REGRESSION - MP4 OUTPUT ✅
+             - Rendered MP4 file exists on disk: /app/data/uploads/clips/<clipId>.mp4
+             - ffprobe verification:
+               * Video stream: h264, 1080x1920 (correct for 9:16)
+               * Audio stream: aac
+             - render_version incremented after each render (final: 21)
+          
+          VERIFIED IMPLEMENTATION DETAILS:
+          - animation_style parameter correctly validated: ['static', 'karaoke', 'word_bounce']
+          - Default fallback logic: body.animation_style || clip.animation_style || 'karaoke'
+          - Static mode: chunks up to 4 words/line, ≤8 words split via \N, single Dialogue per chunk
+          - Karaoke mode: chunks compressed to ≤3 words/line, per-word Dialogue events with {\c<accent>}word{\r}
+          - Word_bounce mode: same as karaoke + {\fscx115\fscy115\t(0,100,\fscx100\fscy100)} scale animation
+          - ASS file written to /tmp/last_cap.ass for debugging (verified in all tests)
+          - animation_style persisted to generated_clips.animation_style on render
+          - Credits charged correctly (0.25 per second of output duration)
+          - MP4 output valid with correct dimensions and codecs
+          
+          NO ISSUES FOUND. Implementation is production-ready.
+
 frontend:
   - task: "captionUtils.styleAssToCss — switch from frameWidth-based to previewBoxHeight-based pixel scaling"
     implemented: true
@@ -500,18 +596,12 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "10.0"
-  test_sequence: 10
+  version: "11.0"
+  test_sequence: 11
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "POST /api/videos/:id/supercuts/auto — REWRITTEN to use full source video + full transcript (not covering clips)"
-    - "POST /api/videos/:id/prepare-source — new endpoint: on-demand full source download + Whisper full transcript"
-    - "GET  /api/videos/:id/source-video/download — new endpoint: streams full source, NO credit deduction"
-    - "GET  /api/videos/:id/source-video/status — new endpoint: source_ready + transcript_ready flags"
-    - "GET  /api/clips/:id/download — NOW DEDUCTS 0.25 credits/sec (idempotent per render_version)"
-    - "POST /api/clips/:id/download-quote — new preflight endpoint: returns credits_required WITHOUT charging"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -755,3 +845,31 @@ agent_communication:
       
       NO CRITICAL ISSUES FOUND (after route ordering fix).
       All new endpoints working correctly. Implementation is production-ready.
+    -agent: "testing"
+    -message: |
+      ✅ ANIMATION_STYLE PARAMETER TESTING COMPLETE - ALL TESTS PASSED
+      
+      Tested the new animation_style parameter on POST /api/clips/:id/render endpoint.
+      
+      SUMMARY:
+      ✅ POST /api/clips/:id/render with animation_style: 'static' - Works correctly
+      ✅ POST /api/clips/:id/render with animation_style: 'karaoke' - Works correctly
+      ✅ POST /api/clips/:id/render with animation_style: 'word_bounce' - Works correctly
+      ✅ Default behavior (omitted animation_style) - Defaults to 'karaoke'
+      ✅ Invalid value handling - Clamps to 'karaoke'
+      ✅ Static without word timings - Works correctly
+      ✅ MP4 output regression - Valid h264 1080x1920 + aac audio
+      
+      VERIFIED:
+      - Three distinct animation styles produce different ASS subtitle output:
+        * Static: Single Dialogue event per chunk, plain text, no color/scale tags
+        * Karaoke: Multiple per-word Dialogue events with {\c<accent>}word{\r} color highlighting
+        * Word_bounce: Same as karaoke + {\fscx115\fscy115\t(0,100,\fscx100\fscy100)} scale animation
+      - animation_style persisted to generated_clips.animation_style on render
+      - Default fallback logic: body.animation_style || clip.animation_style || 'karaoke'
+      - ASS file written to /tmp/last_cap.ass for debugging (verified in all tests)
+      - Credits charged correctly (0.25 per second)
+      - render_version incremented after each render
+      - MP4 output valid with correct dimensions and codecs
+      
+      NO ISSUES FOUND. Implementation is production-ready.

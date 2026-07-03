@@ -1680,6 +1680,13 @@ ${transcriptListing}`
             return `${hh}:${mm}:${ss}.${cs}`
           }
           const MAX_WORDS_PER_LINE = 4
+          // Animation style controls the on-screen behaviour of each cue:
+          //   'static'       → single Dialogue per cue, no per-word tags (fastest, cleanest)
+          //   'karaoke'      → per-word Dialogue events with the ACTIVE word colored in the accent color (default)
+          //   'word_bounce'  → same as karaoke + the active word scales 115% → 100% over ~100ms (voice-synced pulse)
+          const animationStyle = ['static', 'karaoke', 'word_bounce'].includes(body.animation_style) ? body.animation_style : 'karaoke'
+          // For animated styles we compress chunks to ≤3 words so the active-word highlight has room to breathe
+          const wordsPerLine = animationStyle === 'static' ? MAX_WORDS_PER_LINE : 3
           // Chunked cues carry through the ORIGINAL cue's `words` array (word-level timing) if the
           // upstream transcriber provided it. This is needed to emit karaoke-style word highlighting.
           const chunked = []
@@ -1689,23 +1696,33 @@ ${transcriptListing}`
             const words = text.split(/\s+/)
             // Word-level timings, if any. Shape: [{start, end, text}]. Timings are in the SAME frame as `c.start/end`.
             const wordTimings = Array.isArray(c.words) ? c.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end)) : []
-            if (words.length <= MAX_WORDS_PER_LINE) {
+            if (words.length <= wordsPerLine) {
               chunked.push({ start: c.start, end: c.end, text, words: wordTimings })
-            } else if (words.length <= MAX_WORDS_PER_LINE * 2) {
+            } else if (words.length <= wordsPerLine * 2 && animationStyle === 'static') {
+              // Static mode allows a 2-line \N chunk (up to 8 words on screen at once)
               const half = Math.ceil(words.length / 2)
-              // Use literal \N for ASS line break inside Dialogue text
               chunked.push({ start: c.start, end: c.end, text: words.slice(0, half).join(' ') + '\\N' + words.slice(half).join(' '), words: wordTimings })
             } else {
-              const numChunks = Math.ceil(words.length / MAX_WORDS_PER_LINE)
-              const per = (c.end - c.start) / numChunks
+              // Otherwise: split into sequential chunks of `wordsPerLine` — driven by word timings when available
+              // so each chunk gets an accurate start/end (not a naive linear time distribution).
+              const numChunks = Math.ceil(words.length / wordsPerLine)
               for (let k = 0; k < numChunks; k++) {
-                const slice = words.slice(k * MAX_WORDS_PER_LINE, (k + 1) * MAX_WORDS_PER_LINE).join(' ')
-                if (slice) {
-                  const chunkStart = c.start + k * per
-                  const chunkEnd = c.start + (k + 1) * per
-                  const chunkWords = wordTimings.filter(w => w.start >= chunkStart - 0.05 && w.end <= chunkEnd + 0.05)
-                  chunked.push({ start: chunkStart, end: chunkEnd, text: slice, words: chunkWords })
+                const slice = words.slice(k * wordsPerLine, (k + 1) * wordsPerLine).join(' ')
+                if (!slice) continue
+                let chunkStart, chunkEnd, chunkWords
+                if (wordTimings.length >= words.length) {
+                  // Prefer word-timing-driven bounds
+                  const first = wordTimings[k * wordsPerLine]
+                  const last = wordTimings[Math.min(wordTimings.length - 1, (k + 1) * wordsPerLine - 1)]
+                  chunkStart = first?.start ?? (c.start + k * ((c.end - c.start) / numChunks))
+                  chunkEnd = last?.end ?? (c.start + (k + 1) * ((c.end - c.start) / numChunks))
+                } else {
+                  const per = (c.end - c.start) / numChunks
+                  chunkStart = c.start + k * per
+                  chunkEnd = c.start + (k + 1) * per
                 }
+                chunkWords = wordTimings.filter(w => w.start >= chunkStart - 0.05 && w.end <= chunkEnd + 0.05)
+                chunked.push({ start: chunkStart, end: chunkEnd, text: slice, words: chunkWords })
               }
             }
           }
@@ -1760,14 +1777,18 @@ ${transcriptListing}`
           // emit one Dialogue line PER active word window. Each line renders the FULL cue text with
           // one word colored in the accent color (default yellow) so the "spoken word" pulses through.
           // If no word timings are available, we fall back to a single Dialogue per cue.
-          const wordHighlight = body.word_highlight !== false // default ON when word timings exist
+          // ANIMATION STYLE:
+          //   static      → single Dialogue per cue, plain text (no per-word events)
+          //   karaoke     → per-word events, active word in accent color
+          //   word_bounce → same as karaoke + active word scales 115% → 100% over ~100ms via \t()
+          const wordHighlight = body.word_highlight !== false && animationStyle !== 'static'
           const events = []
           for (const c of chunked) {
             const usableWords = wordHighlight && Array.isArray(c.words) && c.words.length > 0
               ? c.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start && w.end > c.start && w.start < c.end)
               : []
             if (usableWords.length === 0) {
-              // No word timings → single static cue
+              // No word timings OR static mode → single static cue for this chunk
               events.push(`Dialogue: 0,${fmt(c.start)},${fmt(c.end)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${c.text}`)
               continue
             }
@@ -1784,7 +1805,7 @@ ${transcriptListing}`
             }
             const timedWords = usableWords.slice(0, wordTokenIndices.length)
             // For each timed word, emit a Dialogue line covering that word's time window.
-            // The active word gets accent color + slight bold outline; other words stay primary.
+            // The active word gets accent color (+ optional bounce transform) — other words stay in primary color.
             let prevEnd = c.start
             for (let wi = 0; wi < timedWords.length; wi++) {
               const w = timedWords[wi]
@@ -1801,12 +1822,21 @@ ${transcriptListing}`
               // wrapping the active word ONLY. We only change PrimaryColour (\c) — NOT the outline
               // (\3c) — because with BorderStyle=3 the "outline" is the box padding and changing its
               // color would draw a giant accent-colored box over the word text.
+              // For 'word_bounce': also add an instantaneous scale-up (fscx/fscy 115) with a \t()
+              // transform back to 100% over the first 100ms of the event — this is the voice-synced pulse.
               const parts = []
               for (let ti = 0; ti < cueTextTokens.length; ti++) {
                 const tok = cueTextTokens[ti]
                 if (ti === activeIdx) {
                   // Accent text color, then \r resets to Default style for the rest.
-                  parts.push(`{\\c${accentColour}}${tok}{\\r}`)
+                  if (animationStyle === 'word_bounce') {
+                    // {\fscx115\fscy115\c<accent>\t(0,100,\fscx100\fscy100\1a&HFF&\1a&H00&)}word{\r}
+                    // We rely on \t(t1,t2,tags) — libass animates fscx/fscy linearly from current → target
+                    // between t1 and t2 milliseconds relative to the dialogue start.
+                    parts.push(`{\\fscx115\\fscy115\\c${accentColour}\\t(0,100,\\fscx100\\fscy100)}${tok}{\\r}`)
+                  } else {
+                    parts.push(`{\\c${accentColour}}${tok}{\\r}`)
+                  }
                 } else {
                   parts.push(tok)
                 }
@@ -2076,6 +2106,7 @@ ${eventsBlock}
           logo_x_percent: logoX, logo_y_percent: logoY, logo_scale_percent: logoScale,
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
           template_id: templateId,
+          animation_style: ['static','karaoke','word_bounce'].includes(body.animation_style) ? body.animation_style : (clip.animation_style || 'karaoke'),
           last_rendered_at: new Date(),
           render_version: (clip.render_version || 0) + 1,
           overlays_config: { ...(clip.overlays_config || {}), caption: { ...(clip.overlays_config?.caption || {}), position_percent: captionPos } },
