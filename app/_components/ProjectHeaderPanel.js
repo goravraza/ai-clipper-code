@@ -89,15 +89,19 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
     finally { setGeneratingChapters(false) }
   }
 
-  const downloadFull = () => {
-    // The source video isn't stored on disk (we cut only individual clip segments) — the fastest way to
-    // let the user get the ORIGINAL video is to open the source page (YouTube/TikTok/etc) in a new tab
-    // where they can use the platform's native download or a browser extension.
-    if (project?.original_url) {
-      window.open(project.original_url, '_blank', 'noopener,noreferrer')
-    } else {
-      toast.info('Source URL not available for this project')
+  const downloadFull = async () => {
+    // Since we don't retain the source video (only per-clip segments), download the highest-virality clip.
+    // Uses an anchor element with the `download` attribute + a helper endpoint that sets Content-Disposition.
+    const top = [...(projClips || [])].sort((a,b) => (b.virality_score||0) - (a.virality_score||0))[0]
+    if (!top?.storage_url_mp4) {
+      toast.info('No clips available to download yet — generate clips first.')
+      return
     }
+    const a = document.createElement('a')
+    a.href = `${top.storage_url_mp4}${top.storage_url_mp4.includes('?') ? '&' : '?'}download=1`
+    a.download = `${(project?.title || 'clip').replace(/[^\w\-]+/g,'_').slice(0,60)}.mp4`
+    document.body.appendChild(a); a.click(); document.body.removeChild(a)
+    toast.success('Download started', { description: 'Downloading the top clip from this project.' })
   }
 
   // Load the video transcript for the Cut & Clip → Transcript sub-tab.
@@ -318,24 +322,31 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
   )
 }
 
-// Supercut sub-view — shown when the user clicks "Create Supercut"
-export function SupercutView({ project, onBack }) {
-  const [supercuts, setSupercuts] = useState([])
+// Supercut sub-view — shown when the user clicks "Create Supercut".
+// New behavior (2026): supercuts are now generated_clips rows (is_supercut=true) so the parent
+// renders them with the same <ClipCard/> as normal clips (opens ClipEditor on click, trim/re-render, etc.).
+// This component just provides the layout scaffold + the "Generate More Supercuts" button.
+export function SupercutView({ project, supercutClips = [], onBack, onGenerated, children }) {
   const [generating, setGenerating] = useState(false)
-
-  useEffect(() => {
-    if (!project?.id) return
-    fetch(`/api/videos/${project.id}/supercuts`).then(r => r.json()).then(d => setSupercuts(Array.isArray(d?.supercuts) ? d.supercuts : [])).catch(() => {})
-  }, [project?.id])
 
   const generate = async () => {
     setGenerating(true)
+    toast.info('AI is scanning your transcript for the best narratives…', { description: 'This can take 30-90 seconds — we ffmpeg-extract each segment and stitch them.' })
     try {
       const r = await fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
       const d = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(d.error || 'Failed')
-      toast.success(`Supercut queued · ${d.segments || 0} segments will be stitched`)
-      setSupercuts(prev => [d.supercut, ...prev])
+      if (!r.ok) {
+        if (r.status === 402) {
+          toast.error(`Insufficient credits`, { description: `Need ${(d.credits_required||0).toFixed(2)}, have ${(d.credits_available||0).toFixed(2)}.` })
+        } else {
+          throw new Error(d.error || 'Failed')
+        }
+        return
+      }
+      toast.success(`${d.count || 0} supercut${d.count === 1 ? '' : 's'} generated · ${(d.credits_used || 0).toFixed(2)} credits used`, {
+        description: `${d.segments || 0} narrative segments stitched · click any card to edit`,
+      })
+      onGenerated?.(d.supercuts || [])
     } catch (e) { toast.error('Supercut failed', { description: e.message }) }
     finally { setGenerating(false) }
   }
@@ -347,37 +358,29 @@ export function SupercutView({ project, onBack }) {
       </div>
       <Card className="p-4 space-y-3 mb-4">
         <div className="text-sm font-semibold">{project?.title || 'Project'}</div>
-        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 flex items-center gap-2 text-xs text-muted-foreground">
-          <Info className="h-3.5 w-3.5" />
-          A supercut is your video&apos;s best moments, stitched together by theme into one short clip.
+        <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 flex items-start gap-2 text-xs text-muted-foreground">
+          <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+          <span>A supercut stitches multiple non-contiguous moments from your source video into one 30–120s narrative clip. AI picks the best segments and matches them for natural flow. Each supercut opens in the editor for further trimming.</span>
         </div>
       </Card>
       <div className="flex items-center justify-between mb-3">
-        <div className="text-sm"><span className="font-semibold">Supercuts</span> <span className="text-muted-foreground">{supercuts.length}</span></div>
+        <div className="text-sm"><span className="font-semibold">Supercuts</span> <span className="text-muted-foreground">{supercutClips.length}</span></div>
         <Button size="sm" onClick={generate} disabled={generating} className="gap-2">
           {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-          Find More
+          {generating ? 'Generating…' : (supercutClips.length ? 'Generate More' : 'Generate Supercuts')}
         </Button>
       </div>
-      {supercuts.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-border py-10 text-center">
-          <Loader2 className="h-5 w-5 mx-auto mb-2 text-muted-foreground animate-spin" />
-          <div className="text-sm text-muted-foreground">Your video has hidden gems…</div>
-          <div className="text-xs text-muted-foreground mt-1">Click <b>Find More</b> to have AI stitch your top moments.</div>
+      {supercutClips.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border py-14 text-center">
+          <Sparkles className="h-6 w-6 mx-auto mb-2 text-muted-foreground" />
+          <div className="text-sm font-medium">No supercuts yet</div>
+          <div className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">
+            Click <b>Generate Supercuts</b> — AI will find 2-3 multi-segment narratives from your source video and stitch them into 30-120s clips.
+          </div>
         </div>
       ) : (
         <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
-          {supercuts.map((s) => (
-            <Card key={s.id} className="overflow-hidden">
-              {s.storage_url_mp4 && (
-                <video src={s.storage_url_mp4} controls controlsList="nodownload" disablePictureInPicture className="w-full aspect-[9/16] object-cover bg-black" />
-              )}
-              <div className="p-3">
-                <div className="text-sm font-semibold line-clamp-2">{s.title || 'Supercut'}</div>
-                <div className="text-xs text-muted-foreground mt-1">{s.status || 'ready'} · {s.duration ? fmtDuration(s.duration) : '—'}</div>
-              </div>
-            </Card>
-          ))}
+          {children}
         </div>
       )}
     </div>

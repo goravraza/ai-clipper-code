@@ -741,12 +741,41 @@ export default function HomePage() {
               {/* DRILLED-IN PROJECT — show breadcrumb + header + its clips (or supercut view) */}
               {clipsView === 'projects' && activeProjectId && (() => {
                 const proj = projects.find(p => p.id === activeProjectId)
-                const projClips = activeProjectId === '__unsorted__'
+                const projClipsAll = activeProjectId === '__unsorted__'
                   ? clips.filter(c => !c.video_id || !projects.some(p => p.id === c.video_id && !p.is_virtual))
                   : clips.filter(c => c.video_id === activeProjectId)
-                // If user clicked "Create Supercut" — render the SupercutView instead of the clip grid.
+                // Split into normal clips (shown in main grid) vs supercuts (shown in SupercutView)
+                const projClips = projClipsAll.filter(c => !c.is_supercut)
+                const projSupercuts = projClipsAll.filter(c => c.is_supercut)
+                // Reusable renderer for a ClipCard (used in both normal grid and SupercutView)
+                const renderClipCard = (clip) => (
+                  <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                    onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
+                    onEdit={(c) => setEditorClip(c)}
+                    onRestyle={(c) => {
+                      setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
+                      setPendingSubmit(() => (config) => submitRestyle(c, config))
+                      setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
+                      setWizardMode('restyle')
+                      setWizardOpen(true)
+                    }} />
+                )
+                // If user clicked "Create Supercut" — render the SupercutView with the supercut clip cards as children.
                 if (supercutProjectId === activeProjectId) {
-                  return <SupercutView project={proj} onBack={() => setSupercutProjectId(null)} />
+                  return (
+                    <SupercutView
+                      project={proj}
+                      supercutClips={projSupercuts}
+                      onBack={() => setSupercutProjectId(null)}
+                      onGenerated={async () => {
+                        // Refresh the clips list so new supercuts appear
+                        const cl = await fetch('/api/clips').then(r => r.json()).catch(() => [])
+                        setClips(Array.isArray(cl) ? cl : [])
+                      }}
+                    >
+                      {projSupercuts.map(renderClipCard)}
+                    </SupercutView>
+                  )
                 }
                 // Estimate the source video duration from the widest clip end time (used by TimeSpinner clamp).
                 const videoDurationSec = projClips.reduce((mx, c) => Math.max(mx, Number(c.end_time_seconds) || 0), 0) || 3600
@@ -799,18 +828,7 @@ export default function HomePage() {
                       </div>
                     ) : (
                       <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                        {projClips.map((clip) => (
-                          <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
-                            onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
-                            onEdit={(c) => setEditorClip(c)}
-                            onRestyle={(c) => {
-                              setWizardPayload({ type: 'file', title: c.clip_title, fileBlobUrl: c.storage_url_mp4, duration: c.end_time_seconds - c.start_time_seconds })
-                              setPendingSubmit(() => (config) => submitRestyle(c, config))
-                              setWizardInitialConfig({ style_preset: c.style_preset, overlays_config: c.overlays_config, language: c.language || 'auto', font_size: c.style_ass?.fontSize, outline_size: c.style_ass?.outline })
-                              setWizardMode('restyle')
-                              setWizardOpen(true)
-                            }} />
-                        ))}
+                        {projClips.map(renderClipCard)}
                       </div>
                     )}
                   </div>
