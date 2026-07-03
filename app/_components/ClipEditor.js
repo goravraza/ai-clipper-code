@@ -539,8 +539,45 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
               {/* INTERACTIVE ACTIVE CAPTION OVERLAY — bounding box with corner handles */}
               {(() => {
                 const activeCue = activeCueIdx >= 0 ? activeCaptionTrack[activeCueIdx] : null
-                const displayCue = activeCue || (activeCaptionTrack[0] ? { ...activeCaptionTrack[0], _ghost: true } : { text: 'Sample caption preview', _ghost: true, _idx: -1 })
-                const displayText = chunkForLine(displayCue.text || '', 4)
+                const displayCueRaw = activeCue || (activeCaptionTrack[0] ? { ...activeCaptionTrack[0], _ghost: true } : { text: 'Sample caption preview', _ghost: true, _idx: -1 })
+                // MIRROR BACKEND CHUNKING: for animated modes (karaoke / word_bounce) the backend splits every
+                // cue into ≤3-word micro-chunks and emits one Dialogue per word. The preview must reflect the
+                // SAME chunking or supercut cues (which can be 6-10 words long) look wrong.
+                const anim = state.animation_style || 'karaoke'
+                const wordsPerLine = anim === 'static' ? 4 : 3
+                const displayCue = (() => {
+                  const raw = displayCueRaw
+                  const cueText = String(raw.text || '').trim()
+                  if (!cueText) return raw
+                  const wordsArr = cueText.split(/\s+/).filter(Boolean)
+                  if (wordsArr.length <= wordsPerLine) return raw
+                  // Derive per-word timings for the whole cue so we can locate the right micro-chunk
+                  const cueStart = Number(raw.start) || 0
+                  const cueEnd = Number(raw.end) || (cueStart + Math.max(0.5, wordsArr.length * 0.3))
+                  const totalDur = Math.max(0.05, cueEnd - cueStart)
+                  const MIN_WORD_MS = 0.25
+                  const evenPer = totalDur / wordsArr.length
+                  const perWord = evenPer >= MIN_WORD_MS ? evenPer : MIN_WORD_MS
+                  let wordTimings = Array.isArray(raw.words) && raw.words.length >= wordsArr.length
+                    ? raw.words.slice(0, wordsArr.length).map((w, i) => ({ start: Number(w.start) || (cueStart + i * perWord), end: Number(w.end) || (cueStart + (i + 1) * perWord) }))
+                    : wordsArr.map((_, i) => ({ start: cueStart + i * perWord, end: cueStart + (i + 1) * perWord }))
+                  // Pick the micro-chunk covering currentTime; default to chunk 0 for ghost/paused state
+                  const numChunks = Math.ceil(wordsArr.length / wordsPerLine)
+                  let ci = 0
+                  if (!raw._ghost) {
+                    for (let k = 0; k < numChunks; k++) {
+                      const s = wordTimings[k * wordsPerLine]?.start ?? (cueStart + k * (totalDur / numChunks))
+                      const e = wordTimings[Math.min(wordsArr.length - 1, (k + 1) * wordsPerLine - 1)]?.end ?? (cueStart + (k + 1) * (totalDur / numChunks))
+                      if (currentTime >= s - 0.05 && currentTime <= e + 0.05) { ci = k; break }
+                    }
+                  }
+                  const slice = wordsArr.slice(ci * wordsPerLine, (ci + 1) * wordsPerLine)
+                  const sliceStart = wordTimings[ci * wordsPerLine]?.start ?? cueStart
+                  const sliceEnd = wordTimings[Math.min(wordsArr.length - 1, (ci + 1) * wordsPerLine - 1)]?.end ?? cueEnd
+                  const sliceWords = Array.isArray(raw.words) ? raw.words.slice(ci * wordsPerLine, (ci + 1) * wordsPerLine) : []
+                  return { ...raw, text: slice.join(' '), start: sliceStart, end: sliceEnd, words: sliceWords }
+                })()
+                const displayText = chunkForLine(displayCue.text || '', wordsPerLine)
                 const cssStyle = styleAssToCss({
                   styleAss: state.style_ass,
                   fontSize: state.font_size,
