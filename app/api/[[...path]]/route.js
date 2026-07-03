@@ -1790,15 +1790,33 @@ ${transcriptListing}`
             // FALLBACK: word-level timings missing (Hindi/CJK Whisper sometimes returns only segment-level times).
             // Synthesize word bounds by evenly distributing the cue duration across its visible words. Without this,
             // the karaoke/word_bounce animations degrade to a single static Dialogue — no highlight visible.
+            //
+            // ANTI-FLICKER: Whisper's phrase timestamps are often TIGHT (e.g. 3 words in 0.42s = 140ms/word which
+            // reads as strobe-flicker). We enforce a minimum per-word display duration of ~250ms by stretching
+            // the last word to hold until the cue ends — better to slightly overlap the next cue than to strobe.
             if (usableWords.length === 0 && wordHighlight) {
               const tokens = String(c.text || '').replace(/\\N/g, ' ').split(/\s+/).filter(Boolean)
               if (tokens.length >= 1) {
-                const per = (c.end - c.start) / Math.max(1, tokens.length)
-                usableWords = tokens.map((tok, i) => ({
-                  start: c.start + i * per,
-                  end: c.start + (i + 1) * per,
-                  text: tok,
-                }))
+                const totalDur = Math.max(0.05, c.end - c.start)
+                const MIN_WORD_MS = 0.25   // ≥250ms per word — prevents strobing on Whisper's tight phrase timings
+                // Ideal even split
+                const evenPer = totalDur / tokens.length
+                if (evenPer >= MIN_WORD_MS || tokens.length === 1) {
+                  const per = evenPer
+                  usableWords = tokens.map((tok, i) => ({
+                    start: c.start + i * per,
+                    end: c.start + (i + 1) * per,
+                    text: tok,
+                  }))
+                } else {
+                  // Not enough time — give each word MIN_WORD_MS and let the highlight lag the audio slightly.
+                  // Last word extends to the cue end (may bleed slightly into next cue but reads much better).
+                  usableWords = tokens.map((tok, i) => {
+                    const s = c.start + i * MIN_WORD_MS
+                    const e = i === tokens.length - 1 ? Math.max(s + MIN_WORD_MS, c.end) : s + MIN_WORD_MS
+                    return { start: s, end: e, text: tok }
+                  })
+                }
               }
             }
             if (usableWords.length === 0) {

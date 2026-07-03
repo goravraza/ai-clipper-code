@@ -625,8 +625,19 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                           if (wordTimings.length < tokens.length) {
                             const cueStart = Number(cue.start) || 0
                             const cueEnd = Number(cue.end) || (cueStart + Math.max(0.5, tokens.length * 0.3))
-                            const per = (cueEnd - cueStart) / tokens.length
-                            wordTimings = tokens.map((_, i) => ({ start: cueStart + i * per, end: cueStart + (i + 1) * per }))
+                            const totalDur = Math.max(0.05, cueEnd - cueStart)
+                            const MIN_WORD_MS = 0.25  // ≥250ms per word — anti-strobe on tight Whisper phrase times
+                            const evenPer = totalDur / tokens.length
+                            if (evenPer >= MIN_WORD_MS || tokens.length === 1) {
+                              const per = evenPer
+                              wordTimings = tokens.map((_, i) => ({ start: cueStart + i * per, end: cueStart + (i + 1) * per }))
+                            } else {
+                              wordTimings = tokens.map((_, i) => {
+                                const s = cueStart + i * MIN_WORD_MS
+                                const e = i === tokens.length - 1 ? Math.max(s + MIN_WORD_MS, cueEnd) : s + MIN_WORD_MS
+                                return { start: s, end: e }
+                              })
+                            }
                           }
                           // Accent color (default yellow) from styleAss.accent_hex or #FFFF00
                           const accent = (state.style_ass && (state.style_ass.accent_hex || state.style_ass.accentHex)) || '#FFFF00'
@@ -642,14 +653,15 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                                   ? {
                                       color: accent,
                                       display: 'inline-block',
+                                      marginRight: i < tokens.length - 1 ? '0.35em' : 0,
                                       transform: anim === 'word_bounce' ? 'scale(1.15)' : 'none',
                                       transformOrigin: 'center',
                                       transition: 'transform 100ms cubic-bezier(0.34, 1.56, 0.64, 1)',
                                     }
-                                  : { display: 'inline-block' }
+                                  : { display: 'inline-block', marginRight: i < tokens.length - 1 ? '0.35em' : 0 }
                                 return (
                                   <span key={i} style={style}>
-                                    {tok}{i < tokens.length - 1 ? ' ' : ''}
+                                    {tok}
                                   </span>
                                 )
                               })}
