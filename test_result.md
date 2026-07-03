@@ -328,6 +328,28 @@ backend:
     file: "app/api/[[...path]]/route.js"
     stuck_count: 0
     priority: "high"
+    -agent: "main"
+    -message: |
+      REWRITE 2: Full-source-based Supercut + credit-aware Downloads.
+
+      WHAT CHANGED:
+      1. Ingestion now persists the FULL SOURCE VIDEO to `/app/data/uploads/sources/<vid>.mp4` and the FULL WHISPER TRANSCRIPT to `videos_processed.full_transcript_segments` (word-level).
+      2. NEW endpoint `POST /api/videos/:id/prepare-source` — retroactive backfill for older projects.
+      3. NEW endpoint `GET /api/videos/:id/source-video/download` — streams the full source, NO credit charge.
+      4. NEW endpoint `GET /api/videos/:id/source-video/status` — { source_ready, transcript_ready }.
+      5. Supercut generator REWRITTEN — now uses full transcript to find beats and extracts DIRECTLY from source_video_path (no more "covering clip" hack that produced 6s supercuts).
+      6. `GET /api/clips/:id/download` now DEDUCTS 0.25 credits/sec, idempotent per render_version.
+      7. NEW endpoint `POST /api/clips/:id/download-quote` — preflight cost quote without charging.
+
+      Backend testing PASSED for all 9 test cases. Subagent also fixed a pre-existing route-ordering bug where the catch-all `GET /videos/:id` matched before specific `/videos/:id/*` routes.
+
+      FRONTEND WIRE-UP DONE:
+      - ProjectHeaderPanel "Download source video" icon → POST /prepare-source (if needed) → GET /source-video/download
+      - ProjectHeaderPanel SupercutView → auto-prepare source before generating; fire-and-poll for supercuts
+      - ClipCard "Get Clip" button → POST /download-quote → confirm dialog with credit cost → GET /download (charges + streams)
+
+      READY FOR USER VISUAL QA.
+
     needs_retesting: false
     status_history:
         -working: "NA"
