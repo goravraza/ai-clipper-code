@@ -1246,17 +1246,40 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
     toast.success(`Scheduled to ${platform.replace('_',' ')}`, { description: new Date(scheduledTime).toLocaleString() })
   }
 
-  function download() {
-    if (clip.storage_url_mp4 && clip.storage_url_mp4.startsWith('/api/files/')) {
-      // Use the dedicated /download endpoint which sets Content-Disposition: attachment
-      // so the browser actually downloads instead of opening the MP4 inline.
-      const a = document.createElement('a')
-      a.href = `/api/clips/${clip.id}/download`
-      a.download = `${clip.clip_title.replace(/[^a-z0-9]+/gi, '_')}.mp4`
-      document.body.appendChild(a); a.click(); a.remove()
-      toast.success('Downloading MP4', { description: clip.clip_title })
-    } else {
+  async function download() {
+    if (!clip.storage_url_mp4 || !clip.storage_url_mp4.startsWith('/api/files/')) {
       toast.error('This clip has no rendered MP4 yet', { description: 'Use a YouTube URL in the workspace to generate a real clip.' })
+      return
+    }
+    try {
+      // Preflight quote — checks credits WITHOUT charging
+      const q = await fetch(`/api/clips/${clip.id}/download-quote`, { method: 'POST' }).then(r => r.json())
+      if (q?.credits_required > 0) {
+        const ok = confirm(`Downloading this ${q.duration_seconds}s clip will use ${q.credits_required.toFixed(2)} credits (you have ${q.credits_available.toFixed(2)}). Continue?`)
+        if (!ok) return
+      }
+      // Actual download — server deducts credits and streams the file
+      const res = await fetch(`/api/clips/${clip.id}/download`)
+      if (!res.ok) {
+        if (res.status === 402) {
+          const d = await res.json().catch(() => ({}))
+          toast.error('Insufficient credits', { description: `Need ${(d.credits_required||0).toFixed(2)}, you have ${(d.credits_available||0).toFixed(2)}.` })
+          return
+        }
+        throw new Error(`Server returned ${res.status}`)
+      }
+      const charged = Number(res.headers.get('x-credits-charged') || 0)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${(clip.clip_title || 'clip').replace(/[^a-z0-9]+/gi, '_')}.mp4`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 30000)
+      if (charged > 0) toast.success(`Downloaded · ${charged.toFixed(2)} credits used`, { description: clip.clip_title })
+      else toast.success('Downloaded (no charge — already paid for this render)', { description: clip.clip_title })
+    } catch (e) {
+      toast.error('Download failed', { description: e.message })
     }
   }
 

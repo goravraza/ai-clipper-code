@@ -89,19 +89,35 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
     finally { setGeneratingChapters(false) }
   }
 
+  const [downloading, setDownloading] = useState(false)
   const downloadFull = async () => {
-    // Since we don't retain the source video (only per-clip segments), download the highest-virality clip.
-    // Uses an anchor element with the `download` attribute + a helper endpoint that sets Content-Disposition.
-    const top = [...(projClips || [])].sort((a,b) => (b.virality_score||0) - (a.virality_score||0))[0]
-    if (!top?.storage_url_mp4) {
-      toast.info('No clips available to download yet — generate clips first.')
-      return
+    // Downloads the FULL uploaded/ingested source video (NO credit deduction).
+    // If the server hasn't persisted the source yet (older projects) we first POST /prepare-source
+    // to fetch + save it — this can take 1-3 min for a 10-min video. We show a toast during the wait.
+    if (downloading) return
+    setDownloading(true)
+    try {
+      // Quick status check first
+      const statusRes = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+      if (!statusRes?.source_ready) {
+        toast.info('Preparing source video…', { description: 'Fetching the full uploaded/ingested video (this can take 1-3 min for older projects).' })
+        const prepRes = await fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' })
+        const prepData = await prepRes.json().catch(() => ({}))
+        if (!prepRes.ok || !prepData.source_ready) {
+          throw new Error(prepData.error || 'Could not prepare source video')
+        }
+      }
+      // Now trigger the actual download via the streaming endpoint
+      const a = document.createElement('a')
+      a.href = `/api/videos/${project.id}/source-video/download`
+      a.download = `${(project?.title || 'source').replace(/[^\w\-]+/g,'_').slice(0,60)}.mp4`
+      document.body.appendChild(a); a.click(); document.body.removeChild(a)
+      toast.success('Downloading full source video', { description: 'The original file is being sent to your browser.' })
+    } catch (e) {
+      toast.error('Could not download source video', { description: e.message })
+    } finally {
+      setDownloading(false)
     }
-    const a = document.createElement('a')
-    a.href = `${top.storage_url_mp4}${top.storage_url_mp4.includes('?') ? '&' : '?'}download=1`
-    a.download = `${(project?.title || 'clip').replace(/[^\w\-]+/g,'_').slice(0,60)}.mp4`
-    document.body.appendChild(a); a.click(); document.body.removeChild(a)
-    toast.success('Download started', { description: 'Downloading the top clip from this project.' })
   }
 
   // Load the video transcript for the Cut & Clip → Transcript sub-tab.
@@ -333,64 +349,78 @@ export function SupercutView({ project, supercutClips = [], onBack, onGenerated,
 
   const generate = async () => {
     setGenerating(true)
-    setPollingMsg('AI is scanning your transcript…')
+    setPollingMsg('Checking source video…')
     const baselineIds = new Set(supercutClips.map(c => c.id))
-    toast.info('AI is scanning your transcript for the best narratives…', { description: 'This can take 60–120 seconds — hang tight while we ffmpeg-extract each segment and stitch them.' })
 
-    // Fire the POST but DON'T wait for it (Cloudflare edge times out at 60s while the backend keeps running).
-    // Instead we start polling GET /supercuts every 5s for up to 5 minutes to detect new ones.
-    let postDone = false
-    let postResult = null
-    let postError = null
-    const postPromise = fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
-      .then(async r => {
-        postDone = true
-        const d = await r.json().catch(() => ({}))
-        if (!r.ok) postError = { status: r.status, body: d }
-        else postResult = d
-      })
-      .catch(e => { postDone = true; postError = { status: 0, body: { error: e.message } } })
+    try {
+      // Step 1: ensure source video + full transcript are ready
+      const status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+      if (!status?.source_ready || !status?.transcript_ready) {
+        setPollingMsg('Fetching + transcribing the full source video (may take 2-4 min the first time)…')
+        toast.info('Preparing source video + transcript…', { description: 'This one-time step downloads the full video and runs Whisper. It usually takes 1-4 min.' })
+        const prepRes = await fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' })
+        const prepData = await prepRes.json().catch(() => ({}))
+        if (!prepRes.ok || !prepData.source_ready || !prepData.transcript_ready) {
+          throw new Error(prepData.error || 'Could not prepare source video/transcript')
+        }
+      }
 
-    // Poll for new supercuts every 5s up to 60 polls (5 minutes)
-    let elapsed = 0
-    let found = false
-    for (let i = 0; i < 60 && !found; i++) {
-      await new Promise(r => setTimeout(r, 5000))
-      elapsed += 5
-      setPollingMsg(`Generating… ${elapsed}s (this typically takes 60–120s)`)
-      try {
-        const r = await fetch(`/api/videos/${project.id}/supercuts`)
-        const d = await r.json().catch(() => ({}))
-        const newOnes = (d.supercuts || []).filter(s => !baselineIds.has(s.id))
-        if (newOnes.length > 0) {
-          found = true
-          toast.success(`${newOnes.length} supercut${newOnes.length === 1 ? '' : 's'} generated`, {
-            description: 'Click any card to open it in the editor for further trimming.',
-          })
-          onGenerated?.(newOnes)
+      // Step 2: fire the supercut POST — fire-and-poll (Cloudflare edge times out at 60s while backend continues)
+      setPollingMsg('AI is scanning your transcript…')
+      toast.info('AI is scanning your full-video transcript…', { description: 'Picking 2-3 non-contiguous narratives to stitch into 30-120s clips.' })
+      let postError = null
+      const postPromise = fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
+        .then(async r => {
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) postError = { status: r.status, body: d }
+        })
+        .catch(e => { postError = { status: 0, body: { error: e.message } } })
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      void postPromise
+
+      // Step 3: poll GET /supercuts every 5s for up to 5 minutes
+      let elapsed = 0
+      let found = false
+      for (let i = 0; i < 60 && !found; i++) {
+        await new Promise(r => setTimeout(r, 5000))
+        elapsed += 5
+        setPollingMsg(`Generating… ${elapsed}s`)
+        try {
+          const r = await fetch(`/api/videos/${project.id}/supercuts`)
+          const d = await r.json().catch(() => ({}))
+          const newOnes = (d.supercuts || []).filter(s => !baselineIds.has(s.id))
+          if (newOnes.length > 0) {
+            found = true
+            toast.success(`${newOnes.length} supercut${newOnes.length === 1 ? '' : 's'} generated`, {
+              description: 'Click any card to open it in the ClipEditor for further trimming.',
+            })
+            onGenerated?.(newOnes)
+            break
+          }
+        } catch {}
+        if (postError) {
+          if (postError.status === 402) {
+            toast.error('Insufficient credits', {
+              description: `Need ${(postError.body?.credits_required || 0).toFixed(2)}, you have ${(postError.body?.credits_available || 0).toFixed(2)}.`,
+            })
+          } else if (postError.status === 428) {
+            toast.error('Source not ready', { description: 'Please retry — the source video was not persisted in time.' })
+          } else {
+            toast.error('Supercut failed', { description: postError.body?.error || 'Unknown error' })
+          }
           break
         }
-      } catch {}
-      // If POST resolved with an error (402 insufficient credits, 400 bad data, etc.), surface it immediately.
-      if (postDone && postError) {
-        if (postError.status === 402) {
-          toast.error('Insufficient credits', {
-            description: `Need ${(postError.body?.credits_required || 0).toFixed(2)}, you have ${(postError.body?.credits_available || 0).toFixed(2)}.`,
-          })
-        } else {
-          toast.error('Supercut failed', { description: postError.body?.error || 'Unknown error' })
-        }
-        break
       }
+      if (!found && !postError) {
+        toast.info('Still processing…', { description: 'Refresh the page in a minute to see new supercuts.' })
+      }
+    } catch (e) {
+      toast.error('Supercut generation failed', { description: e.message })
+    } finally {
+      setPollingMsg('')
+      setGenerating(false)
+      onGenerated?.([])
     }
-    if (!found && !postError) {
-      // Timed out but no error came back — probably still cooking on the server
-      toast.info('Still processing…', { description: 'The AI is taking longer than expected. Refresh the page in a minute to see new supercuts.' })
-    }
-    setPollingMsg('')
-    setGenerating(false)
-    // Best-effort refresh at the end
-    onGenerated?.([])
   }
 
   return (

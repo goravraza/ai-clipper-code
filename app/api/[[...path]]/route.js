@@ -518,11 +518,14 @@ async function handle(request, { params }) {
       return NextResponse.json({ supercuts: [...list.map(strip), ...legacy.map(strip)] })
     }
 
-    // POST /api/videos/:id/supercuts/auto — NEW multi-segment AI supercut.
-    // AI reads the full source transcript, picks 2-3 supercut narratives (each 30-120s, 3-6 non-contiguous segments),
-    // ffmpeg-extracts each sub-segment from its covering rendered clip, concats them into one MP4, and saves the
-    // result as a `generated_clips` doc with `is_supercut: true` so it opens in the ClipEditor for further trimming.
-    // Deducts 0.25 credits per output second (same rate as clip render).
+    // POST /api/videos/:id/supercuts/auto — AI-driven multi-segment supercut FROM THE FULL SOURCE VIDEO.
+    // Reads the full-video transcript (v.full_transcript_segments — word-level Whisper output from ingestion),
+    // has the LLM pick 2-3 supercut narratives (each 30-120s, 3-6 non-contiguous source segments),
+    // FFmpeg-extracts each segment DIRECTLY FROM THE FULL SOURCE VIDEO (v.source_video_path),
+    // concats them, and saves each as a `generated_clips` doc with `is_supercut: true` so the ClipEditor opens on click.
+    // Requires both source_video_path AND full_transcript_segments — returns 428 (Precondition Required) with a hint
+    // when they're missing, so the frontend can POST /prepare-source first.
+    // Charges 0.25 credits per output second.
     if (path_.startsWith('/videos/') && path_.endsWith('/supercuts/auto') && method === 'POST') {
       const user = await getUser(request, db)
       const vid = segments[1]
@@ -530,70 +533,63 @@ async function handle(request, { params }) {
       if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
       if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
 
-      // Only NON-supercut clips make up the source pool (we don't want supercuts of supercuts)
-      const clips = await db.collection('generated_clips').find({
-        video_id: vid, user_id: user.id,
-        is_supercut: { $ne: true },
-        storage_url_mp4: { $regex: '^/api/files/clips/' },
-      }).sort({ start_time_seconds: 1 }).toArray()
-
-      if (clips.length === 0) return NextResponse.json({ error: 'No rendered clips available. Generate clips first from a video.' }, { status: 400 })
-
-      // Build a GLOBAL timeline transcript from every clip's caption_segments (word-level → phrase-level fallback).
-      // Each entry maps a source-timeline range (start/end in original video seconds) to text + the clip it lives in.
-      const timeline = []
-      for (const c of clips) {
-        const clipStart = Number(c.start_time_seconds) || 0
-        if (Array.isArray(c.caption_segments) && c.caption_segments.length > 0) {
-          for (const s of c.caption_segments) {
-            const t = String(s.text || '').replace(/\\N/g, ' ').trim()
-            if (!t) continue
-            timeline.push({
-              source_start: clipStart + Number(s.start || 0),
-              source_end: clipStart + Number(s.end || 0),
-              text: t, clip_id: c.id,
-            })
-          }
-        } else if (c.srt_content) {
-          // Parse SRT lines "HH:MM:SS,mmm --> HH:MM:SS,mmm" for phrase-level entries
-          const lines = String(c.srt_content).split(/\r?\n/)
-          for (let i = 0; i < lines.length; i++) {
-            const m = /(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/.exec(lines[i])
-            if (m) {
-              const s = (+m[1])*3600 + (+m[2])*60 + (+m[3]) + (+m[4])/1000
-              const e = (+m[5])*3600 + (+m[6])*60 + (+m[7]) + (+m[8])/1000
-              const textParts = []
-              for (let j = i + 1; j < lines.length && lines[j].trim(); j++) textParts.push(lines[j].trim())
-              const text = textParts.join(' ').trim()
-              if (text) timeline.push({ source_start: clipStart + s, source_end: clipStart + e, text, clip_id: c.id })
-            }
-          }
-        }
+      // Preconditions: source video file must exist on disk AND full transcript must be persisted.
+      let sourceReady = false
+      if (v.source_video_path) { try { await fs.access(v.source_video_path); sourceReady = true } catch {} }
+      const transcriptReady = Array.isArray(v.full_transcript_segments) && v.full_transcript_segments.length >= 3
+      if (!sourceReady || !transcriptReady) {
+        return NextResponse.json({
+          error: 'Source video or full transcript not ready. Call POST /api/videos/:id/prepare-source first.',
+          source_ready: sourceReady, transcript_ready: transcriptReady,
+          needs_prepare: true,
+        }, { status: 428 })
       }
 
-      if (timeline.length < 4) return NextResponse.json({ error: 'Not enough transcript data on your clips. Open a clip in the editor to auto-transcribe it first.' }, { status: 400 })
+      // Build the AI prompt from the FULL SOURCE TRANSCRIPT (word-level Whisper output).
+      // Group very fine word-level segments into ~5-15s "beats" so the AI has meaningful segment indices to pick from.
+      const rawSegs = v.full_transcript_segments.map(s => ({
+        start: Number(s.start || 0),
+        end: Number(s.end || 0),
+        text: String(s.text || '').replace(/\s+/g, ' ').trim(),
+      })).filter(s => s.text && s.end > s.start)
 
-      // Prompt AI for narratives.
-      const transcriptListing = timeline.map((s, i) => `[${i}] ${s.source_start.toFixed(1)}s → ${s.source_end.toFixed(1)}s :: ${s.text}`).join('\n').slice(0, 15000)
-      const aiPrompt = `You are an AI video editor building "supercut" mini-videos from an existing long-form video.
+      const beats = []
+      let cur = null
+      const MIN_BEAT = 4, MAX_BEAT = 15
+      for (const s of rawSegs) {
+        if (!cur) { cur = { start: s.start, end: s.end, text: s.text }; continue }
+        const nextDur = s.end - cur.start
+        if (nextDur > MAX_BEAT && (cur.end - cur.start) >= MIN_BEAT) {
+          beats.push(cur); cur = { start: s.start, end: s.end, text: s.text }
+        } else {
+          cur.end = s.end; cur.text = (cur.text + ' ' + s.text).slice(0, 800)
+        }
+      }
+      if (cur) beats.push(cur)
 
-Given this timestamped transcript, generate 2-3 supercut narratives. Each supercut = 3-6 NON-CONTIGUOUS transcript segment indices that together form a coherent story with natural flow (question→answer, setup→punchline, thesis→examples→conclusion, contrasting quotes, etc.).
+      if (beats.length < 4) return NextResponse.json({ error: 'Full transcript has too few segments for a supercut. Try re-running /prepare-source.' }, { status: 400 })
+
+      const transcriptListing = beats.map((s, i) => `[${i}] ${s.start.toFixed(1)}s → ${s.end.toFixed(1)}s :: ${s.text.slice(0, 220)}`).join('\n').slice(0, 15000)
+      const aiPrompt = `You are an AI video editor building "supercut" mini-videos from a long-form source video.
+
+Given this timestamped transcript of the FULL source video, generate 2-3 supercut narratives. Each supercut = 3-6 NON-CONTIGUOUS transcript beat indices that together form a COHERENT 30-120 second story with natural narrative flow (question→answer, setup→punchline, thesis→examples→conclusion, contrasting quotes, tension→release, etc.).
 
 STRICT RULES:
-1. Segments MUST be non-contiguous — pick the BEST moments from ACROSS the video, not one continuous chunk.
-2. Total duration per supercut = 30-120 seconds (sum of segment durations).
-3. Segments should FLOW naturally when stitched — smooth topic linkage.
-4. Give each supercut a punchy title (3-6 words) and a hook_text (opening line ≤80 chars).
-5. Do NOT repeat the same segment indices across different supercuts unless the theme genuinely demands it.
+1. Segments MUST be non-contiguous — pick the BEST moments from ACROSS the whole video, not one continuous chunk.
+2. Total duration per supercut MUST be 30-120 seconds (sum of picked beat durations). Reject any narrative under 30s.
+3. Segments should FLOW naturally when stitched together — smooth topic linkage, no jarring transitions.
+4. Give each supercut a punchy title (3-6 words) and a hook_text (opening line ≤80 chars) that entices the viewer.
+5. Don't repeat the exact same segment indices across different supercuts unless the theme demands it.
+6. Prefer beats that are complete thoughts (start at a sentence boundary, end at a sentence boundary).
 
 Return ONLY JSON in this exact format:
 {
   "supercuts": [
     {
-      "title": "Title Here",
+      "title": "Punchy Title",
       "theme": "one-line theme description",
       "hook_text": "opening line to grab attention",
-      "segments": [ {"index": 0, "reason": "why this fits"}, {"index": 5, "reason": "..."} ]
+      "segments": [ {"index": 3, "reason": "..."}, {"index": 12, "reason": "..."} ]
     }
   ]
 }
@@ -614,13 +610,20 @@ ${transcriptListing}`
       const supercutSpecs = Array.isArray(aiJson?.supercuts) ? aiJson.supercuts : []
       if (supercutSpecs.length === 0) return NextResponse.json({ error: 'AI returned no supercut narratives' }, { status: 500 })
 
-      // Credit pre-check: estimate total duration across all supercuts
+      // For each spec, pad beat durations so we hit the 30s minimum:
+      // if the AI-picked segment total is short, we extend each selected beat by adjacent word-level context up to the neighbouring beat.
+      const specToSegments = (spec) => {
+        const idxs = (Array.isArray(spec.segments) ? spec.segments : []).map(s => Number(s.index)).filter(i => Number.isFinite(i) && i >= 0 && i < beats.length)
+        if (idxs.length < 2) return []
+        // Deduplicate + sort ascending so the concat plays chronologically (fallback if AI shuffled)
+        const uniq = [...new Set(idxs)]
+        return uniq.map(i => ({ ...beats[i], beat_index: i }))
+      }
+
+      // Credit pre-check across all specs (sum of picked beat durations)
       const estimateDur = supercutSpecs.reduce((total, sc) => {
-        const segs = Array.isArray(sc.segments) ? sc.segments : []
-        return total + segs.reduce((sum, s) => {
-          const tl = timeline[Number(s.index)]
-          return tl ? sum + Math.max(0, tl.source_end - tl.source_start) : sum
-        }, 0)
+        const chosen = specToSegments(sc)
+        return total + chosen.reduce((sum, b) => sum + Math.max(0, b.end - b.start), 0)
       }, 0)
       const creditsNeeded = 0.25 * estimateDur
       const profile = await db.collection('profiles').findOne({ id: user.id })
@@ -638,10 +641,10 @@ ${transcriptListing}`
       const createdClips = []
       let totalCreditsUsed = 0
       const errors = []
+      const sourcePath = v.source_video_path
 
       for (const spec of supercutSpecs) {
-        const segs = Array.isArray(spec.segments) ? spec.segments : []
-        const chosen = segs.map(s => timeline[Number(s.index)]).filter(Boolean)
+        const chosen = specToSegments(spec)
         if (chosen.length < 2) continue
 
         const supercutId = uuidv4()
@@ -654,19 +657,13 @@ ${transcriptListing}`
         try {
           for (let i = 0; i < chosen.length; i++) {
             const seg = chosen[i]
-            const covering = clips.find(c =>
-              (Number(c.start_time_seconds) || 0) <= seg.source_start + 0.5 &&
-              (Number(c.end_time_seconds) || 0) >= seg.source_end - 0.5 &&
-              c.storage_url_mp4?.startsWith('/api/files/clips/')
-            )
-            if (!covering) { console.warn(`[supercut] no covering clip for ${seg.source_start.toFixed(1)}s-${seg.source_end.toFixed(1)}s`); continue }
-            const clipMp4 = path.join('/app/data/uploads', covering.storage_url_mp4.replace(/^\/api\/files\//, ''))
-            const relStart = Math.max(0, seg.source_start - (Number(covering.start_time_seconds) || 0))
-            const relDur = Math.max(0.5, seg.source_end - seg.source_start)
+            const relStart = Math.max(0, seg.start)
+            const relDur = Math.max(0.5, seg.end - seg.start)
             const subPath = path.join(tmpDir, `part_${String(i).padStart(2, '0')}.mp4`)
+            // Extract sub-segment DIRECTLY from the full source video.
             await new Promise((resolve, reject) => {
               const ff = spawn('/usr/bin/ffmpeg', [
-                '-y', '-ss', String(relStart), '-t', String(relDur), '-i', clipMp4,
+                '-y', '-ss', String(relStart), '-t', String(relDur), '-i', sourcePath,
                 '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30',
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
@@ -680,15 +677,14 @@ ${transcriptListing}`
             subPaths.push(subPath)
             captionOffsets.push({
               concat_start: cursorSec, concat_end: cursorSec + relDur,
-              source_start: seg.source_start, source_end: seg.source_end,
-              text: seg.text, clip_id: covering.id, clip_source_start: Number(covering.start_time_seconds) || 0,
+              source_start: seg.start, source_end: seg.end,
+              text: seg.text, beat_index: seg.beat_index,
             })
             cursorSec += relDur
           }
 
           if (subPaths.length < 2) throw new Error('Fewer than 2 usable segments found')
 
-          // Concat via concat demuxer — all sub-clips share same codec params so we can stream-copy
           const concatListPath = path.join(tmpDir, 'concat.txt')
           await fs.writeFile(concatListPath, subPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'))
           const outPath = path.join(outDir, `supercut_${supercutId}.mp4`)
@@ -711,52 +707,44 @@ ${transcriptListing}`
             })
           } catch {}
 
-          // Remap caption segments onto concat timeline
+          // Build caption_segments on the CONCAT timeline by pulling word-level segments from the FULL transcript
+          // that fall inside each picked source-range, then remapping their offsets.
           const captionSegments = []
+          const fullSegs = v.full_transcript_segments
           for (const co of captionOffsets) {
-            const cc = clips.find(c => c.id === co.clip_id)
-            if (!cc || !Array.isArray(cc.caption_segments) || cc.caption_segments.length === 0) {
+            const inRange = fullSegs.filter(s => Number(s.end || 0) > co.source_start - 0.05 && Number(s.start || 0) < co.source_end + 0.05)
+            if (inRange.length === 0) {
               captionSegments.push({ start: co.concat_start, end: co.concat_end, text: co.text, words: [] })
               continue
             }
-            const clipStart = Number(cc.start_time_seconds) || 0
-            let matched = 0
-            for (const cs of cc.caption_segments) {
-              const csSourceStart = clipStart + Number(cs.start || 0)
-              const csSourceEnd = clipStart + Number(cs.end || 0)
-              if (csSourceEnd < co.source_start - 0.05 || csSourceStart > co.source_end + 0.05) continue
-              const overlapStart = Math.max(csSourceStart, co.source_start)
-              const overlapEnd = Math.min(csSourceEnd, co.source_end)
+            for (const fs2 of inRange) {
+              const overlapStart = Math.max(Number(fs2.start || 0), co.source_start)
+              const overlapEnd = Math.min(Number(fs2.end || 0), co.source_end)
               if (overlapEnd - overlapStart < 0.1) continue
               const localStart = co.concat_start + (overlapStart - co.source_start)
               const localEnd = co.concat_start + (overlapEnd - co.source_start)
-              const words = Array.isArray(cs.words) ? cs.words.map(w => {
-                const wsSource = clipStart + Number(w.start || 0)
-                const weSource = clipStart + Number(w.end || 0)
-                const wsOverlap = Math.max(wsSource, co.source_start)
-                const weOverlap = Math.min(weSource, co.source_end)
-                if (weOverlap - wsOverlap < 0.02) return null
+              const words = Array.isArray(fs2.words) ? fs2.words.map(w => {
+                const ws = Math.max(Number(w.start || 0), co.source_start)
+                const we = Math.min(Number(w.end || 0), co.source_end)
+                if (we - ws < 0.02) return null
                 return {
-                  start: co.concat_start + (wsOverlap - co.source_start),
-                  end: co.concat_start + (weOverlap - co.source_start),
-                  text: w.text || w.word || '',
+                  start: co.concat_start + (ws - co.source_start),
+                  end: co.concat_start + (we - co.source_start),
+                  text: String(w.text || w.word || ''),
                 }
               }).filter(Boolean) : []
-              captionSegments.push({ start: localStart, end: localEnd, text: String(cs.text || co.text).replace(/\\N/g, ' '), words })
-              matched++
-            }
-            if (matched === 0) {
-              captionSegments.push({ start: co.concat_start, end: co.concat_end, text: co.text, words: [] })
+              captionSegments.push({
+                start: localStart, end: localEnd,
+                text: String(fs2.text || '').replace(/\\N/g, ' '), words,
+              })
             }
           }
 
-          // Deduct credits (0.25 per output second)
           const actualDur = cursorSec
           const credits = 0.25 * actualDur
           await db.collection('profiles').updateOne({ id: user.id }, { $inc: { credit_balance_minutes: -credits } })
           totalCreditsUsed += credits
 
-          // Save as a generated_clips row with is_supercut: true — clicks in the UI open the ClipEditor.
           const clipId = uuidv4()
           const doc = {
             id: clipId, user_id: user.id, video_id: vid,
@@ -770,7 +758,7 @@ ${transcriptListing}`
             supercut_source_segments: captionOffsets.map(co => ({
               source_start: co.source_start, source_end: co.source_end,
               concat_start: co.concat_start, concat_end: co.concat_end,
-              text: co.text, clip_id: co.clip_id,
+              text: co.text, beat_index: co.beat_index,
             })),
             caption_segments: captionSegments,
             transcript_segment: captionSegments.map(s => s.text).join(' ').slice(0, 1500),
@@ -782,14 +770,13 @@ ${transcriptListing}`
             is_scheduled: false, scheduled_time: null,
             credits_charged: credits,
             source_video_url: v.original_url || null,
-            captions_burned: false, // subtitles not burned into the concat MP4 yet — user can re-render from editor
+            captions_burned: false,
             created_at: new Date(), updated_at: new Date(),
             render_version: 0,
           }
           await db.collection('generated_clips').insertOne(doc)
           createdClips.push(strip(doc))
 
-          // Cleanup temp parts
           for (const p of subPaths) try { await fs.unlink(p) } catch {}
           try { await fs.unlink(concatListPath) } catch {}
           try { await fs.rmdir(tmpDir) } catch {}
@@ -1161,15 +1148,6 @@ ${transcriptListing}`
       processVideoInBackground({ videoId, url, userId: user.id, db, callLLM, clipLengthRange: { min: clipMin, max: clipMax }, addCaptions, language, stylePreset, styleAss, overlaysConfig }).catch(e => console.error('bg fail', e))
 
       return NextResponse.json({ video_id: videoId, status: 'queued', source_type: meta.source_type, thumbnail: meta.thumbnail, title: meta.title, clip_length_range: { min: clipMin, max: clipMax }, add_captions: addCaptions, language, style_preset: stylePreset })
-    }
-
-    // GET /api/videos/:id  — poll processing status
-    if (path_.startsWith('/videos/') && method === 'GET') {
-      const id = segments[1]
-      const v = await db.collection('videos_processed').findOne({ id })
-      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
-      const clips = await db.collection('generated_clips').find({ video_id: id }).sort({ virality_score: -1 }).toArray()
-      return NextResponse.json({ ...strip(v), clips: clips.map(strip) })
     }
 
     // POST /api/ai/translate  body: { language: 'es', strings: { key: 'English text', ... } }
@@ -2129,7 +2107,9 @@ ${eventsBlock}
       }
     }
 
-    // GET /api/clips/:id/download  — stream the clip with Content-Disposition: attachment (forces download)
+    // GET /api/clips/:id/download  — stream the clip with Content-Disposition: attachment (forces download).
+    // Charges 0.25 credits per output second of the clip (deducted BEFORE the byte stream is returned).
+    // Charge is idempotent per clip: once a clip has been paid for, subsequent downloads are free (tracked via clip.download_paid_at).
     if (path_.startsWith('/clips/') && path_.endsWith('/download') && method === 'GET') {
       const clipId = segments[1]
       const clip = await db.collection('generated_clips').findOne({ id: clipId })
@@ -2138,6 +2118,35 @@ ${eventsBlock}
         return NextResponse.json({ error: 'No rendered MP4 for this clip' }, { status: 410 })
       }
       try {
+        const user = await getUser(request, db).catch(() => null)
+        // Compute effective clip duration (respect any applied trim)
+        const rawDur = Math.max(1, Number(clip.end_time_seconds || 0) - Number(clip.start_time_seconds || 0))
+        const effDur = Number.isFinite(clip.trim_end) && Number.isFinite(clip.trim_start)
+          ? Math.max(1, Number(clip.trim_end) - Number(clip.trim_start))
+          : rawDur
+        const creditsNeeded = 0.25 * effDur
+        // Only deduct if this user owns the clip AND hasn't paid yet for this render_version
+        const alreadyPaidVersion = Number(clip.download_paid_render_version || -1)
+        const currentVersion = Number(clip.render_version || 0)
+        const shouldCharge = user && clip.user_id === user.id && alreadyPaidVersion !== currentVersion
+        if (shouldCharge) {
+          const profile = await db.collection('profiles').findOne({ id: user.id })
+          const balance = Number(profile?.credit_balance_minutes || 0)
+          if (balance < creditsNeeded) {
+            return NextResponse.json({
+              error: `Insufficient credits. Need ${creditsNeeded.toFixed(2)}, you have ${balance.toFixed(2)}.`,
+              credits_required: creditsNeeded,
+              credits_available: balance,
+            }, { status: 402 })
+          }
+          await db.collection('profiles').updateOne({ id: user.id }, { $inc: { credit_balance_minutes: -creditsNeeded } })
+          await db.collection('generated_clips').updateOne({ id: clipId }, { $set: {
+            download_paid_render_version: currentVersion,
+            download_paid_at: new Date(),
+            download_paid_credits: creditsNeeded,
+          } })
+          try { await db.collection('credit_transactions').insertOne({ id: uuidv4(), user_id: user.id, clip_id: clipId, amount: -creditsNeeded, reason: 'clip_download', duration_seconds: effDur, created_at: new Date() }) } catch {}
+        }
         const localPath = path.join(UPLOAD_DIR, clip.storage_url_mp4.replace(/^\/api\/files\//, ''))
         const stat = await fs.stat(localPath)
         const data = await fs.readFile(localPath)
@@ -2147,8 +2156,171 @@ ${eventsBlock}
           'content-length': String(stat.size),
           'content-disposition': `attachment; filename="${safeName}.mp4"`,
           'cache-control': 'private, no-cache',
+          'x-credits-charged': shouldCharge ? String(creditsNeeded.toFixed(2)) : '0',
         } })
       } catch (e) { return NextResponse.json({ error: 'File missing on server' }, { status: 410 }) }
+    }
+
+    // POST /api/clips/:id/download-quote — returns { credits_required, credits_available, already_paid } WITHOUT charging.
+    // Frontend calls this BEFORE triggering the download so it can show a confirmation like "This costs 15 credits, continue?".
+    if (path_.startsWith('/clips/') && path_.endsWith('/download-quote') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      const rawDur = Math.max(1, Number(clip.end_time_seconds || 0) - Number(clip.start_time_seconds || 0))
+      const effDur = Number.isFinite(clip.trim_end) && Number.isFinite(clip.trim_start)
+        ? Math.max(1, Number(clip.trim_end) - Number(clip.trim_start))
+        : rawDur
+      const creditsRequired = 0.25 * effDur
+      const alreadyPaidVersion = Number(clip.download_paid_render_version || -1)
+      const currentVersion = Number(clip.render_version || 0)
+      const alreadyPaid = alreadyPaidVersion === currentVersion
+      const profile = await db.collection('profiles').findOne({ id: user.id })
+      return NextResponse.json({
+        clip_id: clipId,
+        duration_seconds: effDur,
+        credits_required: alreadyPaid ? 0 : creditsRequired,
+        credits_available: Number(profile?.credit_balance_minutes || 0),
+        already_paid: alreadyPaid,
+      })
+    }
+
+    // GET /api/videos/:id/source-video/download — stream the FULL uploaded/ingested source video.
+    // NO credit deduction. If source_video_path missing or file missing, returns 404 with a hint to call /prepare-source.
+    if (path_.startsWith('/videos/') && path_.endsWith('/source-video/download') && method === 'GET') {
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (!v.source_video_path) {
+        return NextResponse.json({ error: 'Source video not persisted for this project yet. Call POST /api/videos/:id/prepare-source first.', source_ready: false }, { status: 404 })
+      }
+      try {
+        const stat = await fs.stat(v.source_video_path)
+        const data = await fs.readFile(v.source_video_path)
+        const safeName = String(v.title || 'source').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 80) || 'source'
+        return new NextResponse(data, { headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(stat.size),
+          'content-disposition': `attachment; filename="${safeName}.mp4"`,
+          'cache-control': 'private, no-cache',
+        } })
+      } catch { return NextResponse.json({ error: 'Source file missing on disk. Re-ingest the video.', source_ready: false }, { status: 410 }) }
+    }
+
+    // POST /api/videos/:id/prepare-source — on-demand fetch of the FULL source video + FULL transcript for existing/older projects
+    // that didn't have these persisted at ingestion time. Idempotent: returns { source_ready: true, transcript_ready: true } once both exist.
+    // On first call it kicks off the heavy work synchronously (up to 3-5 min for a 10-min video). Frontend should poll.
+    if (path_.startsWith('/videos/') && path_.endsWith('/prepare-source') && method === 'POST') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+
+      const SOURCES_DIR = path.join(UPLOAD_DIR, 'sources')
+      await fs.mkdir(SOURCES_DIR, { recursive: true })
+      const sourceOutPath = v.source_video_path || path.join(SOURCES_DIR, `${vid}.mp4`)
+      let sourceReady = false
+      try { await fs.access(sourceOutPath); sourceReady = true } catch {}
+
+      // STEP 1: source video
+      if (!sourceReady) {
+        if (!v.original_url) {
+          return NextResponse.json({ error: 'This project has no source URL to fetch from (was uploaded but source file is missing). Please re-ingest the video.', source_ready: false }, { status: 400 })
+        }
+        try {
+          const { fetchFullVideoFromYouTube, getProxyUrl: _getProxyUrl } = await import('@/lib/video-processor')
+          void _getProxyUrl
+          const sessionId = `prepsrc${vid.slice(0,8)}${Date.now().toString(36)}`
+          const tmpDir = path.join(UPLOAD_DIR, 'originals', vid)
+          await fs.mkdir(tmpDir, { recursive: true })
+          const fullPath = await fetchFullVideoFromYouTube({ url: v.original_url, outDir: tmpDir, db, maxHeight: 1080, sessionId })
+          if (fullPath) {
+            try { await fs.rename(fullPath, sourceOutPath); sourceReady = true } catch (renErr) {
+              // Fallback: copy if rename fails (cross-device)
+              await fs.copyFile(fullPath, sourceOutPath); await fs.unlink(fullPath).catch(()=>{}); sourceReady = true
+            }
+            try {
+              const st = await fs.stat(sourceOutPath)
+              await db.collection('videos_processed').updateOne({ id: vid }, { $set: {
+                source_video_path: sourceOutPath,
+                source_video_size_bytes: st.size,
+              } })
+            } catch {}
+          }
+          try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        } catch (dlErr) {
+          return NextResponse.json({ error: 'Failed to fetch source video: ' + dlErr.message, source_ready: false }, { status: 500 })
+        }
+      }
+
+      // STEP 2: full transcript
+      let transcriptReady = Array.isArray(v.full_transcript_segments) && v.full_transcript_segments.length > 0
+      if (!transcriptReady && sourceReady) {
+        try {
+          const { spawn } = await import('child_process')
+          const audioPath = sourceOutPath.replace(/\.mp4$/, '.audio.mp3')
+          await new Promise((resolve, reject) => {
+            const ff = spawn('/usr/bin/ffmpeg', ['-y', '-i', sourceOutPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '96k', audioPath])
+            let stderr = ''
+            ff.stderr.on('data', d => { stderr += d.toString() })
+            ff.on('close', code => code === 0 ? resolve() : reject(new Error('audio extract failed: ' + stderr.slice(-200))))
+          })
+          // Whisper transcription — use existing utility inside video-processor
+          const { getOpenAIKey, getGroqWhisperConfig, transcribeWithWhisper } = await import('@/lib/video-processor')
+          const openaiKey = await getOpenAIKey(db).catch(() => null)
+          const groqCfg = await getGroqWhisperConfig(db).catch(() => null)
+          if (!openaiKey && !groqCfg) {
+            return NextResponse.json({ error: 'No Whisper provider configured (need Groq or OpenAI API key in Admin → Integrations)', source_ready: true, transcript_ready: false }, { status: 400 })
+          }
+          const whisperSegs = await transcribeWithWhisper(audioPath, openaiKey, v.language || null, db)
+          try { await fs.unlink(audioPath) } catch {}
+          if (Array.isArray(whisperSegs) && whisperSegs.length > 0) {
+            const compact = whisperSegs.map(s => ({
+              start: Number(s.start || 0),
+              end: Number(s.end || 0),
+              text: String(s.text || '').slice(0, 500),
+              words: Array.isArray(s.words) ? s.words.map(w => ({ start: Number(w.start || 0), end: Number(w.end || 0), text: String(w.text || w.word || '').slice(0, 40) })) : [],
+            }))
+            await db.collection('videos_processed').updateOne({ id: vid }, { $set: {
+              full_transcript_segments: compact,
+              full_transcript_text: compact.map(s => s.text).join(' ').slice(0, 20000),
+              transcription_source: 'whisper',
+            } })
+            transcriptReady = true
+          }
+        } catch (trErr) {
+          return NextResponse.json({ error: 'Failed to transcribe source: ' + trErr.message, source_ready: sourceReady, transcript_ready: false }, { status: 500 })
+        }
+      }
+
+      return NextResponse.json({ ok: true, source_ready: sourceReady, transcript_ready: transcriptReady })
+    }
+
+    // GET /api/videos/:id/source-video/status — check if the source is persisted and transcript is available
+    if (path_.startsWith('/videos/') && path_.endsWith('/source-video/status') && method === 'GET') {
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      let sourceReady = false
+      if (v.source_video_path) { try { await fs.access(v.source_video_path); sourceReady = true } catch {} }
+      const transcriptReady = Array.isArray(v.full_transcript_segments) && v.full_transcript_segments.length > 0
+      return NextResponse.json({
+        source_ready: sourceReady,
+        transcript_ready: transcriptReady,
+        source_size_bytes: sourceReady ? (v.source_video_size_bytes || null) : null,
+        transcript_segments: transcriptReady ? v.full_transcript_segments.length : 0,
+      })
+    }
+
+    // GET /api/videos/:id  — poll processing status (catch-all, must be AFTER specific /videos/:id/* routes)
+    if (path_.startsWith('/videos/') && method === 'GET') {
+      const id = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const clips = await db.collection('generated_clips').find({ video_id: id }).sort({ virality_score: -1 }).toArray()
+      return NextResponse.json({ ...strip(v), clips: clips.map(strip) })
     }
 
     // POST /api/clips/:id/apply-trim  — actually re-render the MP4 with trim/crop bounds (the saved fields alone are metadata-only)
