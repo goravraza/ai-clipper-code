@@ -607,7 +607,50 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                         style={cssStyle}
                         onDoubleClick={(e) => { e.stopPropagation(); if (activeCue) setEditingCueIdx(activeCueIdx) }}
                       >
-                        {displayText}
+                        {(() => {
+                          // Animation preview: for karaoke / word_bounce, colorize the active word (+ pulse for bounce).
+                          // For static or ghost cues, just show the text.
+                          const anim = state.animation_style || 'karaoke'
+                          if (anim === 'static' || displayCue._ghost) return displayText
+                          const cue = activeCue
+                          if (!cue) return displayText
+                          // Derive per-word timings — prefer real Whisper timings, else evenly distribute
+                          const cueText = String(cue.text || '')
+                          const tokens = cueText.replace(/\\N/g, ' ').split(/\s+/).filter(Boolean)
+                          if (tokens.length === 0) return displayText
+                          let wordTimings = Array.isArray(cue.words) && cue.words.length > 0
+                            ? cue.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end)).slice(0, tokens.length)
+                            : []
+                          if (wordTimings.length < tokens.length) {
+                            const per = (cue.end - cue.start) / tokens.length
+                            wordTimings = tokens.map((_, i) => ({ start: cue.start + i * per, end: cue.start + (i + 1) * per }))
+                          }
+                          // Accent color (default yellow) from styleAss.accent or #FFFF00
+                          const accent = (state.style_ass && (state.style_ass.accent_hex || state.style_ass.accentHex)) || '#FFFF00'
+                          // Find the active word index at currentTime
+                          const activeIdx = wordTimings.findIndex(w => currentTime >= w.start - 0.02 && currentTime < w.end + 0.02)
+                          return (
+                            <span>
+                              {tokens.map((tok, i) => {
+                                const isActive = i === activeIdx
+                                const style = isActive
+                                  ? {
+                                      color: accent,
+                                      display: 'inline-block',
+                                      transform: anim === 'word_bounce' ? 'scale(1.15)' : 'none',
+                                      transformOrigin: 'center',
+                                      transition: 'transform 100ms cubic-bezier(0.34, 1.56, 0.64, 1)',
+                                    }
+                                  : { display: 'inline-block' }
+                                return (
+                                  <span key={i} style={style}>
+                                    {tok}{i < tokens.length - 1 ? ' ' : ''}
+                                  </span>
+                                )
+                              })}
+                            </span>
+                          )
+                        })()}
                       </span>
                     )}
                   </div>

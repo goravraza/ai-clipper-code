@@ -1784,9 +1784,23 @@ ${transcriptListing}`
           const wordHighlight = body.word_highlight !== false && animationStyle !== 'static'
           const events = []
           for (const c of chunked) {
-            const usableWords = wordHighlight && Array.isArray(c.words) && c.words.length > 0
+            let usableWords = wordHighlight && Array.isArray(c.words) && c.words.length > 0
               ? c.words.filter(w => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start && w.end > c.start && w.start < c.end)
               : []
+            // FALLBACK: word-level timings missing (Hindi/CJK Whisper sometimes returns only segment-level times).
+            // Synthesize word bounds by evenly distributing the cue duration across its visible words. Without this,
+            // the karaoke/word_bounce animations degrade to a single static Dialogue — no highlight visible.
+            if (usableWords.length === 0 && wordHighlight) {
+              const tokens = String(c.text || '').replace(/\\N/g, ' ').split(/\s+/).filter(Boolean)
+              if (tokens.length >= 1) {
+                const per = (c.end - c.start) / Math.max(1, tokens.length)
+                usableWords = tokens.map((tok, i) => ({
+                  start: c.start + i * per,
+                  end: c.start + (i + 1) * per,
+                  text: tok,
+                }))
+              }
+            }
             if (usableWords.length === 0) {
               // No word timings OR static mode → single static cue for this chunk
               events.push(`Dialogue: 0,${fmt(c.start)},${fmt(c.end)},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})}${c.text}`)
