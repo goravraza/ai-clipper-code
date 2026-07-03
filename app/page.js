@@ -30,6 +30,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import Link from 'next/link'
 import StyleWizard from './_components/StyleWizard'
 import ClipEditor from './_components/ClipEditor'
+import { ProjectHeaderPanel, SupercutView } from './_components/ProjectHeaderPanel'
 
 const CROP_ASPECTS = [
   { value: '9:16', label: 'Vertical 9:16', tw: 'aspect-[9/16]' },
@@ -150,6 +151,7 @@ export default function HomePage() {
   const [activeProjectId, setActiveProjectId] = useState(null)
   const [renamingProjectId, setRenamingProjectId] = useState(null)
   const [renameTitle, setRenameTitle] = useState('')
+  const [supercutProjectId, setSupercutProjectId] = useState(null)
   const [memes, setMemes] = useState([])
   const [sliderMinutes, setSliderMinutes] = useState([1000])
   const [billingCycle, setBillingCycle] = useState('month')
@@ -736,12 +738,18 @@ export default function HomePage() {
                 )
               )}
 
-              {/* DRILLED-IN PROJECT — show breadcrumb + its clips */}
+              {/* DRILLED-IN PROJECT — show breadcrumb + header + its clips (or supercut view) */}
               {clipsView === 'projects' && activeProjectId && (() => {
                 const proj = projects.find(p => p.id === activeProjectId)
                 const projClips = activeProjectId === '__unsorted__'
                   ? clips.filter(c => !c.video_id || !projects.some(p => p.id === c.video_id && !p.is_virtual))
                   : clips.filter(c => c.video_id === activeProjectId)
+                // If user clicked "Create Supercut" — render the SupercutView instead of the clip grid.
+                if (supercutProjectId === activeProjectId) {
+                  return <SupercutView project={proj} onBack={() => setSupercutProjectId(null)} />
+                }
+                // Estimate the source video duration from the widest clip end time (used by TimeSpinner clamp).
+                const videoDurationSec = projClips.reduce((mx, c) => Math.max(mx, Number(c.end_time_seconds) || 0), 0) || 3600
                 return (
                   <div>
                     <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
@@ -762,6 +770,28 @@ export default function HomePage() {
                         </Badge>
                       )}
                     </div>
+
+                    {/* Header cluster — Cut & Clip / Create Supercut / metadata action icons / slide-out drawer */}
+                    {proj && !proj.is_virtual && (
+                      <div className="mb-4">
+                        <ProjectHeaderPanel
+                          project={proj}
+                          projClips={projClips}
+                          videoDurationSec={videoDurationSec}
+                          videoSizeBytes={proj.size_bytes || null}
+                          onOpenSupercut={() => setSupercutProjectId(activeProjectId)}
+                          onRefreshClips={async () => {
+                            const [pj, cl] = await Promise.all([
+                              fetch('/api/projects').then(r => r.json()).catch(() => []),
+                              fetch('/api/clips').then(r => r.json()).catch(() => []),
+                            ])
+                            setProjects(Array.isArray(pj) ? pj : [])
+                            setClips(cl)
+                          }}
+                        />
+                      </div>
+                    )}
+
                     {projClips.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-border bg-muted/20 py-12 text-center">
                         <div className="text-sm">No clips in this project yet.</div>

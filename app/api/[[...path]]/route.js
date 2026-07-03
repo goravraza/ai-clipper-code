@@ -435,6 +435,141 @@ async function handle(request, { params }) {
       return NextResponse.json(list.map(strip))
     }
 
+    // ============= STUDIO / PROJECT ADVANCED ACTIONS =============
+    // GET /api/videos/:id/transcript — full raw transcript (all clips concatenated).
+    if (path_.startsWith('/videos/') && path_.endsWith('/transcript') && method === 'GET') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const cs = await db.collection('generated_clips').find({ video_id: vid, user_id: user.id }).sort({ start_time_seconds: 1 }).toArray()
+      // Prefer stored full-video transcript if we have it, else concat clip srt_content.
+      const text = v.full_transcript
+        || cs.map(c => (c.srt_content || '').split(/\r?\n/).filter(l => l && !/^\d+$/.test(l.trim()) && !/-->/.test(l)).join(' ')).filter(Boolean).join('\n\n')
+      return NextResponse.json({ video_id: vid, text, chapters: Array.isArray(v.chapters) ? v.chapters : [] })
+    }
+
+    // POST /api/videos/:id/chapters/auto — auto-generate chapter markers with AI from the transcript.
+    if (path_.startsWith('/videos/') && path_.endsWith('/chapters/auto') && method === 'POST') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const cs = await db.collection('generated_clips').find({ video_id: vid, user_id: user.id }).sort({ start_time_seconds: 1 }).toArray()
+      const flatText = cs.map(c => `[${Math.floor(c.start_time_seconds)}s] ${(c.srt_content || '').split(/\r?\n/).filter(l => l && !/^\d+$/.test(l.trim()) && !/-->/.test(l)).join(' ').slice(0, 500)}`).join('\n')
+      if (!flatText.trim()) return NextResponse.json({ error: 'No transcript available yet — transcribe your clips first.' }, { status: 400 })
+      try {
+        const raw = await callLLM([{ role: 'user', content: `Analyze this video transcript with timestamps and produce 5-10 CHAPTER markers as JSON. Return {"chapters":[{"start":<seconds>, "title":"<3-6 word title>"}]}. Transcript:\n${flatText}` }], { json: true, temperature: 0.4, db })
+        const cleaned = String(raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim()
+        let parsed
+        try { parsed = JSON.parse(cleaned) } catch { const m = cleaned.match(/\{[\s\S]*\}/); if (m) { try { parsed = JSON.parse(m[0]) } catch {} } }
+        const chapters = Array.isArray(parsed?.chapters) ? parsed.chapters.filter(c => Number.isFinite(c.start) && typeof c.title === 'string') : []
+        if (chapters.length === 0) return NextResponse.json({ error: 'AI returned no valid chapters' }, { status: 500 })
+        await db.collection('videos_processed').updateOne({ id: vid }, { $set: { chapters, chapters_generated_at: new Date() } })
+        return NextResponse.json({ ok: true, chapters })
+      } catch (e) { return NextResponse.json({ error: 'AI generation failed', message: e.message }, { status: 500 }) }
+    }
+
+    // POST /api/videos/:id/cut-clip — create a new generated_clips row from a specified time range.
+    // Body: { start_time_seconds, end_time_seconds, title? }
+    if (path_.startsWith('/videos/') && path_.endsWith('/cut-clip') && method === 'POST') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const start = Math.max(0, Number(body.start_time_seconds) || 0)
+      const end = Math.max(start + 1, Number(body.end_time_seconds) || start + 30)
+      // Find any existing clip that covers this range to copy the source MP4 path (we don't re-download the source video).
+      const anyClip = await db.collection('generated_clips').findOne({ video_id: vid, user_id: user.id, storage_url_mp4: { $regex: '^/api/files/clips/' } })
+      if (!anyClip) return NextResponse.json({ error: 'No source clip available to cut from. Re-ingest the video.' }, { status: 400 })
+      const anyMp4 = /\/api\/files\/clips\/([^?]+\.mp4)/.exec(anyClip.storage_url_mp4)?.[1]
+      if (!anyMp4) return NextResponse.json({ error: 'Source path invalid' }, { status: 400 })
+      // Simpler MVP: create a placeholder clip row pointing at the same MP4 but with different start/end.
+      // Full re-cut requires the SOURCE video which we may not have. For now we set the metadata and let the user
+      // trigger a render via the ClipEditor which will apply the trim.
+      const clipId = uuidv4()
+      const newClip = {
+        id: clipId, user_id: user.id, video_id: vid,
+        clip_title: body.title || `Cut ${new Date().toLocaleTimeString()}`,
+        start_time_seconds: start, end_time_seconds: end,
+        virality_score: 70, storage_url_mp4: anyClip.storage_url_mp4,
+        thumbnail_url: anyClip.thumbnail_url, hook_type: 'text', hook_text: '',
+        style_preset: 'classic_white', srt_content: '', caption_segments: [],
+        created_at: new Date(), updated_at: new Date(), render_version: 0,
+      }
+      await db.collection('generated_clips').insertOne(newClip)
+      await logActivity(db, user.id, 'clip_cut_manual', request, { clip_id: clipId, video_id: vid, range: [start, end] })
+      return NextResponse.json({ ok: true, clip: strip(newClip) })
+    }
+
+    // GET /api/videos/:id/supercuts — list all supercut renders for this project.
+    if (path_.startsWith('/videos/') && path_.endsWith('/supercuts') && method === 'GET') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const list = await db.collection('supercuts').find({ video_id: vid, user_id: user.id }).sort({ created_at: -1 }).toArray()
+      return NextResponse.json({ supercuts: list.map(strip) })
+    }
+
+    // POST /api/videos/:id/supercuts/auto — AI picks the top moments and concats them into ONE video.
+    if (path_.startsWith('/videos/') && path_.endsWith('/supercuts/auto') && method === 'POST') {
+      const user = await getUser(request, db)
+      const vid = segments[1]
+      const v = await db.collection('videos_processed').findOne({ id: vid })
+      if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      // Pick TOP 5 clips of this project by virality score.
+      const cs = await db.collection('generated_clips').find({ video_id: vid, user_id: user.id, storage_url_mp4: { $regex: '^/api/files/clips/' } }).sort({ virality_score: -1 }).limit(5).toArray()
+      if (cs.length < 2) return NextResponse.json({ error: 'Need at least 2 rendered clips to build a supercut' }, { status: 400 })
+      // Build concat filter list
+      const supercutId = uuidv4()
+      const outDir = '/app/data/uploads/clips'
+      const outPath = path.join(outDir, `supercut_${supercutId}.mp4`)
+      const inputs = []
+      for (const c of cs) {
+        const m = /\/api\/files\/clips\/([^?]+\.mp4)/.exec(c.storage_url_mp4)
+        if (m) inputs.push(path.join(outDir, m[1]))
+      }
+      if (inputs.length < 2) return NextResponse.json({ error: 'No local MP4s available for supercut' }, { status: 400 })
+      try {
+        // Concat via ffmpeg filter_complex — normalizes SAR/timebase so different-source clips join cleanly.
+        const { spawn } = await import('child_process')
+        const args = []
+        for (const p of inputs) args.push('-i', p)
+        const parts = inputs.map((_, i) => `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}];[${i}:a]aresample=44100[a${i}]`)
+        const joined = inputs.map((_, i) => `[v${i}][a${i}]`).join('') + `concat=n=${inputs.length}:v=1:a=1[outv][outa]`
+        args.push('-filter_complex', parts.join(';') + ';' + joined,
+          '-map', '[outv]', '-map', '[outa]',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+          '-vsync', 'cfr', '-async', '1',
+          '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+          '-movflags', '+faststart', '-y', outPath)
+        await new Promise((resolve, reject) => {
+          const ps = spawn('/usr/bin/ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+          let stderr = ''
+          ps.stderr.on('data', d => { stderr += d.toString() })
+          ps.on('close', code => code === 0 ? resolve() : reject(new Error('ffmpeg concat failed: ' + stderr.slice(-500))))
+        })
+        const durSec = cs.reduce((a, c) => a + (c.end_time_seconds - c.start_time_seconds), 0)
+        const supercut = {
+          id: supercutId, user_id: user.id, video_id: vid,
+          title: `${v.title || 'Project'} — Best Moments`,
+          storage_url_mp4: `/api/files/clips/supercut_${supercutId}.mp4`,
+          source_clip_ids: cs.map(c => c.id),
+          segments: cs.map(c => ({ clip_id: c.id, title: c.clip_title, duration: c.end_time_seconds - c.start_time_seconds })),
+          duration: durSec, status: 'completed', created_at: new Date(),
+        }
+        await db.collection('supercuts').insertOne(supercut)
+        await logActivity(db, user.id, 'supercut_created', request, { supercut_id: supercutId, video_id: vid, clips: cs.length })
+        return NextResponse.json({ ok: true, supercut: strip(supercut), segments: cs.length })
+      } catch (e) {
+        return NextResponse.json({ error: 'Supercut concat failed: ' + e.message }, { status: 500 })
+      }
+    }
+
     // ============= PROJECTS (group clips by their parent source video) =============
     // GET /api/projects — list of source-video projects with clip counts + preview thumbs
     if (path_ === '/projects' && method === 'GET') {
