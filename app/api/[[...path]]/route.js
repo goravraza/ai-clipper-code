@@ -974,6 +974,55 @@ async function handle(request, { params }) {
       }
     }
 
+    // POST /api/clips/:id/refetch-source — re-download a clip's underlying MP4 segment from its source URL.
+    // Used to REPAIR clips that got saved without an audio track (a bug from an earlier ingestion) — the
+    // corrected format chain in fetchYouTubeSegment now guarantees video+audio in one file. This endpoint
+    // re-cuts the same time-range using the fixed selector so the user doesn't have to re-ingest the whole video.
+    if (path_.startsWith('/clips/') && path_.endsWith('/refetch-source') && method === 'POST') {
+      const user = await getUser(request, db)
+      const clipId = segments[1]
+      const clip = await db.collection('generated_clips').findOne({ id: clipId })
+      if (!clip) return NextResponse.json({ error: 'Clip not found' }, { status: 404 })
+      if (clip.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const vid = await db.collection('videos_processed').findOne({ id: clip.video_id })
+      const sourceUrl = vid?.original_url
+      if (!sourceUrl) return NextResponse.json({ error: 'Source URL not found on parent video' }, { status: 400 })
+      const start = Number(clip.start_time_seconds) || 0
+      const end = Number(clip.end_time_seconds) || (start + 30)
+      if (end - start < 1) return NextResponse.json({ error: 'Invalid clip range' }, { status: 400 })
+      const mp4Match = /\/api\/files\/clips\/([^?]+\.mp4)/.exec(clip.storage_url_mp4 || '')
+      if (!mp4Match) return NextResponse.json({ error: 'Clip has no local MP4 path' }, { status: 400 })
+      const finalPath = path.join('/app/data/uploads/clips', mp4Match[1])
+      const tmpDir = `/tmp/refetch_${clipId}_${Date.now()}`
+      try { await fs.mkdir(tmpDir, { recursive: true }) } catch {}
+      const rawPath = path.join(tmpDir, 'seg.mp4')
+      try {
+        const { fetchYouTubeSegment, getProxyUrl, getCookiesFile } = await import('@/lib/video-processor')
+        const sid = `rf${Date.now()}${Math.floor(Math.random()*9999)}`
+        const proxyUrl = await getProxyUrl(db, { sessionId: sid })
+        const cookiesFile = await getCookiesFile(db)
+        await fetchYouTubeSegment(sourceUrl, start, end, rawPath, proxyUrl, cookiesFile, 1080)
+        // Verify the new file has both video AND audio streams before replacing the old one
+        const { execFile } = await import('child_process')
+        const { stdout: probe } = await new Promise((resolve, reject) => {
+          execFile('/usr/bin/ffprobe', ['-v','error','-show_streams','-select_streams','a','-of','default=nk=1:nw=1', rawPath], (err, stdout) => err ? reject(err) : resolve({ stdout }))
+        })
+        if (!probe || !probe.trim()) {
+          try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+          return NextResponse.json({ error: 'Re-downloaded clip still has no audio track — source may not offer audio.' }, { status: 502 })
+        }
+        // Replace the on-disk file atomically. Mark render_version=0 so any cache-busting still works.
+        await fs.rename(rawPath, finalPath)
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { updated_at: new Date() }, $inc: { render_version: 1 } })
+        await logActivity(db, user.id, 'clip_source_refetched', request, { clip_id: clipId, range: [start, end] })
+        return NextResponse.json({ ok: true, message: 'Source segment re-downloaded with audio.' })
+      } catch (e) {
+        try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+        return NextResponse.json({ error: 'Refetch failed: ' + e.message }, { status: 500 })
+      }
+    }
+
     // POST /api/clips/:id/transcribe — on-demand per-clip transcription for clips that don't have one.
     // Used when the original ingestion couldn't transcribe (e.g. YT blocked audio-only stream).
     // Extracts audio from the clip's local MP4 and runs Groq/OpenAI Whisper on it. Free for now — we already
