@@ -89,10 +89,41 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
     finally { setGeneratingChapters(false) }
   }
 
-  const downloadFull = async () => {
-    if (!project?.original_url && !project?.id) return
-    window.open(`/api/videos/${project.id}/download-full`, '_blank')
+  const downloadFull = () => {
+    // The source video isn't stored on disk (we cut only individual clip segments) — the fastest way to
+    // let the user get the ORIGINAL video is to open the source page (YouTube/TikTok/etc) in a new tab
+    // where they can use the platform's native download or a browser extension.
+    if (project?.original_url) {
+      window.open(project.original_url, '_blank', 'noopener,noreferrer')
+    } else {
+      toast.info('Source URL not available for this project')
+    }
   }
+
+  // Load the video transcript for the Cut & Clip → Transcript sub-tab.
+  const [cutTranscript, setCutTranscript] = useState([])
+  useEffect(() => {
+    if (drawerMode !== 'cut' || !project?.id) return
+    fetch(`/api/videos/${project.id}/transcript`).then(r => r.json()).then(d => {
+      // Try to build phrase-level segments from clip srt_content if the flat text doesn't have timings.
+      // Fetch each clip's transcript segments (with word timings) and merge.
+      const list = []
+      if (Array.isArray(projClips)) {
+        for (const c of projClips) {
+          if (Array.isArray(c.caption_segments) && c.caption_segments.length > 0) {
+            for (const s of c.caption_segments) {
+              list.push({ start: c.start_time_seconds + (s.start || 0), end: c.start_time_seconds + (s.end || 0), text: s.text || '' })
+            }
+          }
+        }
+      }
+      list.sort((a, b) => a.start - b.start)
+      setCutTranscript(list)
+    }).catch(() => {})
+  }, [drawerMode, project?.id, projClips])
+
+  // Pick the first clip's local MP4 as a preview source for the drawer video player.
+  const previewSrc = projClips?.[0]?.storage_url_mp4 ? `${projClips[0].storage_url_mp4}?v=${projClips[0].render_version || 0}` : null
 
   return (
     <>
@@ -143,6 +174,23 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
           </SheetHeader>
 
           <div className="flex-1 overflow-y-auto">
+            {/* Video preview strip at the top of the drawer — visible for BOTH Cut & Clip and Transcript modes */}
+            {previewSrc && (
+              <div className="bg-black" onContextMenu={(e) => e.preventDefault()}>
+                <video
+                  ref={(el) => { if (el) el.currentTime = start }}
+                  src={previewSrc}
+                  className="w-full max-h-64 object-contain bg-black"
+                  controls
+                  controlsList="nodownload noplaybackrate noremoteplayback"
+                  disablePictureInPicture
+                  playsInline
+                  preload="metadata"
+                  onContextMenu={(e) => e.preventDefault()}
+                />
+              </div>
+            )}
+
             {drawerMode === 'cut' && (
               <div className="p-4 space-y-4">
                 <Tabs value={tab} onValueChange={setTab}>
@@ -165,11 +213,37 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
                       Duration: <span className="font-mono font-semibold text-foreground">{fmtDuration(Math.max(0, end - start))}</span>
                     </div>
                   </TabsContent>
-                  <TabsContent value="transcript" className="mt-4">
-                    <div className="rounded-lg border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
-                      <FileText className="h-6 w-6 mx-auto mb-2 opacity-60" />
-                      Coming soon — select phrase-level snippets from the transcript.
-                    </div>
+                  <TabsContent value="transcript" className="mt-4 space-y-2 max-h-[50vh] overflow-y-auto">
+                    {cutTranscript.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                        <FileText className="h-6 w-6 mx-auto mb-2 opacity-60" />
+                        No transcript segments available. Open a clip in the editor first to auto-transcribe.
+                      </div>
+                    ) : (
+                      <>
+                        <div className="text-[11px] text-muted-foreground px-1">Click any phrase to select its time range as the cut. Shift+click extends the selection.</div>
+                        {cutTranscript.map((s, i) => {
+                          const active = start <= s.start && s.end <= end
+                          return (
+                            <button
+                              key={i}
+                              onClick={(e) => {
+                                if (e.shiftKey) {
+                                  setEnd(Math.max(start + 1, Math.floor(s.end)))
+                                } else {
+                                  setStart(Math.floor(s.start))
+                                  setEnd(Math.max(Math.floor(s.start) + 5, Math.ceil(s.end)))
+                                }
+                              }}
+                              className={`w-full text-left rounded-md border p-2 text-xs transition-colors ${active ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/50'}`}
+                            >
+                              <div className="font-mono text-[10px] text-muted-foreground">{fmtDuration(s.start)} → {fmtDuration(s.end)}</div>
+                              <div className="text-foreground/90 mt-0.5">{s.text}</div>
+                            </button>
+                          )
+                        })}
+                      </>
+                    )}
                   </TabsContent>
                 </Tabs>
               </div>

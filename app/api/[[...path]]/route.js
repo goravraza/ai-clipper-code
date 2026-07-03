@@ -535,11 +535,38 @@ async function handle(request, { params }) {
       }
       if (inputs.length < 2) return NextResponse.json({ error: 'No local MP4s available for supercut' }, { status: 400 })
       try {
-        // Concat via ffmpeg filter_complex — normalizes SAR/timebase so different-source clips join cleanly.
+        // Probe each input for the presence of an audio stream. Clips without audio (from the earlier
+        // DASH bug) would break `[N:a]aresample=…` and cause `concat matches no streams`. For those we
+        // inject a silent audio track via `anullsrc` so the filter chain remains valid and joined output
+        // still plays cleanly.
         const { spawn } = await import('child_process')
+        const { execFile } = await import('child_process')
+        const hasAudio = []
+        for (const p of inputs) {
+          try {
+            const { stdout } = await new Promise((resolve, reject) => {
+              execFile('/usr/bin/ffprobe', ['-v','error','-select_streams','a','-show_entries','stream=codec_name','-of','csv=p=0', p], (err, stdout) => err ? reject(err) : resolve({ stdout }))
+            })
+            hasAudio.push(!!String(stdout || '').trim())
+          } catch { hasAudio.push(false) }
+        }
+        // Build ffmpeg args: inputs, plus an anullsrc input at the end IF any clip lacks audio.
         const args = []
         for (const p of inputs) args.push('-i', p)
-        const parts = inputs.map((_, i) => `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}];[${i}:a]aresample=44100[a${i}]`)
+        const silentIdx = inputs.length
+        const needSilent = hasAudio.some(x => !x)
+        if (needSilent) args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo')
+        // Video normalization: scale/pad to 1080x1920, setsar=1
+        const parts = inputs.map((_, i) => `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30[v${i}]`)
+        // Audio normalization: real audio → aresample; silent → apad from the anullsrc input trimmed to clip's duration
+        for (let i = 0; i < inputs.length; i++) {
+          if (hasAudio[i]) {
+            parts.push(`[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`)
+          } else {
+            const durSec = (cs[i]?.end_time_seconds - cs[i]?.start_time_seconds) || 30
+            parts.push(`[${silentIdx}:a]atrim=0:${durSec.toFixed(2)},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`)
+          }
+        }
         const joined = inputs.map((_, i) => `[v${i}][a${i}]`).join('') + `concat=n=${inputs.length}:v=1:a=1[outv][outa]`
         args.push('-filter_complex', parts.join(';') + ';' + joined,
           '-map', '[outv]', '-map', '[outa]',
