@@ -298,6 +298,18 @@ agent_communication:
       Rewrote the caption rendering pipeline for pixel-perfect preview-vs-render parity.
 
       WHAT CHANGED IN /render:
+    -agent: "main"
+    -message: |
+      Backend testing PASSED. Only known limitation: Cloudflare edge times out at 60s while backend continues (backend logs show POST completes in 59-60s → 200 OK; edge returns 502 to client).
+
+      UX FIX APPLIED (frontend-only, no backend change):
+      - SupercutView now uses fire-and-poll pattern: sends POST /supercuts/auto but doesn't wait for it. Instead polls GET /supercuts every 5s for up to 5 minutes to detect new supercuts appearing.
+      - Shows "Generating… Xs (typically 60-120s)" progress indicator.
+      - Immediately surfaces 402 (insufficient credits) / 4xx errors if the POST does return them before the poll finds new supercuts.
+      - Renders a skeleton loading card in the grid while generating.
+
+      Ready for user visual QA.
+
       - Stopped using SRT + force_style + original_size.
       - Now writes a real `.ass` file (Advanced SubStation Alpha) with PlayResX/Y set to the actual output frame dims (1080x1920 for 9:16).
       - WrapStyle=2 — no auto word-wrap (our 4-word chunker is the final say).

@@ -325,30 +325,72 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
 // Supercut sub-view — shown when the user clicks "Create Supercut".
 // New behavior (2026): supercuts are now generated_clips rows (is_supercut=true) so the parent
 // renders them with the same <ClipCard/> as normal clips (opens ClipEditor on click, trim/re-render, etc.).
-// This component just provides the layout scaffold + the "Generate More Supercuts" button.
+// Handles the Cloudflare 60s edge timeout by firing the POST and then polling GET /supercuts every 5s
+// for up to 5 minutes to detect newly-created supercuts appearing in the DB.
 export function SupercutView({ project, supercutClips = [], onBack, onGenerated, children }) {
   const [generating, setGenerating] = useState(false)
+  const [pollingMsg, setPollingMsg] = useState('')
 
   const generate = async () => {
     setGenerating(true)
-    toast.info('AI is scanning your transcript for the best narratives…', { description: 'This can take 30-90 seconds — we ffmpeg-extract each segment and stitch them.' })
-    try {
-      const r = await fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
-      const d = await r.json().catch(() => ({}))
-      if (!r.ok) {
-        if (r.status === 402) {
-          toast.error(`Insufficient credits`, { description: `Need ${(d.credits_required||0).toFixed(2)}, have ${(d.credits_available||0).toFixed(2)}.` })
-        } else {
-          throw new Error(d.error || 'Failed')
-        }
-        return
-      }
-      toast.success(`${d.count || 0} supercut${d.count === 1 ? '' : 's'} generated · ${(d.credits_used || 0).toFixed(2)} credits used`, {
-        description: `${d.segments || 0} narrative segments stitched · click any card to edit`,
+    setPollingMsg('AI is scanning your transcript…')
+    const baselineIds = new Set(supercutClips.map(c => c.id))
+    toast.info('AI is scanning your transcript for the best narratives…', { description: 'This can take 60–120 seconds — hang tight while we ffmpeg-extract each segment and stitch them.' })
+
+    // Fire the POST but DON'T wait for it (Cloudflare edge times out at 60s while the backend keeps running).
+    // Instead we start polling GET /supercuts every 5s for up to 5 minutes to detect new ones.
+    let postDone = false
+    let postResult = null
+    let postError = null
+    const postPromise = fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
+      .then(async r => {
+        postDone = true
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok) postError = { status: r.status, body: d }
+        else postResult = d
       })
-      onGenerated?.(d.supercuts || [])
-    } catch (e) { toast.error('Supercut failed', { description: e.message }) }
-    finally { setGenerating(false) }
+      .catch(e => { postDone = true; postError = { status: 0, body: { error: e.message } } })
+
+    // Poll for new supercuts every 5s up to 60 polls (5 minutes)
+    let elapsed = 0
+    let found = false
+    for (let i = 0; i < 60 && !found; i++) {
+      await new Promise(r => setTimeout(r, 5000))
+      elapsed += 5
+      setPollingMsg(`Generating… ${elapsed}s (this typically takes 60–120s)`)
+      try {
+        const r = await fetch(`/api/videos/${project.id}/supercuts`)
+        const d = await r.json().catch(() => ({}))
+        const newOnes = (d.supercuts || []).filter(s => !baselineIds.has(s.id))
+        if (newOnes.length > 0) {
+          found = true
+          toast.success(`${newOnes.length} supercut${newOnes.length === 1 ? '' : 's'} generated`, {
+            description: 'Click any card to open it in the editor for further trimming.',
+          })
+          onGenerated?.(newOnes)
+          break
+        }
+      } catch {}
+      // If POST resolved with an error (402 insufficient credits, 400 bad data, etc.), surface it immediately.
+      if (postDone && postError) {
+        if (postError.status === 402) {
+          toast.error('Insufficient credits', {
+            description: `Need ${(postError.body?.credits_required || 0).toFixed(2)}, you have ${(postError.body?.credits_available || 0).toFixed(2)}.`,
+          })
+        } else {
+          toast.error('Supercut failed', { description: postError.body?.error || 'Unknown error' })
+        }
+        break
+      }
+    }
+    if (!found && !postError) {
+      // Timed out but no error came back — probably still cooking on the server
+      toast.info('Still processing…', { description: 'The AI is taking longer than expected. Refresh the page in a minute to see new supercuts.' })
+    }
+    setPollingMsg('')
+    setGenerating(false)
+    // Best-effort refresh at the end
+    onGenerated?.([])
   }
 
   return (
@@ -364,13 +406,17 @@ export function SupercutView({ project, supercutClips = [], onBack, onGenerated,
         </div>
       </Card>
       <div className="flex items-center justify-between mb-3">
-        <div className="text-sm"><span className="font-semibold">Supercuts</span> <span className="text-muted-foreground">{supercutClips.length}</span></div>
+        <div className="text-sm">
+          <span className="font-semibold">Supercuts</span>{' '}
+          <span className="text-muted-foreground">{supercutClips.length}</span>
+          {generating && pollingMsg && <span className="ml-3 text-xs text-muted-foreground">· {pollingMsg}</span>}
+        </div>
         <Button size="sm" onClick={generate} disabled={generating} className="gap-2">
           {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
           {generating ? 'Generating…' : (supercutClips.length ? 'Generate More' : 'Generate Supercuts')}
         </Button>
       </div>
-      {supercutClips.length === 0 ? (
+      {supercutClips.length === 0 && !generating ? (
         <div className="rounded-xl border border-dashed border-border py-14 text-center">
           <Sparkles className="h-6 w-6 mx-auto mb-2 text-muted-foreground" />
           <div className="text-sm font-medium">No supercuts yet</div>
@@ -381,6 +427,15 @@ export function SupercutView({ project, supercutClips = [], onBack, onGenerated,
       ) : (
         <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
           {children}
+          {generating && (
+            <div className="rounded-xl border border-dashed border-border bg-muted/10 py-10 flex flex-col items-center justify-center text-center min-h-[280px]">
+              <Loader2 className="h-6 w-6 mb-3 text-muted-foreground animate-spin" />
+              <div className="text-sm font-medium">Building supercut…</div>
+              <div className="text-xs text-muted-foreground mt-1 px-4">
+                AI is picking narrative segments and stitching them with FFmpeg. Usually takes 60–120 seconds.
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
