@@ -92,27 +92,28 @@ export function ProjectHeaderPanel({ project, projClips, videoDurationSec, video
   const [downloading, setDownloading] = useState(false)
   const downloadFull = async () => {
     // Downloads the FULL uploaded/ingested source video (NO credit deduction).
-    // If the server hasn't persisted the source yet (older projects) we first POST /prepare-source
-    // to fetch + save it — this can take 1-3 min for a 10-min video. We show a toast during the wait.
+    // Uses fire-and-poll (Cloudflare edge times out at 60s) — fires /prepare-source but polls /status.
     if (downloading) return
     setDownloading(true)
     try {
-      // Quick status check first
-      const statusRes = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
-      if (!statusRes?.source_ready) {
-        toast.info('Preparing source video…', { description: 'Fetching the full uploaded/ingested video (this can take 1-3 min for older projects).' })
-        const prepRes = await fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' })
-        const prepData = await prepRes.json().catch(() => ({}))
-        if (!prepRes.ok || !prepData.source_ready) {
-          throw new Error(prepData.error || 'Could not prepare source video')
+      let status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+      if (!status?.source_ready) {
+        toast.info('Preparing source video…', { description: 'First-time prep: yt-dlp fetches the full video (~1-3 min). Please wait.' })
+        // Fire the prep POST — don't wait for it since Cloudflare edge cuts at 60s
+        fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' }).catch(() => {})
+        // Poll status every 3s for up to 5 min
+        for (let i = 0; i < 100; i++) {
+          await new Promise(r => setTimeout(r, 3000))
+          status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+          if (status?.source_ready) break
         }
+        if (!status?.source_ready) throw new Error('Timed out waiting for source video to be prepared (5 min limit). yt-dlp may be blocked or the video is unavailable.')
       }
-      // Now trigger the actual download via the streaming endpoint
       const a = document.createElement('a')
       a.href = `/api/videos/${project.id}/source-video/download`
       a.download = `${(project?.title || 'source').replace(/[^\w\-]+/g,'_').slice(0,60)}.mp4`
       document.body.appendChild(a); a.click(); document.body.removeChild(a)
-      toast.success('Downloading full source video', { description: 'The original file is being sent to your browser.' })
+      toast.success('Downloading full source video', { description: 'Original file is being sent to your browser.' })
     } catch (e) {
       toast.error('Could not download source video', { description: e.message })
     } finally {
@@ -353,30 +354,37 @@ export function SupercutView({ project, supercutClips = [], onBack, onGenerated,
     const baselineIds = new Set(supercutClips.map(c => c.id))
 
     try {
-      // Step 1: ensure source video + full transcript are ready
-      const status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+      // Step 1: ensure source video + full transcript are ready via fire-and-poll (Cloudflare edge is 60s but prep can take 3-5 min)
+      let status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
       if (!status?.source_ready || !status?.transcript_ready) {
         setPollingMsg('Fetching + transcribing the full source video (may take 2-4 min the first time)…')
-        toast.info('Preparing source video + transcript…', { description: 'This one-time step downloads the full video and runs Whisper. It usually takes 1-4 min.' })
-        const prepRes = await fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' })
-        const prepData = await prepRes.json().catch(() => ({}))
-        if (!prepRes.ok || !prepData.source_ready || !prepData.transcript_ready) {
-          throw new Error(prepData.error || 'Could not prepare source video/transcript')
+        toast.info('Preparing source video + transcript…', { description: 'yt-dlp downloads the full video + Whisper transcribes it. Usually 1-4 min. Please wait.' })
+        // Fire the POST but don't await (edge times out at 60s)
+        fetch(`/api/videos/${project.id}/prepare-source`, { method: 'POST' }).catch(() => {})
+        // Poll every 3s for up to 5 min
+        let prepElapsed = 0
+        let prepDone = false
+        for (let i = 0; i < 100; i++) {
+          await new Promise(r => setTimeout(r, 3000))
+          prepElapsed += 3
+          setPollingMsg(`Preparing source: ${prepElapsed}s (typically 60-240s)…`)
+          status = await fetch(`/api/videos/${project.id}/source-video/status`).then(r => r.json()).catch(() => null)
+          if (status?.source_ready && status?.transcript_ready) { prepDone = true; break }
         }
+        if (!prepDone) throw new Error('Timed out preparing source video (5 min limit). yt-dlp may be blocked, the URL may be unavailable, or Whisper may be unreachable.')
       }
 
       // Step 2: fire the supercut POST — fire-and-poll (Cloudflare edge times out at 60s while backend continues)
+      const baselineIds = new Set(supercutClips.map(c => c.id))
       setPollingMsg('AI is scanning your transcript…')
       toast.info('AI is scanning your full-video transcript…', { description: 'Picking 2-3 non-contiguous narratives to stitch into 30-120s clips.' })
       let postError = null
-      const postPromise = fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
+      fetch(`/api/videos/${project.id}/supercuts/auto`, { method: 'POST' })
         .then(async r => {
           const d = await r.json().catch(() => ({}))
           if (!r.ok) postError = { status: r.status, body: d }
         })
         .catch(e => { postError = { status: 0, body: { error: e.message } } })
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      void postPromise
 
       // Step 3: poll GET /supercuts every 5s for up to 5 minutes
       let elapsed = 0

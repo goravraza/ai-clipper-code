@@ -2210,7 +2210,8 @@ ${eventsBlock}
 
     // POST /api/videos/:id/prepare-source — on-demand fetch of the FULL source video + FULL transcript for existing/older projects
     // that didn't have these persisted at ingestion time. Idempotent: returns { source_ready: true, transcript_ready: true } once both exist.
-    // On first call it kicks off the heavy work synchronously (up to 3-5 min for a 10-min video). Frontend should poll.
+    // On first call it kicks off the heavy work synchronously (up to 3-5 min for a 10-min video). Frontend should poll /status.
+    // De-duplication: if a prepare is already in flight for this video, returns 202 immediately so we don't spawn duplicate yt-dlp processes.
     if (path_.startsWith('/videos/') && path_.endsWith('/prepare-source') && method === 'POST') {
       const user = await getUser(request, db)
       const vid = segments[1]
@@ -2218,84 +2219,92 @@ ${eventsBlock}
       if (!v) return NextResponse.json({ error: 'not found' }, { status: 404 })
       if (v.user_id !== user.id && user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
 
-      const SOURCES_DIR = path.join(UPLOAD_DIR, 'sources')
-      await fs.mkdir(SOURCES_DIR, { recursive: true })
-      const sourceOutPath = v.source_video_path || path.join(SOURCES_DIR, `${vid}.mp4`)
-      let sourceReady = false
-      try { await fs.access(sourceOutPath); sourceReady = true } catch {}
+      // Module-scoped in-flight tracker to prevent concurrent yt-dlp spawns for the same video
+      globalThis.__prepareSourceInFlight = globalThis.__prepareSourceInFlight || new Set()
+      if (globalThis.__prepareSourceInFlight.has(vid)) {
+        return NextResponse.json({ ok: true, in_progress: true, source_ready: false, transcript_ready: false, message: 'Preparation already in progress — poll /source-video/status' }, { status: 202 })
+      }
+      globalThis.__prepareSourceInFlight.add(vid)
 
-      // STEP 1: source video
-      if (!sourceReady) {
-        if (!v.original_url) {
-          return NextResponse.json({ error: 'This project has no source URL to fetch from (was uploaded but source file is missing). Please re-ingest the video.', source_ready: false }, { status: 400 })
-        }
-        try {
-          const { fetchFullVideoFromYouTube, getProxyUrl: _getProxyUrl } = await import('@/lib/video-processor')
-          void _getProxyUrl
-          const sessionId = `prepsrc${vid.slice(0,8)}${Date.now().toString(36)}`
-          const tmpDir = path.join(UPLOAD_DIR, 'originals', vid)
-          await fs.mkdir(tmpDir, { recursive: true })
-          const fullPath = await fetchFullVideoFromYouTube({ url: v.original_url, outDir: tmpDir, db, maxHeight: 1080, sessionId })
-          if (fullPath) {
-            try { await fs.rename(fullPath, sourceOutPath); sourceReady = true } catch (renErr) {
-              // Fallback: copy if rename fails (cross-device)
-              await fs.copyFile(fullPath, sourceOutPath); await fs.unlink(fullPath).catch(()=>{}); sourceReady = true
+      try {
+        const SOURCES_DIR = path.join(UPLOAD_DIR, 'sources')
+        await fs.mkdir(SOURCES_DIR, { recursive: true })
+        const sourceOutPath = v.source_video_path || path.join(SOURCES_DIR, `${vid}.mp4`)
+        let sourceReady = false
+        try { await fs.access(sourceOutPath); sourceReady = true } catch {}
+
+        // STEP 1: source video
+        if (!sourceReady) {
+          if (!v.original_url) {
+            return NextResponse.json({ error: 'This project has no source URL to fetch from (was uploaded but source file is missing). Please re-ingest the video.', source_ready: false }, { status: 400 })
+          }
+          try {
+            const { fetchFullVideoFromYouTube } = await import('@/lib/video-processor')
+            const sessionId = `prepsrc${vid.slice(0,8)}${Date.now().toString(36)}`
+            const tmpDir = path.join(UPLOAD_DIR, 'originals', vid)
+            await fs.mkdir(tmpDir, { recursive: true })
+            const fullPath = await fetchFullVideoFromYouTube({ url: v.original_url, outDir: tmpDir, db, maxHeight: 1080, sessionId })
+            if (fullPath) {
+              try { await fs.rename(fullPath, sourceOutPath); sourceReady = true } catch {
+                await fs.copyFile(fullPath, sourceOutPath); await fs.unlink(fullPath).catch(()=>{}); sourceReady = true
+              }
+              try {
+                const st = await fs.stat(sourceOutPath)
+                await db.collection('videos_processed').updateOne({ id: vid }, { $set: {
+                  source_video_path: sourceOutPath,
+                  source_video_size_bytes: st.size,
+                } })
+              } catch {}
             }
-            try {
-              const st = await fs.stat(sourceOutPath)
+            try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
+          } catch (dlErr) {
+            return NextResponse.json({ error: 'Failed to fetch source video: ' + dlErr.message, source_ready: false }, { status: 500 })
+          }
+        }
+
+        // STEP 2: full transcript
+        let transcriptReady = Array.isArray(v.full_transcript_segments) && v.full_transcript_segments.length > 0
+        if (!transcriptReady && sourceReady) {
+          try {
+            const { spawn } = await import('child_process')
+            const audioPath = sourceOutPath.replace(/\.mp4$/, '.audio.mp3')
+            await new Promise((resolve, reject) => {
+              const ff = spawn('/usr/bin/ffmpeg', ['-y', '-i', sourceOutPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '96k', audioPath])
+              let stderr = ''
+              ff.stderr.on('data', d => { stderr += d.toString() })
+              ff.on('close', code => code === 0 ? resolve() : reject(new Error('audio extract failed: ' + stderr.slice(-200))))
+            })
+            const { getOpenAIKey, getGroqWhisperConfig, transcribeWithWhisper } = await import('@/lib/video-processor')
+            const openaiKey = await getOpenAIKey(db).catch(() => null)
+            const groqCfg = await getGroqWhisperConfig(db).catch(() => null)
+            if (!openaiKey && !groqCfg) {
+              return NextResponse.json({ error: 'No Whisper provider configured (need Groq or OpenAI API key in Admin → Integrations)', source_ready: true, transcript_ready: false }, { status: 400 })
+            }
+            const whisperSegs = await transcribeWithWhisper(audioPath, openaiKey, v.language || null, db)
+            try { await fs.unlink(audioPath) } catch {}
+            if (Array.isArray(whisperSegs) && whisperSegs.length > 0) {
+              const compact = whisperSegs.map(s => ({
+                start: Number(s.start || 0),
+                end: Number(s.end || 0),
+                text: String(s.text || '').slice(0, 500),
+                words: Array.isArray(s.words) ? s.words.map(w => ({ start: Number(w.start || 0), end: Number(w.end || 0), text: String(w.text || w.word || '').slice(0, 40) })) : [],
+              }))
               await db.collection('videos_processed').updateOne({ id: vid }, { $set: {
-                source_video_path: sourceOutPath,
-                source_video_size_bytes: st.size,
+                full_transcript_segments: compact,
+                full_transcript_text: compact.map(s => s.text).join(' ').slice(0, 20000),
+                transcription_source: 'whisper',
               } })
-            } catch {}
+              transcriptReady = true
+            }
+          } catch (trErr) {
+            return NextResponse.json({ error: 'Failed to transcribe source: ' + trErr.message, source_ready: sourceReady, transcript_ready: false }, { status: 500 })
           }
-          try { await fs.rm(tmpDir, { recursive: true, force: true }) } catch {}
-        } catch (dlErr) {
-          return NextResponse.json({ error: 'Failed to fetch source video: ' + dlErr.message, source_ready: false }, { status: 500 })
         }
-      }
 
-      // STEP 2: full transcript
-      let transcriptReady = Array.isArray(v.full_transcript_segments) && v.full_transcript_segments.length > 0
-      if (!transcriptReady && sourceReady) {
-        try {
-          const { spawn } = await import('child_process')
-          const audioPath = sourceOutPath.replace(/\.mp4$/, '.audio.mp3')
-          await new Promise((resolve, reject) => {
-            const ff = spawn('/usr/bin/ffmpeg', ['-y', '-i', sourceOutPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '96k', audioPath])
-            let stderr = ''
-            ff.stderr.on('data', d => { stderr += d.toString() })
-            ff.on('close', code => code === 0 ? resolve() : reject(new Error('audio extract failed: ' + stderr.slice(-200))))
-          })
-          // Whisper transcription — use existing utility inside video-processor
-          const { getOpenAIKey, getGroqWhisperConfig, transcribeWithWhisper } = await import('@/lib/video-processor')
-          const openaiKey = await getOpenAIKey(db).catch(() => null)
-          const groqCfg = await getGroqWhisperConfig(db).catch(() => null)
-          if (!openaiKey && !groqCfg) {
-            return NextResponse.json({ error: 'No Whisper provider configured (need Groq or OpenAI API key in Admin → Integrations)', source_ready: true, transcript_ready: false }, { status: 400 })
-          }
-          const whisperSegs = await transcribeWithWhisper(audioPath, openaiKey, v.language || null, db)
-          try { await fs.unlink(audioPath) } catch {}
-          if (Array.isArray(whisperSegs) && whisperSegs.length > 0) {
-            const compact = whisperSegs.map(s => ({
-              start: Number(s.start || 0),
-              end: Number(s.end || 0),
-              text: String(s.text || '').slice(0, 500),
-              words: Array.isArray(s.words) ? s.words.map(w => ({ start: Number(w.start || 0), end: Number(w.end || 0), text: String(w.text || w.word || '').slice(0, 40) })) : [],
-            }))
-            await db.collection('videos_processed').updateOne({ id: vid }, { $set: {
-              full_transcript_segments: compact,
-              full_transcript_text: compact.map(s => s.text).join(' ').slice(0, 20000),
-              transcription_source: 'whisper',
-            } })
-            transcriptReady = true
-          }
-        } catch (trErr) {
-          return NextResponse.json({ error: 'Failed to transcribe source: ' + trErr.message, source_ready: sourceReady, transcript_ready: false }, { status: 500 })
-        }
+        return NextResponse.json({ ok: true, source_ready: sourceReady, transcript_ready: transcriptReady })
+      } finally {
+        globalThis.__prepareSourceInFlight.delete(vid)
       }
-
-      return NextResponse.json({ ok: true, source_ready: sourceReady, transcript_ready: transcriptReady })
     }
 
     // GET /api/videos/:id/source-video/status — check if the source is persisted and transcript is available
