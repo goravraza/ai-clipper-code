@@ -13,7 +13,7 @@ import {
   Palette, Captions, Type, Camera, Film, Crop, Droplet, Hash, Image as ImageIcon,
   Gauge, Scissors, X, Loader2, Upload, Sparkles, Check, MessageSquareText, Save as SaveIcon, Plus, Trash2,
 } from 'lucide-react'
-import { styleAssToCss, chunkForLine, findActiveCue } from './captionUtils'
+import { styleAssToCss, chunkForLine, findActiveCue, assToCss } from './captionUtils'
 
 // Caption-style presets (the "Big idea" grid in the reference)
 const PRESETS = [
@@ -101,6 +101,13 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       animation_style: clip.animation_style || 'karaoke',
       // Fill mode for 9:16 portrait when source is landscape
       fill_mode: clip.fill_mode || 'crop',
+      // NEW: fully customizable caption styling — overrides the preset's defaults if set.
+      // Presets set these too (via selectPreset) so it stays a batch update.
+      font_family: clip.font_family || clip.style_ass?.fontName || 'Montserrat',
+      base_text_color: clip.base_text_color || assToCss(clip.style_ass?.primary) || '#FFFFFF',
+      highlight_text_color: clip.highlight_text_color || assToCss(clip.style_ass?.accent) || '#FFFF00',
+      stroke_color: clip.stroke_color || assToCss(clip.style_ass?.outlineColour) || '#000000',
+      shadow_color: clip.shadow_color || assToCss(clip.style_ass?.back) || '#000000',
       fill_color: clip.fill_color || '#000000',
       clip_title: clip.clip_title || '',
       duration: dur,
@@ -236,11 +243,18 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
   function patch(p) { setState(s => ({ ...s, ...p })) }
 
   function selectPreset(p) {
+    // Batch update: preset overwrites BOTH styleAss AND the individual color/font fields so
+    // the CC-tab pickers stay in sync. User can still manually override individual fields after.
     patch({
       style_preset: p.id,
       style_ass: p.ass,
       font_size: p.ass.fontSize,
       outline_size: p.ass.outline ?? 2,
+      font_family: p.ass.fontName || 'Montserrat',
+      base_text_color: assToCss(p.ass.primary) || '#FFFFFF',
+      highlight_text_color: assToCss(p.ass.accent) || '#FFFF00',  // presets rarely define accent — keep yellow default
+      stroke_color: assToCss(p.ass.outlineColour) || '#000000',
+      shadow_color: p.ass.back ? assToCss(p.ass.back) : '#000000',
     })
   }
 
@@ -297,6 +311,12 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         template_id: state.template_id,
         // NEW: caption animation style — drives the ASS event generator in the backend
         animation_style: state.animation_style,
+        // NEW: fully customizable caption design (CC-tab pickers)
+        font_family: state.font_family,
+        base_text_color: state.base_text_color,
+        highlight_text_color: state.highlight_text_color,
+        stroke_color: state.stroke_color,
+        shadow_color: state.shadow_color,
         // Pass the edited caption track so the backend uses the user's edits (not the cached srt)
         caption_segments: activeCaptionTrack,
       }
@@ -583,6 +603,10 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   fontSize: state.font_size,
                   outlineSize: state.outline_size,
                   previewBoxHeight: previewRect.height,
+                  // Manual color/font overrides from the CC tab pickers take precedence over the preset defaults
+                  fontFamilyOverride: state.font_family,
+                  colorOverride: state.base_text_color,
+                  strokeOverride: state.stroke_color,
                 })
                 const isEditing = editingCueIdx === activeCueIdx && activeCueIdx >= 0
                 const selected = !!activeCue && !displayCue._ghost
@@ -676,8 +700,8 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                               })
                             }
                           }
-                          // Accent color (default yellow) from styleAss.accent_hex or #FFFF00
-                          const accent = (state.style_ass && (state.style_ass.accent_hex || state.style_ass.accentHex)) || '#FFFF00'
+                          // Accent color — user's state.highlight_text_color takes precedence, then styleAss, then yellow
+                          const accent = state.highlight_text_color || (state.style_ass && (state.style_ass.accent_hex || state.style_ass.accentHex)) || '#FFFF00'
                           // Find the active word index at currentTime — if outside the cue window, default to first word
                           // so ghost/paused previews always show at least the "active word" styling on token[0].
                           let activeIdx = wordTimings.findIndex(w => currentTime >= w.start - 0.02 && currentTime < w.end + 0.02)
@@ -814,6 +838,62 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                   </div>
                   <Slider min={0} max={6} step={0.5} value={[state.outline_size]} onValueChange={([v]) => patch({ outline_size: v })} />
                 </div>
+
+                {/* ── NEW: Caption Design Panel — Font family + Base / Highlight / Stroke / Shadow color pickers.
+                    Live-preview binds to state via `state.font_family`, `state.base_text_color`, etc.
+                    Backend consumes these on render and converts hex → ASS &HAABBGGRR& in the Style row + \c inline tag. */}
+                <div className="space-y-3 pt-2 border-t border-border">
+                  <Label className="text-sm font-semibold">Caption Design</Label>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">Font family</Label>
+                    <select
+                      value={state.font_family}
+                      onChange={(e) => patch({ font_family: e.target.value })}
+                      className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                    >
+                      {['Impact', 'Montserrat', 'Arial Black', 'Bold Sans', 'Bebas Neue', 'Oswald', 'Pacifico', 'Bangers', 'DejaVu Sans'].map(f => (
+                        <option key={f} value={f}>{f}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {[
+                      { key: 'base_text_color',      label: 'Base text',        hint: 'Non-active words' },
+                      { key: 'highlight_text_color', label: 'Highlight word',   hint: 'Active-word color' },
+                      { key: 'stroke_color',         label: 'Stroke / outline', hint: 'Text border' },
+                      { key: 'shadow_color',         label: 'Shadow',           hint: 'Behind text' },
+                    ].map(fld => (
+                      <div key={fld.key} className="space-y-1">
+                        <Label className="text-xs text-muted-foreground">{fld.label}</Label>
+                        <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5">
+                          <input
+                            type="color"
+                            value={state[fld.key] || '#000000'}
+                            onChange={(e) => patch({ [fld.key]: e.target.value.toUpperCase() })}
+                            className="h-6 w-8 rounded cursor-pointer border-0 bg-transparent p-0"
+                            title={fld.hint}
+                          />
+                          <input
+                            type="text"
+                            value={state[fld.key] || ''}
+                            onChange={(e) => {
+                              const v = e.target.value.trim()
+                              if (/^#?[0-9a-fA-F]{0,6}$/.test(v)) {
+                                patch({ [fld.key]: v.startsWith('#') ? v.toUpperCase() : ('#' + v).toUpperCase() })
+                              }
+                            }}
+                            className="flex-1 bg-transparent text-xs font-mono outline-none min-w-0"
+                            maxLength={7}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground -mt-1">
+                    Colors apply live to the preview and are burned into the exported MP4 on render. Selecting a Preset from the Presets tab resets these to that preset&apos;s defaults.
+                  </div>
+                </div>
+
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
                     <Label>Caption position (from top)</Label>

@@ -1738,6 +1738,26 @@ ${transcriptListing}`
             bold: 1,
             ...(styleAss || {}),
           }
+          // Convert CSS hex (#RRGGBB) → ASS Style-row hex (&HAABBGGRR&) so the CC-tab pickers override the preset defaults.
+          const hexToAss = (hex) => {
+            if (!hex) return null
+            let h = String(hex).trim().replace(/^#/, '')
+            if (h.length === 3) h = h.split('').map(c => c + c).join('')
+            if (!/^[0-9a-fA-F]{6}$/.test(h)) return null
+            const r = h.slice(0,2).toUpperCase(), g = h.slice(2,4).toUpperCase(), b = h.slice(4,6).toUpperCase()
+            return `&H00${b}${g}${r}&`
+          }
+          // Apply frontend CC-tab overrides to the ASS Style fields when provided.
+          if (typeof body.font_family === 'string' && body.font_family.trim()) s.fontName = body.font_family.trim()
+          const bodyPrimary = hexToAss(body.base_text_color)
+          if (bodyPrimary) s.primary = bodyPrimary
+          const bodyStroke = hexToAss(body.stroke_color)
+          if (bodyStroke) s.outlineColour = bodyStroke
+          const bodyShadow = hexToAss(body.shadow_color)
+          if (bodyShadow && !s.back) {
+            // shadow_color drives BackColour (drop-shadow); NEVER auto-enable a background box.
+            // If the preset already uses back (borderStyle:3) we leave `s.back` alone.
+          }
           const primary = stripTrailAmp(s.primary || '&H00FFFFFF')
           // libass 0.17.x QUIRK: for BorderStyle=3 (opaque box), the field used to color the box is
           // actually `OutlineColour` (\3c), NOT `BackColour`. This contradicts the VSFilter/ASS spec
@@ -1767,8 +1787,9 @@ ${transcriptListing}`
             effectiveShadow = Math.max(2, Math.round(assFontSize / 40))
           }
           // Word-level accent color — used for karaoke-style word highlight (see writeAssWithWords below).
-          // Fallback to a bright yellow if user didn't provide one.
-          const accentColour = stripTrailAmp(s.accent || s.accentColour || '&H0000FFFF&') // ASS = &HAABBGGRR → 00FFFF = pure yellow (RR=FF GG=FF BB=00 → RGB(0xFF, 0xFF, 0x00) is wrong; correct: &H0000FFFF = alpha 00 blue 00 green FF red FF → RGB(255,255,0) YELLOW ✓)
+          // Priority: body.highlight_text_color (CC-tab picker) → styleAss.accent → yellow default.
+          const bodyAccent = hexToAss(body.highlight_text_color)
+          const accentColour = stripTrailAmp(bodyAccent || s.accent || s.accentColour || '&H0000FFFF&') // ASS = &HAABBGGRR → 00FFFF = pure yellow (RR=FF GG=FF BB=00 → RGB(0xFF, 0xFF, 0x00) is wrong; correct: &H0000FFFF = alpha 00 blue 00 green FF red FF → RGB(255,255,0) YELLOW ✓)
           // Style.MarginL/R/V are unused because we override per-cue with \pos. Set generous side margins anyway.
           const styleMarginH = Math.round(frameW * 0.05)
           const styleLine = `Style: Default,${s.fontName},${assFontSize},${primary},&H000000FF,${outlineCol},${back},${bold},0,0,0,100,100,0,0,${borderStyle},${effectiveOutline},${effectiveShadow},5,${styleMarginH},${styleMarginH},0,1`
@@ -2139,6 +2160,18 @@ ${eventsBlock}
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
           template_id: templateId,
           animation_style: ['static','karaoke','word_bounce'].includes(body.animation_style) ? body.animation_style : (clip.animation_style || 'karaoke'),
+          // CC-tab custom design fields — persist so reopening the editor restores the user's choices.
+          // Only persist if the input is a valid hex (#RRGGBB or #RGB), otherwise keep the previous value.
+          ...(function(){
+            const isHex = (h) => typeof h === 'string' && /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(h.trim())
+            return {
+              font_family:          typeof body.font_family === 'string' ? body.font_family.slice(0, 60) : (clip.font_family || null),
+              base_text_color:      isHex(body.base_text_color)      ? body.base_text_color.toUpperCase()      : (clip.base_text_color || null),
+              highlight_text_color: isHex(body.highlight_text_color) ? body.highlight_text_color.toUpperCase() : (clip.highlight_text_color || null),
+              stroke_color:         isHex(body.stroke_color)         ? body.stroke_color.toUpperCase()         : (clip.stroke_color || null),
+              shadow_color:         isHex(body.shadow_color)         ? body.shadow_color.toUpperCase()         : (clip.shadow_color || null),
+            }
+          })(),
           last_rendered_at: new Date(),
           render_version: (clip.render_version || 0) + 1,
           overlays_config: { ...(clip.overlays_config || {}), caption: { ...(clip.overlays_config?.caption || {}), position_percent: captionPos } },

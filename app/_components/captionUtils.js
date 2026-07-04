@@ -10,6 +10,20 @@ export function assToCss(c) {
   return `#${r}${g}${b}`
 }
 
+// Convert a CSS hex color (#RRGGBB or #RGB) to the ASS Style-row format `&HAABBGGRR&`.
+// Alpha byte is fixed at 00 (fully opaque) — the AA field only matters when the user overrides transparency.
+// Returns null for invalid input so callers can fall back to defaults.
+export function cssHexToAss(hex) {
+  if (!hex) return null
+  let h = String(hex).trim().replace(/^#/, '')
+  if (h.length === 3) h = h.split('').map(c => c + c).join('')  // #RGB → RRGGBB
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return null
+  const r = h.slice(0, 2).toUpperCase()
+  const g = h.slice(2, 4).toUpperCase()
+  const b = h.slice(4, 6).toUpperCase()
+  return `&H00${b}${g}${r}&`
+}
+
 // Build a CSS style object that visually approximates ASS subtitle rendering.
 // Used by the live caption overlay during preview so what-you-see-IS-what-renders.
 //
@@ -20,13 +34,13 @@ export function assToCss(c) {
 // For the preview to be pixel-proportional we use the SAME ratio scaled to the preview box:
 //   previewPx = fontSize * (previewBoxHeight / 288)
 // This makes the preview WYSIWYG with the final render output.
-export function styleAssToCss({ styleAss, fontSize, outlineSize, previewBoxHeight = 462, frameWidth }) {
+export function styleAssToCss({ styleAss, fontSize, outlineSize, previewBoxHeight = 462, frameWidth, fontFamilyOverride, colorOverride, strokeOverride }) {
   // Back-compat: if caller still passes `frameWidth` (old signature) use a fallback height.
   const refH = previewBoxHeight || (frameWidth ? Math.round(frameWidth * 16 / 9) : 462)
   const ass = styleAss || {}
-  const fontFamily = ass.fontName || 'DejaVu Sans'
-  const color = assToCss(ass.primary) || '#ffffff'
-  const stroke = assToCss(ass.outlineColour) || '#000000'
+  const fontFamily = fontFamilyOverride || ass.fontName || 'DejaVu Sans'
+  const color = colorOverride || assToCss(ass.primary) || '#ffffff'
+  const stroke = strokeOverride || assToCss(ass.outlineColour) || '#000000'
   const back = ass.back ? assToCss(ass.back) : null
   const bold = ass.bold ? 800 : 400
   // Match render: previewPx = fontSize * (previewBoxHeight / 288)
