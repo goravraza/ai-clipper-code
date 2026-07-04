@@ -1101,6 +1101,155 @@ ${transcriptListing}`
       return NextResponse.json({ url, filename, size: buffer.length })
     }
 
+    // ============= INTRO / OUTRO / SCROLL-STOPPER MEDIA PIPELINE =============
+    // See spec: per-clip intros + outros (user upload), admin-managed scroll_stoppers with global toggle.
+
+    // ffprobe helper: get duration in seconds (float). Returns 0 on failure.
+    const probeDur = async (p) => {
+      try {
+        const { execFile } = await import('child_process')
+        const { stdout } = await new Promise((res, rej) => execFile('/usr/bin/ffprobe', ['-v','error','-show_entries','format=duration','-of','default=nokey=1:noprint_wrappers=1', p], (e, o) => e ? rej(e) : res({ stdout: o })))
+        return parseFloat(String(stdout).trim()) || 0
+      } catch { return 0 }
+    }
+
+    // POST /api/user/project/upload-intro  or  /upload-outro — per-clip user upload (MP4/MOV, ≤5s, ≤20MB).
+    // Frontend passes `clip_id` in the form. File persisted to /app/data/uploads/{intros|outros}/<uuid>.mp4 and path bound to the clip.
+    if ((path_ === '/user/project/upload-intro' || path_ === '/user/project/upload-outro') && method === 'POST') {
+      const user = await getUser(request, db)
+      const kind = path_.endsWith('intro') ? 'intro' : 'outro'
+      const form = await request.formData()
+      const file = form.get('file')
+      const clipId = String(form.get('clip_id') || '')
+      if (!file || typeof file === 'string') return NextResponse.json({ error: 'No file' }, { status: 400 })
+      if (!clipId) return NextResponse.json({ error: 'clip_id required' }, { status: 400 })
+      const clip = await db.collection('generated_clips').findOne({ id: clipId, user_id: user.id })
+      if (!clip) return NextResponse.json({ error: 'Clip not found or not owned by user' }, { status: 404 })
+      const buffer = Buffer.from(await file.arrayBuffer())
+      if (buffer.length > 20 * 1024 * 1024) return NextResponse.json({ error: 'File too large (max 20MB)' }, { status: 413 })
+      const ext = (file.name?.split('.').pop() || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '')
+      if (!['mp4', 'mov', 'm4v'].includes(ext)) return NextResponse.json({ error: 'Only MP4 or MOV allowed' }, { status: 415 })
+      const dir = path.join(UPLOAD_DIR, kind === 'intro' ? 'intros' : 'outros')
+      await fs.mkdir(dir, { recursive: true })
+      const id = uuidv4()
+      const filename = `${id}.${ext}`
+      const diskPath = path.join(dir, filename)
+      await fs.writeFile(diskPath, buffer)
+      // Enforce ≤5s duration
+      const durSec = await probeDur(diskPath)
+      if (durSec > 5.5) {
+        await fs.unlink(diskPath).catch(()=>{})
+        return NextResponse.json({ error: `${kind} must be ≤5 seconds (was ${durSec.toFixed(1)}s)` }, { status: 400 })
+      }
+      const urlPath = `/api/files/${kind === 'intro' ? 'intros' : 'outros'}/${filename}`
+      const pathField = kind === 'intro' ? 'user_intro_path' : 'user_outro_path'
+      const urlField  = kind === 'intro' ? 'user_intro_url'  : 'user_outro_url'
+      // Cleanup any previous file for this clip to avoid orphans
+      const oldPath = clip[pathField]
+      if (oldPath && oldPath !== diskPath) { try { await fs.unlink(oldPath) } catch {} }
+      await db.collection('generated_clips').updateOne({ id: clipId }, { $set: { [pathField]: diskPath, [urlField]: urlPath, updated_at: new Date() } })
+      return NextResponse.json({ ok: true, kind, [urlField]: urlPath, duration_seconds: durSec })
+    }
+
+    // DELETE /api/user/project/clip/:id/intro  (or /outro) — remove the bound intro/outro
+    if (path_.startsWith('/user/project/clip/') && (path_.endsWith('/intro') || path_.endsWith('/outro')) && method === 'DELETE') {
+      const user = await getUser(request, db)
+      const clipId = segments[3]
+      const kind = path_.endsWith('intro') ? 'intro' : 'outro'
+      const clip = await db.collection('generated_clips').findOne({ id: clipId, user_id: user.id })
+      if (!clip) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      const pathField = kind === 'intro' ? 'user_intro_path' : 'user_outro_path'
+      const urlField  = kind === 'intro' ? 'user_intro_url'  : 'user_outro_url'
+      if (clip[pathField]) { try { await fs.unlink(clip[pathField]) } catch {} }
+      await db.collection('generated_clips').updateOne({ id: clipId }, { $unset: { [pathField]: '', [urlField]: '' } })
+      return NextResponse.json({ ok: true })
+    }
+
+    // POST /api/admin/settings/toggle-scroll-stopper  { enabled: bool } — flips global toggle in system_config
+    if (path_ === '/admin/settings/toggle-scroll-stopper' && method === 'POST') {
+      const user = await getUser(request, db)
+      if (user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json().catch(() => ({}))
+      const enabled = body.enabled === true
+      await db.collection('system_config').updateOne(
+        { key: 'global_scroll_stopper_status' },
+        { $set: { key: 'global_scroll_stopper_status', value: enabled, updated_at: new Date(), updated_by: user.id } },
+        { upsert: true }
+      )
+      return NextResponse.json({ ok: true, enabled })
+    }
+
+    // POST /api/admin/scroll-stoppers/upload — admin adds a 2-5s MP4 hook (≤10MB)
+    if (path_ === '/admin/scroll-stoppers/upload' && method === 'POST') {
+      const user = await getUser(request, db)
+      if (user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const form = await request.formData()
+      const file = form.get('file')
+      const title = String(form.get('title') || '').slice(0, 120) || 'Untitled Hook'
+      if (!file || typeof file === 'string') return NextResponse.json({ error: 'No file' }, { status: 400 })
+      const buffer = Buffer.from(await file.arrayBuffer())
+      if (buffer.length > 10 * 1024 * 1024) return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 413 })
+      const ext = (file.name?.split('.').pop() || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '')
+      if (ext !== 'mp4') return NextResponse.json({ error: 'MP4 only for scroll-stoppers' }, { status: 415 })
+      const dir = path.join(UPLOAD_DIR, 'scroll_stoppers')
+      await fs.mkdir(dir, { recursive: true })
+      const id = uuidv4()
+      const filename = `${id}.mp4`
+      const diskPath = path.join(dir, filename)
+      await fs.writeFile(diskPath, buffer)
+      const durSec = await probeDur(diskPath)
+      if (durSec < 1.5 || durSec > 5.5) {
+        await fs.unlink(diskPath).catch(()=>{})
+        return NextResponse.json({ error: `Scroll-stopper must be 2-5s (was ${durSec.toFixed(1)}s)` }, { status: 400 })
+      }
+      const doc = { id, title, file_path: diskPath, file_url: `/api/files/scroll_stoppers/${filename}`, duration_seconds: durSec, is_active: true, created_at: new Date(), created_by: user.id }
+      await db.collection('scroll_stoppers').insertOne(doc)
+      return NextResponse.json({ ok: true, scroll_stopper: strip(doc) })
+    }
+
+    // GET  /api/admin/scroll-stoppers — list all (admin sees inactive too)
+    if (path_ === '/admin/scroll-stoppers' && method === 'GET') {
+      const user = await getUser(request, db)
+      if (user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('scroll_stoppers').find({}).sort({ created_at: -1 }).toArray()
+      const cfg = await db.collection('system_config').findOne({ key: 'global_scroll_stopper_status' })
+      return NextResponse.json({ scroll_stoppers: list.map(strip), global_enabled: !!cfg?.value })
+    }
+
+    // PATCH /api/admin/scroll-stoppers/:id  { is_active, title }
+    if (path_.startsWith('/admin/scroll-stoppers/') && !path_.endsWith('/upload') && method === 'PATCH') {
+      const user = await getUser(request, db)
+      if (user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const body = await request.json().catch(() => ({}))
+      const setF = {}
+      if (typeof body.is_active === 'boolean') setF.is_active = body.is_active
+      if (typeof body.title === 'string') setF.title = body.title.slice(0, 120)
+      if (Object.keys(setF).length === 0) return NextResponse.json({ error: 'no-op' }, { status: 400 })
+      await db.collection('scroll_stoppers').updateOne({ id }, { $set: setF })
+      return NextResponse.json({ ok: true })
+    }
+
+    // DELETE /api/admin/scroll-stoppers/:id
+    if (path_.startsWith('/admin/scroll-stoppers/') && method === 'DELETE') {
+      const user = await getUser(request, db)
+      if (user.role !== 'admin') return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const doc = await db.collection('scroll_stoppers').findOne({ id })
+      if (!doc) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (doc.file_path) { try { await fs.unlink(doc.file_path) } catch {} }
+      await db.collection('scroll_stoppers').deleteOne({ id })
+      return NextResponse.json({ ok: true })
+    }
+
+    // GET /api/scroll-stoppers/active — user-facing gallery. Respects the global toggle.
+    if (path_ === '/scroll-stoppers/active' && method === 'GET') {
+      const cfg = await db.collection('system_config').findOne({ key: 'global_scroll_stopper_status' })
+      if (!cfg?.value) return NextResponse.json({ enabled: false, scroll_stoppers: [] })
+      const list = await db.collection('scroll_stoppers').find({ is_active: true }).sort({ created_at: -1 }).toArray()
+      return NextResponse.json({ enabled: true, scroll_stoppers: list.map(strip) })
+    }
+
     // ============= VIDEOS / AI =============
     if (path_ === '/videos' && method === 'POST') {
       const user = await getUser(request, db)
@@ -2141,6 +2290,83 @@ ${eventsBlock}
 
         // Replace in place (same key so old URL still works)
         await fs.copyFile(tmpOut, srcPath)
+
+        // ============= INTRO / SCROLL-STOPPER / OUTRO STITCH (MASTER CONCAT CHOP) =============
+        // Order per spec:  [ user_intro OR selected scroll_stopper ]  →  [ core clip w/ captions ]  →  [ user_outro ]
+        // Each anchor media is normalized to 1080x1920 / 30fps / AAC 44.1kHz stereo (matches core clip codec),
+        // then concat-demuxed. If NO anchors are configured, we skip this whole block and keep the core file.
+        try {
+          const introSrc = clip.user_intro_path && (await fs.access(clip.user_intro_path).then(() => clip.user_intro_path).catch(() => null))
+          const outroSrc = clip.user_outro_path && (await fs.access(clip.user_outro_path).then(() => clip.user_outro_path).catch(() => null))
+          // Scroll-stopper resolution: only used if there is NO user intro AND global toggle is ON.
+          // body.scroll_stopper_id can be a specific id, 'random' (pick from active pool), or null.
+          let scrollStopperSrc = null
+          if (!introSrc && body.scroll_stopper_id) {
+            const cfg = await db.collection('system_config').findOne({ key: 'global_scroll_stopper_status' })
+            if (cfg?.value) {
+              let picked = null
+              if (body.scroll_stopper_id === 'random') {
+                const pool = await db.collection('scroll_stoppers').find({ is_active: true }).toArray()
+                if (pool.length > 0) picked = pool[Math.floor(Math.random() * pool.length)]
+              } else {
+                picked = await db.collection('scroll_stoppers').findOne({ id: String(body.scroll_stopper_id), is_active: true })
+              }
+              if (picked?.file_path && await fs.access(picked.file_path).then(() => true).catch(() => false)) {
+                scrollStopperSrc = picked.file_path
+              }
+            }
+          }
+
+          const startAnchor = introSrc || scrollStopperSrc
+          if (startAnchor || outroSrc) {
+            // Normalize each anchor to match the core clip's codec params so concat-demuxer stream-copy works.
+            const normalizeAnchor = async (inPath, outPath) => {
+              await new Promise((resolve, reject) => {
+                const p = spawn('/usr/bin/ffmpeg', [
+                  '-y', '-i', inPath,
+                  '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30',
+                  '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+                  '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+                  '-vsync', 'cfr', '-async', '1', '-movflags', '+faststart', outPath,
+                ], { stdio: ['ignore', 'pipe', 'pipe'] })
+                let se = ''
+                p.stderr.on('data', d => { se += d.toString() })
+                p.on('close', code => code === 0 ? resolve() : reject(new Error('anchor normalize failed: ' + se.slice(-200))))
+                p.on('error', reject)
+              })
+            }
+            const stitchDir = path.join(tmpDir || '/tmp', `stitch_${uuidv4()}`)
+            await fs.mkdir(stitchDir, { recursive: true })
+            const parts = []
+            if (startAnchor) {
+              const p = path.join(stitchDir, 'start.mp4')
+              await normalizeAnchor(startAnchor, p); parts.push(p)
+            }
+            parts.push(srcPath)  // core clip is already normalized
+            if (outroSrc) {
+              const p = path.join(stitchDir, 'end.mp4')
+              await normalizeAnchor(outroSrc, p); parts.push(p)
+            }
+            // Concat via demuxer + stream-copy (all parts share codec params)
+            const listFile = path.join(stitchDir, 'concat.txt')
+            await fs.writeFile(listFile, parts.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'))
+            const stitched = path.join(stitchDir, 'stitched.mp4')
+            await new Promise((resolve, reject) => {
+              const p = spawn('/usr/bin/ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', '-movflags', '+faststart', stitched], { stdio: ['ignore', 'pipe', 'pipe'] })
+              let se = ''
+              p.stderr.on('data', d => { se += d.toString() })
+              p.on('close', code => code === 0 ? resolve() : reject(new Error('stitch concat failed: ' + se.slice(-200))))
+              p.on('error', reject)
+            })
+            await fs.copyFile(stitched, srcPath)
+            try { await fs.rm(stitchDir, { recursive: true, force: true }) } catch {}
+            console.log(`[render-stitch] clip ${clipId}: intro=${!!startAnchor} outro=${!!outroSrc} scroll_stopper=${!!scrollStopperSrc}`)
+          }
+        } catch (stitchErr) {
+          // Stitch failures should NOT nuke the core render — log and continue with just the main clip.
+          console.error('[render-stitch] failed (non-fatal):', stitchErr.message)
+        }
+
         // Regenerate thumb
         try {
           const thumbPath = srcPath.replace(/\.mp4$/, '.jpg')

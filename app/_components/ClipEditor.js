@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Dialog, DialogContent } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -60,7 +60,118 @@ const TABS = [
   { id: 'trim',     icon: Scissors,  label: 'Trim' },
   { id: 'speed',    icon: Gauge,     label: 'Speed' },
   { id: 'logo',     icon: ImageIcon, label: 'Logo' },
+  { id: 'brand',    icon: Sparkles,  label: 'Intro/Outro' },
 ]
+
+// ─── BrandingTab: per-clip Intro / Outro upload + admin-managed Scroll-Stopper picker ───
+// - Intro / Outro: user MP4/MOV upload (≤5s, ≤20MB). Persisted to the clip via /api/user/project/upload-{intro,outro}.
+// - Scroll-Stopper: only shown when the admin toggle is ON. Options: None · 🎲 Random · one of the active hooks.
+function BrandingTab({ clip, state, patch }) {
+  const [uploading, setUploading] = React.useState({ intro: false, outro: false })
+  const [scrollStoppers, setScrollStoppers] = React.useState({ enabled: false, list: [] })
+
+  React.useEffect(() => {
+    fetch('/api/scroll-stoppers/active').then(r => r.json()).then(d => {
+      setScrollStoppers({ enabled: !!d.enabled, list: Array.isArray(d.scroll_stoppers) ? d.scroll_stoppers : [] })
+    }).catch(() => {})
+  }, [])
+
+  const upload = async (kind, file) => {
+    if (!file) return
+    setUploading(u => ({ ...u, [kind]: true }))
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('clip_id', clip.id)
+      const r = await fetch(`/api/user/project/upload-${kind}`, { method: 'POST', body: fd })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'Upload failed')
+      patch({ [`user_${kind}_url`]: d[`user_${kind}_url`] })
+      toast.success(`${kind === 'intro' ? 'Intro' : 'Outro'} uploaded`, { description: `${d.duration_seconds?.toFixed(1) || '?'}s · will stitch on next render` })
+    } catch (e) { toast.error(`${kind} upload failed`, { description: e.message }) }
+    finally { setUploading(u => ({ ...u, [kind]: false })) }
+  }
+
+  const remove = async (kind) => {
+    try {
+      const r = await fetch(`/api/user/project/clip/${clip.id}/${kind}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error('Delete failed')
+      patch({ [`user_${kind}_url`]: null })
+      toast.success(`${kind} removed`)
+    } catch (e) { toast.error(e.message) }
+  }
+
+  const AnchorCard = ({ kind, label, hint }) => {
+    const url = state[`user_${kind}_url`]
+    return (
+      <div className="space-y-2 rounded-lg border border-border p-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <Label className="text-sm font-semibold">{label}</Label>
+            <div className="text-[10px] text-muted-foreground">{hint}</div>
+          </div>
+          {url && <Button size="sm" variant="ghost" className="text-destructive h-7 px-2" onClick={() => remove(kind)}>Remove</Button>}
+        </div>
+        {url ? (
+          <video src={url} controls playsInline className="w-full max-h-48 rounded-md bg-black" />
+        ) : (
+          <label className={`block cursor-pointer rounded-md border-2 border-dashed border-border p-6 text-center text-xs text-muted-foreground hover:bg-muted/30 ${uploading[kind] ? 'opacity-50 pointer-events-none' : ''}`}>
+            <input type="file" accept="video/mp4,video/quicktime" className="hidden" onChange={e => upload(kind, e.target.files?.[0])} />
+            {uploading[kind] ? <Loader2 className="h-5 w-5 mx-auto animate-spin mb-1" /> : <Upload className="h-5 w-5 mx-auto mb-1" />}
+            <div>{uploading[kind] ? 'Uploading…' : `Upload ${label.toLowerCase()} MP4 / MOV`}</div>
+            <div className="mt-1 text-[10px] opacity-70">≤5 seconds · ≤20 MB · normalized to 9:16 30fps</div>
+          </label>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <AnchorCard kind="intro" label="Intro" hint="Plays at second 0 before the main clip" />
+
+      {/* Scroll-stopper — only when admin has enabled the global toggle */}
+      {scrollStoppers.enabled && !state.user_intro_url && (
+        <div className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+          <div>
+            <Label className="text-sm font-semibold">Scroll-Stopper Hook</Label>
+            <div className="text-[10px] text-muted-foreground">Admin-curated 2-5s viral hook. Only used when no custom intro is uploaded.</div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button type="button" onClick={() => patch({ scroll_stopper_id: null })}
+              className={`rounded-md border p-2 text-xs ${!state.scroll_stopper_id ? 'border-primary bg-primary/10' : 'border-border'}`}>None</button>
+            <button type="button" onClick={() => patch({ scroll_stopper_id: 'random' })}
+              className={`rounded-md border p-2 text-xs ${state.scroll_stopper_id === 'random' ? 'border-primary bg-primary/10' : 'border-border'}`}>🎲 Random</button>
+          </div>
+          <div className="grid grid-cols-2 gap-2 max-h-56 overflow-y-auto">
+            {scrollStoppers.list.map(ss => {
+              const sel = state.scroll_stopper_id === ss.id
+              return (
+                <button key={ss.id} type="button" onClick={() => patch({ scroll_stopper_id: ss.id })}
+                  className={`rounded-md border p-1 text-left ${sel ? 'border-primary ring-2 ring-primary/40' : 'border-border'}`}
+                >
+                  <video src={ss.file_url} muted className="w-full aspect-[9/16] object-cover rounded" />
+                  <div className="text-[10px] mt-1 truncate">{ss.title}</div>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+      {scrollStoppers.enabled && state.user_intro_url && (
+        <div className="text-xs text-muted-foreground -mt-2">Your custom intro overrides scroll-stopper (spec: intro takes priority).</div>
+      )}
+
+      <AnchorCard kind="outro" label="Outro" hint="Auto-appended after the main clip (CTA)" />
+
+      <div className="text-[11px] text-muted-foreground border-t border-border pt-3">
+        On render, the final MP4 is stitched as:  <b>[Intro or Scroll-Stopper]</b> → <b>[core clip w/ captions]</b> → <b>[Outro]</b>.
+        Each anchor is normalized to 1080×1920 · 30fps · AAC 44.1kHz before concat.
+      </div>
+    </div>
+  )
+}
+
 
 const LOGO_POSITIONS = [
   { id: 'top-left', label: '↖ TL' },
@@ -108,6 +219,10 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
       highlight_text_color: clip.highlight_text_color || assToCss(clip.style_ass?.accent) || '#FFFF00',
       stroke_color: clip.stroke_color || assToCss(clip.style_ass?.outlineColour) || '#000000',
       shadow_color: clip.shadow_color || assToCss(clip.style_ass?.back) || '#000000',
+      // NEW: Intro/Outro/Scroll-stopper — per-clip anchor media stitched around the core render.
+      user_intro_url: clip.user_intro_url || null,
+      user_outro_url: clip.user_outro_url || null,
+      scroll_stopper_id: clip.scroll_stopper_id || null,  // string id | 'random' | null
       fill_color: clip.fill_color || '#000000',
       clip_title: clip.clip_title || '',
       duration: dur,
@@ -317,6 +432,8 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
         highlight_text_color: state.highlight_text_color,
         stroke_color: state.stroke_color,
         shadow_color: state.shadow_color,
+        // NEW: scroll-stopper selection (server verifies global toggle before applying)
+        scroll_stopper_id: state.scroll_stopper_id || null,
         // Pass the edited caption track so the backend uses the user's edits (not the cached srt)
         caption_segments: activeCaptionTrack,
       }
@@ -1104,6 +1221,11 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                     <Button size="sm" variant="ghost" className="text-destructive" onClick={() => patch({ logo_url: null })}>Remove logo</Button>
                   </>
                 )}
+              </TabsContent>
+
+              {/* ─────────── Intro / Outro / Scroll-Stopper ─────────── */}
+              <TabsContent value="brand" className="p-4 overflow-y-auto max-h-[55vh] mt-0 space-y-5">
+                <BrandingTab clip={clip} state={state} patch={patch} />
               </TabsContent>
             </Tabs>
 
