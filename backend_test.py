@@ -1,575 +1,754 @@
 #!/usr/bin/env python3
 """
-Backend test for animation_style parameter on POST /api/clips/:id/render
-Tests three animation modes: static, karaoke, word_bounce
+Backend test suite for Phase 1: Feature Gating & Pricing Engine
+Tests all 14 critical behaviors listed in the review request.
 """
 
 import requests
 import json
-from pymongo import MongoClient
-import os
-import time
+import sys
+from typing import Dict, Any, Optional
 
-# Configuration
+# Constants
 BASE_URL = "https://shorts-studio-78.preview.emergentagent.com/api"
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "clipforge")
-USER_ID = "11111111-1111-1111-1111-111111111111"
+DEMO_USER_ID = "11111111-1111-1111-1111-111111111111"
+ADMIN_USER_ID = "22222222-2222-2222-2222-222222222222"
 
-# MongoDB connection
-client = MongoClient(MONGO_URL)
-db = client[DB_NAME]
+# Expected feature keys
+FEATURE_KEYS = [
+    'respool', 'animated_captions', 'custom_logo', 'scroll_stopper',
+    'hd_export', 'custom_fonts', 'custom_colors', 'intro_outro'
+]
 
-def setup_user_credits():
-    """Ensure user has enough credits for testing"""
-    print("Setting up user credits...")
-    result = db.profiles.update_one(
-        {"id": USER_ID},
-        {"$set": {"credit_balance_minutes": 200}}
-    )
-    print(f"✓ User credits set to 200 minutes")
-    return True
+# Expected default tiers
+DEFAULT_TIER_KEYS = ['free', 'pro', 'business']
 
-def find_or_create_test_clip():
-    """Find a clip with caption_segments and word timings, or create test data"""
-    print("\nFinding test clip...")
-    
-    # Find a clip with word-level timings
-    clip = db.generated_clips.find_one({
-        "user_id": USER_ID,
-        "storage_url_mp4": {"$regex": "^/api/files/clips/"},
-        "caption_segments.0.words.0.start": {"$exists": True}
+# Test state tracking
+test_results = []
+studio_tier_id = None
+free_tier_id = None
+
+
+def log_test(test_name: str, passed: bool, details: str = ""):
+    """Log test result"""
+    status = "✅ PASS" if passed else "❌ FAIL"
+    print(f"{status}: {test_name}")
+    if details:
+        print(f"   {details}")
+    test_results.append({
+        "test": test_name,
+        "passed": passed,
+        "details": details
     })
-    
-    if clip:
-        print(f"✓ Found clip with word timings: {clip['id']}")
-        return clip['id']
-    
-    # If no clip found, find any clip with local storage
-    clip = db.generated_clips.find_one({
-        "user_id": USER_ID,
-        "storage_url_mp4": {"$regex": "^/api/files/clips/"}
-    })
-    
-    if clip:
-        print(f"✓ Found clip without word timings: {clip['id']}")
-        return clip['id']
-    
-    print("✗ No suitable clip found in database")
-    return None
 
-def read_ass_file():
-    """Read the /tmp/last_cap.ass file"""
+
+def test_1_get_user_features_free():
+    """Test 1: GET /api/user/features (no auth) — free user, all features=false"""
+    print("\n=== Test 1: GET /api/user/features (free user) ===")
     try:
-        with open('/tmp/last_cap.ass', 'r') as f:
-            return f.read()
-    except Exception as e:
-        print(f"✗ Failed to read /tmp/last_cap.ass: {e}")
-        return None
-
-def verify_static_ass(ass_content):
-    """Verify static animation style ASS output"""
-    print("\n  Verifying static ASS output...")
-    errors = []
-    
-    # Should NOT contain color override tags (except in Style row)
-    dialogue_lines = [line for line in ass_content.split('\n') if line.startswith('Dialogue:')]
-    
-    for line in dialogue_lines:
-        if '\\c&H' in line or '{\\c' in line:
-            errors.append(f"Found color override in Dialogue line (should be plain text): {line[:100]}")
-        if '\\fscx' in line or '\\fscy' in line:
-            errors.append(f"Found scale tags in Dialogue line (should have none): {line[:100]}")
-    
-    # Should have fewer Dialogue events (ideally 1-2 for a short cue)
-    if len(dialogue_lines) > 3:
-        print(f"  ⚠ Warning: {len(dialogue_lines)} Dialogue events (expected 1-2 for static)")
-    else:
-        print(f"  ✓ {len(dialogue_lines)} Dialogue events (appropriate for static)")
-    
-    if errors:
-        for err in errors[:3]:  # Show first 3 errors
-            print(f"  ✗ {err}")
-        return False
-    
-    print("  ✓ No color or scale tags in Dialogue lines")
-    print("  ✓ Static style verified")
-    return True
-
-def verify_karaoke_ass(ass_content):
-    """Verify karaoke animation style ASS output"""
-    print("\n  Verifying karaoke ASS output...")
-    errors = []
-    
-    dialogue_lines = [line for line in ass_content.split('\n') if line.startswith('Dialogue:')]
-    
-    # Should have multiple Dialogue events (one per word)
-    if len(dialogue_lines) < 4:
-        errors.append(f"Expected ≥4 Dialogue events for karaoke, got {len(dialogue_lines)}")
-    else:
-        print(f"  ✓ {len(dialogue_lines)} Dialogue events (multiple per-word events)")
-    
-    # Should contain accent color overrides
-    color_override_count = sum(1 for line in dialogue_lines if '{\\c&H' in line or '{\\c' in line)
-    if color_override_count == 0:
-        errors.append("No color override tags found (expected accent color on active words)")
-    else:
-        print(f"  ✓ {color_override_count} Dialogue lines with color overrides")
-    
-    # Should contain reset tags
-    reset_count = sum(1 for line in dialogue_lines if '{\\r}' in line)
-    if reset_count == 0:
-        errors.append("No reset tags {\\r} found (expected after colored words)")
-    else:
-        print(f"  ✓ {reset_count} reset tags found")
-    
-    # Should NOT contain scale tags
-    scale_lines = [line for line in dialogue_lines if '\\fscx115' in line or '\\fscy115' in line]
-    if scale_lines:
-        errors.append(f"Found scale tags (should not be in karaoke): {len(scale_lines)} lines")
-    else:
-        print("  ✓ No scale tags (correct for karaoke)")
-    
-    if errors:
-        for err in errors:
-            print(f"  ✗ {err}")
-        return False
-    
-    print("  ✓ Karaoke style verified")
-    return True
-
-def verify_word_bounce_ass(ass_content):
-    """Verify word_bounce animation style ASS output"""
-    print("\n  Verifying word_bounce ASS output...")
-    errors = []
-    
-    dialogue_lines = [line for line in ass_content.split('\n') if line.startswith('Dialogue:')]
-    
-    # Should have multiple Dialogue events
-    if len(dialogue_lines) < 4:
-        errors.append(f"Expected ≥4 Dialogue events for word_bounce, got {len(dialogue_lines)}")
-    else:
-        print(f"  ✓ {len(dialogue_lines)} Dialogue events")
-    
-    # Should contain scale tags
-    scale_lines = [line for line in dialogue_lines if '\\fscx115' in line and '\\fscy115' in line]
-    if not scale_lines:
-        errors.append("No scale tags (\\fscx115\\fscy115) found")
-    else:
-        print(f"  ✓ {len(scale_lines)} Dialogue lines with scale tags")
-    
-    # Should contain transform tags
-    transform_lines = [line for line in dialogue_lines if '\\t(0,100,' in line and '\\fscx100\\fscy100' in line]
-    if not transform_lines:
-        errors.append("No transform tags \\t(0,100,\\fscx100\\fscy100) found")
-    else:
-        print(f"  ✓ {len(transform_lines)} Dialogue lines with transform tags")
-    
-    # Should contain accent color
-    color_override_count = sum(1 for line in dialogue_lines if '{\\c&H' in line or '\\c&H' in line)
-    if color_override_count == 0:
-        errors.append("No color override tags found")
-    else:
-        print(f"  ✓ {color_override_count} Dialogue lines with color overrides")
-    
-    # Should contain reset tags
-    reset_count = sum(1 for line in dialogue_lines if '{\\r}' in line)
-    if reset_count == 0:
-        errors.append("No reset tags {\\r} found")
-    else:
-        print(f"  ✓ {reset_count} reset tags found")
-    
-    if errors:
-        for err in errors:
-            print(f"  ✗ {err}")
-        return False
-    
-    print("  ✓ Word bounce style verified")
-    return True
-
-def test_render_with_animation_style(clip_id, animation_style, expected_style=None):
-    """Test rendering with a specific animation style"""
-    if expected_style is None:
-        expected_style = animation_style
-    
-    print(f"\n{'='*60}")
-    print(f"Testing animation_style: {animation_style}")
-    print(f"{'='*60}")
-    
-    # Prepare render request
-    render_data = {
-        "trim_start": 0,
-        "trim_end": 10,
-        "crop_aspect": "9:16",
-        "font_size": 20,
-        "outline_size": 2,
-        "fill_mode": "crop",
-        "caption_x_percent": 50,
-        "caption_y_percent": 78,
-        "animation_style": animation_style,
-        "caption_segments": [
-            {
-                "start": 0,
-                "end": 3,
-                "text": "hello world from the test agent",
-                "words": [
-                    {"start": 0, "end": 0.5, "text": "hello"},
-                    {"start": 0.5, "end": 1.0, "text": "world"},
-                    {"start": 1.0, "end": 1.5, "text": "from"},
-                    {"start": 1.5, "end": 2.0, "text": "the"},
-                    {"start": 2.0, "end": 2.5, "text": "test"},
-                    {"start": 2.5, "end": 3.0, "text": "agent"}
-                ]
-            }
-        ]
-    }
-    
-    try:
-        print(f"\nPOST /api/clips/{clip_id}/render")
-        response = requests.post(
-            f"{BASE_URL}/clips/{clip_id}/render",
-            json=render_data,
-            timeout=120
-        )
-        
-        print(f"Status: {response.status_code}")
+        response = requests.get(f"{BASE_URL}/user/features", timeout=10)
         
         if response.status_code != 200:
-            print(f"✗ Expected 200, got {response.status_code}")
-            print(f"Response: {response.text[:500]}")
-            return False
+            log_test("Test 1", False, f"Expected 200, got {response.status_code}")
+            return
         
         data = response.json()
         
-        # Verify response structure
-        if not data.get('ok'):
-            print(f"✗ Response ok=false")
-            return False
+        # Verify structure
+        required_keys = ['plan_key', 'plan_name', 'features', 'tier', 'catalog', 'tiers', 'matrix']
+        missing_keys = [k for k in required_keys if k not in data]
+        if missing_keys:
+            log_test("Test 1", False, f"Missing keys: {missing_keys}")
+            return
         
-        if 'clip' not in data:
-            print(f"✗ No clip in response")
-            return False
+        # Verify plan_key is 'free'
+        if data['plan_key'] != 'free':
+            log_test("Test 1", False, f"Expected plan_key='free', got '{data['plan_key']}'")
+            return
         
-        clip = data['clip']
+        # Verify all features are false for free tier
+        features = data['features']
+        enabled_features = [k for k, v in features.items() if v is True]
+        if enabled_features:
+            log_test("Test 1", False, f"Expected all features=false, but found enabled: {enabled_features}")
+            return
         
-        # Verify animation_style was persisted
-        if clip.get('animation_style') != expected_style:
-            print(f"✗ Expected animation_style={expected_style}, got {clip.get('animation_style')}")
-            return False
+        # Verify catalog has 8 features
+        if len(data['catalog']) != 8:
+            log_test("Test 1", False, f"Expected 8 features in catalog, got {len(data['catalog'])}")
+            return
         
-        print(f"✓ Response OK, animation_style={clip.get('animation_style')}")
+        # Verify tiers has 3 items
+        if len(data['tiers']) != 3:
+            log_test("Test 1", False, f"Expected 3 tiers, got {len(data['tiers'])}")
+            return
         
-        # Verify credits were charged
-        if data.get('credits_charged', 0) <= 0:
-            print(f"✗ No credits charged")
-            return False
+        # Verify matrix structure
+        if not isinstance(data['matrix'], dict):
+            log_test("Test 1", False, "Matrix should be a dict")
+            return
         
-        print(f"✓ Credits charged: {data.get('credits_charged')}")
-        
-        # Read and verify ASS file
-        time.sleep(0.5)  # Give filesystem a moment
-        ass_content = read_ass_file()
-        
-        if not ass_content:
-            print(f"✗ Could not read ASS file")
-            return False
-        
-        print(f"✓ ASS file read successfully ({len(ass_content)} bytes)")
-        
-        # Verify ASS content based on expected style
-        if expected_style == 'static':
-            return verify_static_ass(ass_content)
-        elif expected_style == 'karaoke':
-            return verify_karaoke_ass(ass_content)
-        elif expected_style == 'word_bounce':
-            return verify_word_bounce_ass(ass_content)
-        
-        return True
+        log_test("Test 1", True, f"Free user has plan_key='free', all features=false, catalog={len(data['catalog'])}, tiers={len(data['tiers'])}")
         
     except Exception as e:
-        print(f"✗ Exception: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        log_test("Test 1", False, f"Exception: {str(e)}")
 
-def test_static_without_word_timings(clip_id):
-    """Test static style with caption_segments that have no word timings"""
-    print(f"\n{'='*60}")
-    print(f"Testing static with NO word timings")
-    print(f"{'='*60}")
-    
-    render_data = {
-        "trim_start": 0,
-        "trim_end": 10,
-        "crop_aspect": "9:16",
-        "font_size": 20,
-        "outline_size": 2,
-        "fill_mode": "crop",
-        "caption_x_percent": 50,
-        "caption_y_percent": 78,
-        "animation_style": "static",
-        "caption_segments": [
-            {
-                "start": 0,
-                "end": 3,
-                "text": "hello world from the test"
-                # No words array
-            }
-        ]
-    }
-    
+
+def test_2_get_user_features_admin():
+    """Test 2: GET /api/user/features?admin=true — admin user, all features=true"""
+    print("\n=== Test 2: GET /api/user/features?admin=true (admin user) ===")
     try:
-        print(f"\nPOST /api/clips/{clip_id}/render")
-        response = requests.post(
-            f"{BASE_URL}/clips/{clip_id}/render",
-            json=render_data,
-            timeout=120
-        )
-        
-        print(f"Status: {response.status_code}")
+        response = requests.get(f"{BASE_URL}/user/features?admin=true", timeout=10)
         
         if response.status_code != 200:
-            print(f"✗ Expected 200, got {response.status_code}")
-            return False
+            log_test("Test 2", False, f"Expected 200, got {response.status_code}")
+            return
         
         data = response.json()
         
-        if data.get('clip', {}).get('animation_style') != 'static':
-            print(f"✗ Expected animation_style=static")
-            return False
+        # Verify plan_key is 'business' (admin user is seeded with business plan)
+        if data['plan_key'] != 'business':
+            log_test("Test 2", False, f"Expected plan_key='business', got '{data['plan_key']}'")
+            return
         
-        print(f"✓ Response OK, animation_style=static")
+        # Verify all features are true (isAdminProfile short-circuit)
+        features = data['features']
+        disabled_features = [k for k, v in features.items() if v is False]
+        if disabled_features:
+            log_test("Test 2", False, f"Expected all features=true for admin, but found disabled: {disabled_features}")
+            return
         
-        # Read ASS file
-        time.sleep(0.5)
-        ass_content = read_ass_file()
-        
-        if not ass_content:
-            print(f"✗ Could not read ASS file")
-            return False
-        
-        # Should produce a single Dialogue event with plain text
-        dialogue_lines = [line for line in ass_content.split('\n') if line.startswith('Dialogue:')]
-        
-        if len(dialogue_lines) != 1:
-            print(f"  ⚠ Warning: Expected 1 Dialogue line, got {len(dialogue_lines)}")
-        
-        # Should have no color or scale tags
-        has_color = any('{\\c&H' in line or '{\\c' in line for line in dialogue_lines)
-        has_scale = any('\\fscx' in line or '\\fscy' in line for line in dialogue_lines)
-        
-        if has_color or has_scale:
-            print(f"✗ Found color or scale tags (should be plain text)")
-            return False
-        
-        print(f"✓ Static without word timings verified (plain text, no tags)")
-        return True
+        log_test("Test 2", True, f"Admin user has plan_key='business', all features=true (isAdminProfile override)")
         
     except Exception as e:
-        print(f"✗ Exception: {e}")
-        return False
+        log_test("Test 2", False, f"Exception: {str(e)}")
 
-def verify_mp4_output(clip_id):
-    """Verify the rendered MP4 file exists and is valid"""
-    print(f"\nVerifying MP4 output...")
-    
-    clip = db.generated_clips.find_one({"id": clip_id})
-    if not clip:
-        print(f"✗ Clip not found in database")
-        return False
-    
-    storage_url = clip.get('storage_url_mp4', '')
-    if not storage_url.startswith('/api/files/clips/'):
-        print(f"✗ Invalid storage_url: {storage_url}")
-        return False
-    
-    # Extract filename from URL
-    filename = storage_url.split('/')[-1]
-    file_path = f"/app/data/uploads/clips/{filename}"
-    
-    if not os.path.exists(file_path):
-        print(f"✗ MP4 file not found: {file_path}")
-        return False
-    
-    print(f"✓ MP4 file exists: {file_path}")
-    
-    # Verify with ffprobe
-    import subprocess
+
+def test_3_get_pricing_tiers_no_admin():
+    """Test 3: GET /api/admin/pricing-tiers (no admin=true) → 403"""
+    print("\n=== Test 3: GET /api/admin/pricing-tiers (no admin param) ===")
     try:
-        result = subprocess.run(
-            ['/usr/bin/ffprobe', '-v', 'error', '-show_entries', 
-             'stream=codec_name,width,height', '-of', 'json', file_path],
-            capture_output=True,
-            text=True,
+        response = requests.get(f"{BASE_URL}/admin/pricing-tiers", timeout=10)
+        
+        if response.status_code != 403:
+            log_test("Test 3", False, f"Expected 403, got {response.status_code}")
+            return
+        
+        log_test("Test 3", True, "Non-admin access correctly blocked with 403")
+        
+    except Exception as e:
+        log_test("Test 3", False, f"Exception: {str(e)}")
+
+
+def test_4_get_pricing_tiers_admin():
+    """Test 4: GET /api/admin/pricing-tiers?admin=true → 3 tiers sorted by order"""
+    print("\n=== Test 4: GET /api/admin/pricing-tiers?admin=true ===")
+    global free_tier_id
+    try:
+        response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
+        
+        if response.status_code != 200:
+            log_test("Test 4", False, f"Expected 200, got {response.status_code}")
+            return
+        
+        tiers = response.json()
+        
+        if not isinstance(tiers, list):
+            log_test("Test 4", False, "Expected array of tiers")
+            return
+        
+        if len(tiers) != 3:
+            log_test("Test 4", False, f"Expected 3 tiers, got {len(tiers)}")
+            return
+        
+        # Verify sorted by order
+        orders = [t.get('order', 0) for t in tiers]
+        if orders != sorted(orders):
+            log_test("Test 4", False, f"Tiers not sorted by order: {orders}")
+            return
+        
+        # Verify tier keys
+        tier_keys = [t['key'] for t in tiers]
+        if set(tier_keys) != set(DEFAULT_TIER_KEYS):
+            log_test("Test 4", False, f"Expected tier keys {DEFAULT_TIER_KEYS}, got {tier_keys}")
+            return
+        
+        # Store free tier ID for later tests
+        free_tier = next((t for t in tiers if t['key'] == 'free'), None)
+        if free_tier:
+            free_tier_id = free_tier['id']
+        
+        log_test("Test 4", True, f"Got 3 tiers sorted by order: {tier_keys}")
+        
+    except Exception as e:
+        log_test("Test 4", False, f"Exception: {str(e)}")
+
+
+def test_5_create_studio_tier():
+    """Test 5: POST /api/admin/pricing-tiers?admin=true — create 'studio' tier"""
+    print("\n=== Test 5: POST /api/admin/pricing-tiers?admin=true (create studio) ===")
+    global studio_tier_id
+    try:
+        payload = {
+            "name": "Studio",
+            "price_usd": 29,
+            "price_inr": 2499
+        }
+        response = requests.post(
+            f"{BASE_URL}/admin/pricing-tiers?admin=true",
+            json=payload,
             timeout=10
         )
         
-        if result.returncode != 0:
-            print(f"✗ ffprobe failed: {result.stderr}")
-            return False
-        
-        probe_data = json.loads(result.stdout)
-        streams = probe_data.get('streams', [])
-        
-        video_stream = next((s for s in streams if s.get('codec_name') == 'h264'), None)
-        audio_stream = next((s for s in streams if s.get('codec_name') == 'aac'), None)
-        
-        if not video_stream:
-            print(f"✗ No h264 video stream found")
-            return False
-        
-        if video_stream.get('width') != 1080 or video_stream.get('height') != 1920:
-            print(f"✗ Expected 1080x1920, got {video_stream.get('width')}x{video_stream.get('height')}")
-            return False
-        
-        print(f"✓ Video stream: h264 1080x1920")
-        
-        if audio_stream:
-            print(f"✓ Audio stream: aac")
-        
-        return True
-        
-    except Exception as e:
-        print(f"✗ ffprobe exception: {e}")
-        return False
-
-def main():
-    print("="*60)
-    print("ANIMATION_STYLE PARAMETER TESTING")
-    print("="*60)
-    
-    results = {}
-    
-    # Setup
-    try:
-        setup_user_credits()
-        clip_id = find_or_create_test_clip()
-        
-        if not clip_id:
-            print("\n✗ SETUP FAILED: No test clip available")
+        if response.status_code != 200:
+            log_test("Test 5", False, f"Expected 200, got {response.status_code}: {response.text}")
             return
         
-        print(f"\nUsing clip: {clip_id}")
+        tier = response.json()
+        
+        # Verify tier structure
+        if tier.get('key') != 'studio':
+            log_test("Test 5", False, f"Expected key='studio', got '{tier.get('key')}'")
+            return
+        
+        if tier.get('name') != 'Studio':
+            log_test("Test 5", False, f"Expected name='Studio', got '{tier.get('name')}'")
+            return
+        
+        if tier.get('price_usd') != 29:
+            log_test("Test 5", False, f"Expected price_usd=29, got {tier.get('price_usd')}")
+            return
+        
+        studio_tier_id = tier['id']
+        
+        # Verify 8 feature rows were created (all off)
+        features_response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
+        if features_response.status_code == 200:
+            features_data = features_response.json()
+            studio_features = features_data['matrix'].get('studio', {})
+            
+            if len(studio_features) != 8:
+                log_test("Test 5", False, f"Expected 8 feature rows for studio, got {len(studio_features)}")
+                return
+            
+            # Verify all features are off
+            enabled = [k for k, v in studio_features.items() if v is True]
+            if enabled:
+                log_test("Test 5", False, f"Expected all features off, but found enabled: {enabled}")
+                return
+        
+        log_test("Test 5", True, f"Created studio tier (id={studio_tier_id}) with 8 features all off")
         
     except Exception as e:
-        print(f"\n✗ SETUP FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # Test A: static style
+        log_test("Test 5", False, f"Exception: {str(e)}")
+
+
+def test_6_create_duplicate_tier():
+    """Test 6: POST /api/admin/pricing-tiers?admin=true with duplicate key → 409"""
+    print("\n=== Test 6: POST /api/admin/pricing-tiers?admin=true (duplicate) ===")
     try:
-        results['static'] = test_render_with_animation_style(clip_id, 'static')
-    except Exception as e:
-        print(f"\n✗ Test A (static) failed with exception: {e}")
-        results['static'] = False
-    
-    # Test B: karaoke style
-    try:
-        results['karaoke'] = test_render_with_animation_style(clip_id, 'karaoke')
-    except Exception as e:
-        print(f"\n✗ Test B (karaoke) failed with exception: {e}")
-        results['karaoke'] = False
-    
-    # Test C: word_bounce style
-    try:
-        results['word_bounce'] = test_render_with_animation_style(clip_id, 'word_bounce')
-    except Exception as e:
-        print(f"\n✗ Test C (word_bounce) failed with exception: {e}")
-        results['word_bounce'] = False
-    
-    # Test D: default (omitted animation_style)
-    try:
-        # Clear animation_style from clip to test true default
-        db.generated_clips.update_one(
-            {"id": clip_id},
-            {"$unset": {"animation_style": ""}}
+        payload = {
+            "name": "Studio",
+            "price_usd": 39
+        }
+        response = requests.post(
+            f"{BASE_URL}/admin/pricing-tiers?admin=true",
+            json=payload,
+            timeout=10
         )
         
-        print(f"\n{'='*60}")
-        print(f"Testing DEFAULT (omitted animation_style)")
-        print(f"{'='*60}")
+        if response.status_code != 409:
+            log_test("Test 6", False, f"Expected 409, got {response.status_code}")
+            return
         
-        render_data = {
-            "trim_start": 0,
-            "trim_end": 10,
-            "crop_aspect": "9:16",
-            "font_size": 20,
-            "outline_size": 2,
-            "fill_mode": "crop",
-            "caption_x_percent": 50,
-            "caption_y_percent": 78,
-            # No animation_style field
-            "caption_segments": [
+        log_test("Test 6", True, "Duplicate tier creation correctly rejected with 409")
+        
+    except Exception as e:
+        log_test("Test 6", False, f"Exception: {str(e)}")
+
+
+def test_7_update_studio_tier():
+    """Test 7: PUT /api/admin/pricing-tiers/{studio_id}?admin=true — update tier"""
+    print("\n=== Test 7: PUT /api/admin/pricing-tiers/{studio_id}?admin=true ===")
+    global studio_tier_id
+    
+    if not studio_tier_id:
+        log_test("Test 7", False, "studio_tier_id not set (Test 5 may have failed)")
+        return
+    
+    try:
+        payload = {
+            "name": "Studio Plus",
+            "price_usd": 35
+        }
+        response = requests.put(
+            f"{BASE_URL}/admin/pricing-tiers/{studio_tier_id}?admin=true",
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            log_test("Test 7", False, f"Expected 200, got {response.status_code}: {response.text}")
+            return
+        
+        tier = response.json()
+        
+        if tier.get('name') != 'Studio Plus':
+            log_test("Test 7", False, f"Expected name='Studio Plus', got '{tier.get('name')}'")
+            return
+        
+        if tier.get('price_usd') != 35:
+            log_test("Test 7", False, f"Expected price_usd=35, got {tier.get('price_usd')}")
+            return
+        
+        if 'updated_at' not in tier:
+            log_test("Test 7", False, "updated_at field not set")
+            return
+        
+        log_test("Test 7", True, f"Updated studio tier to name='Studio Plus', price_usd=35")
+        
+    except Exception as e:
+        log_test("Test 7", False, f"Exception: {str(e)}")
+
+
+def test_8_get_pricing_features():
+    """Test 8: GET /api/admin/pricing-features?admin=true → { catalog, tiers, matrix }"""
+    print("\n=== Test 8: GET /api/admin/pricing-features?admin=true ===")
+    try:
+        response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
+        
+        if response.status_code != 200:
+            log_test("Test 8", False, f"Expected 200, got {response.status_code}")
+            return
+        
+        data = response.json()
+        
+        # Verify structure
+        required_keys = ['catalog', 'tiers', 'matrix']
+        missing_keys = [k for k in required_keys if k not in data]
+        if missing_keys:
+            log_test("Test 8", False, f"Missing keys: {missing_keys}")
+            return
+        
+        # Verify catalog
+        if not isinstance(data['catalog'], list) or len(data['catalog']) != 8:
+            log_test("Test 8", False, f"Expected catalog with 8 features, got {len(data.get('catalog', []))}")
+            return
+        
+        # Verify tiers (should now have 4: free, pro, business, studio)
+        if not isinstance(data['tiers'], list) or len(data['tiers']) != 4:
+            log_test("Test 8", False, f"Expected 4 tiers, got {len(data.get('tiers', []))}")
+            return
+        
+        # Verify matrix structure
+        matrix = data['matrix']
+        if not isinstance(matrix, dict):
+            log_test("Test 8", False, "Matrix should be a dict")
+            return
+        
+        # Verify each tier has 8 features
+        for tier_key in ['free', 'pro', 'business', 'studio']:
+            if tier_key not in matrix:
+                log_test("Test 8", False, f"Tier '{tier_key}' not in matrix")
+                return
+            if len(matrix[tier_key]) != 8:
+                log_test("Test 8", False, f"Tier '{tier_key}' should have 8 features, got {len(matrix[tier_key])}")
+                return
+        
+        log_test("Test 8", True, f"Got correct structure: catalog={len(data['catalog'])}, tiers={len(data['tiers'])}, matrix with 4 tiers × 8 features")
+        
+    except Exception as e:
+        log_test("Test 8", False, f"Exception: {str(e)}")
+
+
+def test_9_update_free_tier_custom_colors():
+    """Test 9: PUT /api/admin/pricing-features?admin=true — enable custom_colors for free tier"""
+    print("\n=== Test 9: PUT /api/admin/pricing-features?admin=true (enable custom_colors) ===")
+    try:
+        # Enable custom_colors for free tier
+        payload = {
+            "updates": [
                 {
-                    "start": 0,
-                    "end": 3,
-                    "text": "default test",
-                    "words": [
-                        {"start": 0, "end": 0.5, "text": "default"},
-                        {"start": 0.5, "end": 1.0, "text": "test"}
-                    ]
+                    "tier_key": "free",
+                    "feature_key": "custom_colors",
+                    "is_enabled": True
                 }
             ]
         }
+        response = requests.put(
+            f"{BASE_URL}/admin/pricing-features?admin=true",
+            json=payload,
+            timeout=10
+        )
         
-        response = requests.post(f"{BASE_URL}/clips/{clip_id}/render", json=render_data, timeout=120)
+        if response.status_code != 200:
+            log_test("Test 9", False, f"Expected 200, got {response.status_code}: {response.text}")
+            return
         
+        # Verify the change by getting user features (as free user)
+        features_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
+        if features_response.status_code != 200:
+            log_test("Test 9", False, f"Failed to verify: {features_response.status_code}")
+            return
+        
+        features_data = features_response.json()
+        if features_data['features'].get('custom_colors') is not True:
+            log_test("Test 9", False, f"custom_colors should be true, got {features_data['features'].get('custom_colors')}")
+            return
+        
+        log_test("Test 9", True, "Enabled custom_colors for free tier, verified via GET /api/user/features")
+        
+    except Exception as e:
+        log_test("Test 9", False, f"Exception: {str(e)}")
+
+
+def test_10_update_user_plan_to_pro():
+    """Test 10: PUT /api/admin/users/{demo_user_id}?admin=true { plan_key:"pro" }"""
+    print("\n=== Test 10: PUT /api/admin/users/{demo_user_id}?admin=true (set plan_key=pro) ===")
+    try:
+        payload = {
+            "plan_key": "pro"
+        }
+        response = requests.put(
+            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            log_test("Test 10", False, f"Expected 200, got {response.status_code}: {response.text}")
+            return
+        
+        user = response.json()
+        if user.get('plan_key') != 'pro':
+            log_test("Test 10", False, f"Expected plan_key='pro', got '{user.get('plan_key')}'")
+            return
+        
+        # Verify features (should now have pro features, but custom_colors from step 9 should be reverted)
+        features_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
+        if features_response.status_code != 200:
+            log_test("Test 10", False, f"Failed to verify features: {features_response.status_code}")
+            return
+        
+        features_data = features_response.json()
+        if features_data['plan_key'] != 'pro':
+            log_test("Test 10", False, f"User features should show plan_key='pro', got '{features_data['plan_key']}'")
+            return
+        
+        # Pro tier should have most features enabled (except scroll_stopper)
+        expected_enabled = ['respool', 'animated_captions', 'custom_logo', 'hd_export', 'custom_fonts', 'custom_colors', 'intro_outro']
+        for feature in expected_enabled:
+            if features_data['features'].get(feature) is not True:
+                log_test("Test 10", False, f"Pro tier should have {feature}=true, got {features_data['features'].get(feature)}")
+                return
+        
+        if features_data['features'].get('scroll_stopper') is not False:
+            log_test("Test 10", False, f"Pro tier should have scroll_stopper=false, got {features_data['features'].get('scroll_stopper')}")
+            return
+        
+        log_test("Test 10", True, f"Updated demo user to plan_key='pro', verified pro features")
+        
+    except Exception as e:
+        log_test("Test 10", False, f"Exception: {str(e)}")
+
+
+def test_11_update_user_plan_invalid():
+    """Test 11: PUT /api/admin/users/{demo_user_id}?admin=true { plan_key:"nonexistent" } → 400"""
+    print("\n=== Test 11: PUT /api/admin/users/{demo_user_id}?admin=true (invalid plan_key) ===")
+    try:
+        payload = {
+            "plan_key": "nonexistent"
+        }
+        response = requests.put(
+            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code != 400:
+            log_test("Test 11", False, f"Expected 400, got {response.status_code}")
+            return
+        
+        error_data = response.json()
+        if 'error' not in error_data:
+            log_test("Test 11", False, "Expected error message in response")
+            return
+        
+        log_test("Test 11", True, f"Invalid plan_key correctly rejected with 400: {error_data.get('error')}")
+        
+    except Exception as e:
+        log_test("Test 11", False, f"Exception: {str(e)}")
+
+
+def test_12_delete_free_tier():
+    """Test 12: DELETE /api/admin/pricing-tiers/{free_tier_id}?admin=true → 400"""
+    print("\n=== Test 12: DELETE /api/admin/pricing-tiers/{free_tier_id}?admin=true (cannot delete default) ===")
+    global free_tier_id
+    
+    if not free_tier_id:
+        log_test("Test 12", False, "free_tier_id not set (Test 4 may have failed)")
+        return
+    
+    try:
+        response = requests.delete(
+            f"{BASE_URL}/admin/pricing-tiers/{free_tier_id}?admin=true",
+            timeout=10
+        )
+        
+        if response.status_code != 400:
+            log_test("Test 12", False, f"Expected 400, got {response.status_code}")
+            return
+        
+        error_data = response.json()
+        if 'error' not in error_data:
+            log_test("Test 12", False, "Expected error message in response")
+            return
+        
+        log_test("Test 12", True, f"Cannot delete default/free tier: {error_data.get('error')}")
+        
+    except Exception as e:
+        log_test("Test 12", False, f"Exception: {str(e)}")
+
+
+def test_13_delete_studio_tier():
+    """Test 13: DELETE /api/admin/pricing-tiers/{studio_id}?admin=true → cascades"""
+    print("\n=== Test 13: DELETE /api/admin/pricing-tiers/{studio_id}?admin=true (cascade) ===")
+    global studio_tier_id
+    
+    if not studio_tier_id:
+        log_test("Test 13", False, "studio_tier_id not set (Test 5 may have failed)")
+        return
+    
+    try:
+        response = requests.delete(
+            f"{BASE_URL}/admin/pricing-tiers/{studio_tier_id}?admin=true",
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            log_test("Test 13", False, f"Expected 200, got {response.status_code}: {response.text}")
+            return
+        
+        # Verify tier is deleted
+        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
+        if tiers_response.status_code == 200:
+            tiers = tiers_response.json()
+            studio_exists = any(t['id'] == studio_tier_id for t in tiers)
+            if studio_exists:
+                log_test("Test 13", False, "Studio tier still exists after deletion")
+                return
+        
+        # Verify feature rows are deleted
+        features_response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
+        if features_response.status_code == 200:
+            features_data = features_response.json()
+            if 'studio' in features_data['matrix']:
+                log_test("Test 13", False, "Studio feature rows still exist after tier deletion")
+                return
+        
+        log_test("Test 13", True, "Deleted studio tier, cascaded feature rows")
+        
+    except Exception as e:
+        log_test("Test 13", False, f"Exception: {str(e)}")
+
+
+def test_14_user_cascade_on_tier_delete():
+    """Test 14: Create new tier, assign user to it, delete tier, verify user moved to 'free'"""
+    print("\n=== Test 14: User cascade on tier deletion ===")
+    try:
+        # Create a new test tier
+        payload = {
+            "name": "Test Tier",
+            "price_usd": 99
+        }
+        create_response = requests.post(
+            f"{BASE_URL}/admin/pricing-tiers?admin=true",
+            json=payload,
+            timeout=10
+        )
+        
+        if create_response.status_code != 200:
+            log_test("Test 14", False, f"Failed to create test tier: {create_response.status_code}")
+            return
+        
+        test_tier = create_response.json()
+        test_tier_id = test_tier['id']
+        test_tier_key = test_tier['key']
+        
+        # Assign demo user to this tier
+        assign_response = requests.put(
+            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
+            json={"plan_key": test_tier_key},
+            timeout=10
+        )
+        
+        if assign_response.status_code != 200:
+            log_test("Test 14", False, f"Failed to assign user to test tier: {assign_response.status_code}")
+            return
+        
+        # Verify user is on test tier
+        user = assign_response.json()
+        if user.get('plan_key') != test_tier_key:
+            log_test("Test 14", False, f"User not assigned to test tier: {user.get('plan_key')}")
+            return
+        
+        # Delete the test tier
+        delete_response = requests.delete(
+            f"{BASE_URL}/admin/pricing-tiers/{test_tier_id}?admin=true",
+            timeout=10
+        )
+        
+        if delete_response.status_code != 200:
+            log_test("Test 14", False, f"Failed to delete test tier: {delete_response.status_code}")
+            return
+        
+        # Verify user was moved to 'free'
+        user_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
+        if user_response.status_code != 200:
+            log_test("Test 14", False, f"Failed to get user features: {user_response.status_code}")
+            return
+        
+        user_features = user_response.json()
+        if user_features['plan_key'] != 'free':
+            log_test("Test 14", False, f"User should be moved to 'free', got '{user_features['plan_key']}'")
+            return
+        
+        log_test("Test 14", True, f"Created test tier, assigned user, deleted tier → user moved to 'free'")
+        
+    except Exception as e:
+        log_test("Test 14", False, f"Exception: {str(e)}")
+
+
+def cleanup():
+    """MANDATORY CLEANUP: Restore state to original"""
+    print("\n=== CLEANUP: Restoring original state ===")
+    
+    try:
+        # 1. Restore free tier's custom_colors to false
+        print("1. Restoring free tier's custom_colors to false...")
+        payload = {
+            "updates": [
+                {
+                    "tier_key": "free",
+                    "feature_key": "custom_colors",
+                    "is_enabled": False
+                }
+            ]
+        }
+        response = requests.put(
+            f"{BASE_URL}/admin/pricing-features?admin=true",
+            json=payload,
+            timeout=10
+        )
         if response.status_code == 200:
-            data = response.json()
-            if data.get('clip', {}).get('animation_style') == 'karaoke':
-                print(f"✓ Default animation_style is 'karaoke'")
-                results['default'] = True
-            else:
-                print(f"✗ Expected default 'karaoke', got {data.get('clip', {}).get('animation_style')}")
-                results['default'] = False
+            print("   ✅ Restored free tier's custom_colors to false")
         else:
-            print(f"✗ Request failed: {response.status_code}")
-            results['default'] = False
-            
+            print(f"   ⚠️  Failed to restore custom_colors: {response.status_code}")
+        
+        # 2. Restore demo user to plan_key='free', role='user', is_admin=false
+        print("2. Restoring demo user to plan_key='free', role='user'...")
+        payload = {
+            "plan_key": "free",
+            "role": "user",
+            "is_admin": False
+        }
+        response = requests.put(
+            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
+            json=payload,
+            timeout=10
+        )
+        if response.status_code == 200:
+            print("   ✅ Restored demo user to plan_key='free', role='user'")
+        else:
+            print(f"   ⚠️  Failed to restore demo user: {response.status_code}")
+        
+        # 3. Delete any test tiers (studio, test_tier, etc.)
+        print("3. Deleting test tiers...")
+        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
+        if tiers_response.status_code == 200:
+            tiers = tiers_response.json()
+            for tier in tiers:
+                if tier['key'] not in DEFAULT_TIER_KEYS:
+                    delete_response = requests.delete(
+                        f"{BASE_URL}/admin/pricing-tiers/{tier['id']}?admin=true",
+                        timeout=10
+                    )
+                    if delete_response.status_code == 200:
+                        print(f"   ✅ Deleted test tier: {tier['key']}")
+                    else:
+                        print(f"   ⚠️  Failed to delete tier {tier['key']}: {delete_response.status_code}")
+        
+        # 4. Verify 3 default tiers still exist
+        print("4. Verifying 3 default tiers exist...")
+        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
+        if tiers_response.status_code == 200:
+            tiers = tiers_response.json()
+            tier_keys = [t['key'] for t in tiers]
+            if set(tier_keys) == set(DEFAULT_TIER_KEYS):
+                print(f"   ✅ 3 default tiers exist: {tier_keys}")
+            else:
+                print(f"   ⚠️  Unexpected tiers: {tier_keys}")
+        
+        print("\n✅ CLEANUP COMPLETE")
+        
     except Exception as e:
-        print(f"\n✗ Test D (default) failed with exception: {e}")
-        results['default'] = False
-    
-    # Test E: invalid value
-    try:
-        results['invalid'] = test_render_with_animation_style(clip_id, 'banana', expected_style='karaoke')
-    except Exception as e:
-        print(f"\n✗ Test E (invalid) failed with exception: {e}")
-        results['invalid'] = False
-    
-    # Test F: static without word timings
-    try:
-        results['static_no_words'] = test_static_without_word_timings(clip_id)
-    except Exception as e:
-        print(f"\n✗ Test F (static no words) failed with exception: {e}")
-        results['static_no_words'] = False
-    
-    # Regression: Verify MP4 output
-    try:
-        results['mp4_output'] = verify_mp4_output(clip_id)
-    except Exception as e:
-        print(f"\n✗ MP4 verification failed with exception: {e}")
-        results['mp4_output'] = False
-    
-    # Summary
+        print(f"\n❌ CLEANUP FAILED: {str(e)}")
+
+
+def print_summary():
+    """Print test summary"""
     print("\n" + "="*60)
     print("TEST SUMMARY")
     print("="*60)
     
-    for test_name, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"{status} - {test_name}")
+    passed = sum(1 for r in test_results if r['passed'])
+    total = len(test_results)
     
-    total = len(results)
-    passed = sum(1 for v in results.values() if v)
+    print(f"\nTotal: {passed}/{total} tests passed\n")
     
-    print(f"\nTotal: {passed}/{total} tests passed")
+    for result in test_results:
+        status = "✅" if result['passed'] else "❌"
+        print(f"{status} {result['test']}")
     
-    if passed == total:
-        print("\n🎉 ALL TESTS PASSED")
-    else:
-        print(f"\n⚠️  {total - passed} test(s) failed")
+    print("\n" + "="*60)
+    
+    return passed == total
+
+
+def main():
+    """Run all tests"""
+    print("="*60)
+    print("PHASE 1: Feature Gating & Pricing Engine - Backend Tests")
+    print("="*60)
+    print(f"Base URL: {BASE_URL}")
+    print(f"Demo User ID: {DEMO_USER_ID}")
+    print(f"Admin User ID: {ADMIN_USER_ID}")
+    
+    # Run all tests in order
+    test_1_get_user_features_free()
+    test_2_get_user_features_admin()
+    test_3_get_pricing_tiers_no_admin()
+    test_4_get_pricing_tiers_admin()
+    test_5_create_studio_tier()
+    test_6_create_duplicate_tier()
+    test_7_update_studio_tier()
+    test_8_get_pricing_features()
+    test_9_update_free_tier_custom_colors()
+    test_10_update_user_plan_to_pro()
+    test_11_update_user_plan_invalid()
+    test_12_delete_free_tier()
+    test_13_delete_studio_tier()
+    test_14_user_cascade_on_tier_delete()
+    
+    # Cleanup
+    cleanup()
+    
+    # Print summary
+    all_passed = print_summary()
+    
+    # Exit with appropriate code
+    sys.exit(0 if all_passed else 1)
+
 
 if __name__ == "__main__":
     main()

@@ -14,6 +14,7 @@ import {
   Gauge, Scissors, X, Loader2, Upload, Sparkles, Check, MessageSquareText, Save as SaveIcon, Plus, Trash2,
 } from 'lucide-react'
 import { styleAssToCss, chunkForLine, findActiveCue, assToCss } from './captionUtils'
+import FeatureGate from './FeatureGate'
 
 // Caption-style presets (the "Big idea" grid in the reference)
 const PRESETS = [
@@ -969,51 +970,55 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                     Backend consumes these on render and converts hex → ASS &HAABBGGRR& in the Style row + \c inline tag. */}
                 <div className="space-y-3 pt-2 border-t border-border">
                   <Label className="text-sm font-semibold">Caption Design</Label>
-                  <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground">Font family</Label>
-                    <select
-                      value={state.font_family}
-                      onChange={(e) => patch({ font_family: e.target.value })}
-                      className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-                    >
-                      {['Impact', 'Montserrat', 'Arial Black', 'Bold Sans', 'Bebas Neue', 'Oswald', 'Pacifico', 'Bangers', 'DejaVu Sans'].map(f => (
-                        <option key={f} value={f}>{f}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    {[
-                      { key: 'base_text_color',      label: 'Base text',        hint: 'Non-active words' },
-                      { key: 'highlight_text_color', label: 'Highlight word',   hint: 'Active-word color' },
-                      { key: 'stroke_color',         label: 'Stroke / outline', hint: 'Text border' },
-                      { key: 'shadow_color',         label: 'Shadow',           hint: 'Behind text' },
-                    ].map(fld => (
-                      <div key={fld.key} className="space-y-1">
-                        <Label className="text-xs text-muted-foreground">{fld.label}</Label>
-                        <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5">
-                          <input
-                            type="color"
-                            value={state[fld.key] || '#000000'}
-                            onChange={(e) => patch({ [fld.key]: e.target.value.toUpperCase() })}
-                            className="h-6 w-8 rounded cursor-pointer border-0 bg-transparent p-0"
-                            title={fld.hint}
-                          />
-                          <input
-                            type="text"
-                            value={state[fld.key] || ''}
-                            onChange={(e) => {
-                              const v = e.target.value.trim()
-                              if (/^#?[0-9a-fA-F]{0,6}$/.test(v)) {
-                                patch({ [fld.key]: v.startsWith('#') ? v.toUpperCase() : ('#' + v).toUpperCase() })
-                              }
-                            }}
-                            className="flex-1 bg-transparent text-xs font-mono outline-none min-w-0"
-                            maxLength={7}
-                          />
+                  <FeatureGate feature="custom_fonts" label="Upgrade for custom fonts">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Font family</Label>
+                      <select
+                        value={state.font_family}
+                        onChange={(e) => patch({ font_family: e.target.value })}
+                        className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                      >
+                        {['Impact', 'Montserrat', 'Arial Black', 'Bold Sans', 'Bebas Neue', 'Oswald', 'Pacifico', 'Bangers', 'DejaVu Sans'].map(f => (
+                          <option key={f} value={f}>{f}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </FeatureGate>
+                  <FeatureGate feature="custom_colors" label="Upgrade for custom colors">
+                    <div className="grid grid-cols-2 gap-3">
+                      {[
+                        { key: 'base_text_color',      label: 'Base text',        hint: 'Non-active words' },
+                        { key: 'highlight_text_color', label: 'Highlight word',   hint: 'Active-word color' },
+                        { key: 'stroke_color',         label: 'Stroke / outline', hint: 'Text border' },
+                        { key: 'shadow_color',         label: 'Shadow',           hint: 'Behind text' },
+                      ].map(fld => (
+                        <div key={fld.key} className="space-y-1">
+                          <Label className="text-xs text-muted-foreground">{fld.label}</Label>
+                          <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5">
+                            <input
+                              type="color"
+                              value={state[fld.key] || '#000000'}
+                              onChange={(e) => patch({ [fld.key]: e.target.value.toUpperCase() })}
+                              className="h-6 w-8 rounded cursor-pointer border-0 bg-transparent p-0"
+                              title={fld.hint}
+                            />
+                            <input
+                              type="text"
+                              value={state[fld.key] || ''}
+                              onChange={(e) => {
+                                const v = e.target.value.trim()
+                                if (/^#?[0-9a-fA-F]{0,6}$/.test(v)) {
+                                  patch({ [fld.key]: v.startsWith('#') ? v.toUpperCase() : ('#' + v).toUpperCase() })
+                                }
+                              }}
+                              className="flex-1 bg-transparent text-xs font-mono outline-none min-w-0"
+                              maxLength={7}
+                            />
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  </FeatureGate>
                   <div className="text-[10px] text-muted-foreground -mt-1">
                     Colors apply live to the preview and are burned into the exported MP4 on render. Selecting a Preset from the Presets tab resets these to that preset&apos;s defaults.
                   </div>
@@ -1186,8 +1191,10 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
 
               {/* Logo */}
               <TabsContent value="logo" className="p-4 overflow-y-auto max-h-[55vh] mt-0 space-y-4">
-                <div className="rounded-lg border-2 border-dashed border-border bg-muted/20 p-6 text-center cursor-pointer hover:border-primary/40"
-                  onClick={() => fileRef.current?.click()}>
+                <FeatureGate feature="custom_logo" label="Upgrade for custom logo overlay">
+                  <div className="space-y-4">
+                    <div className="rounded-lg border-2 border-dashed border-border bg-muted/20 p-6 text-center cursor-pointer hover:border-primary/40"
+                      onClick={() => fileRef.current?.click()}>
                   {state.logo_url ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={state.logo_url} alt="logo" className="mx-auto h-20 w-auto object-contain" />
@@ -1229,11 +1236,15 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                     <Button size="sm" variant="ghost" className="text-destructive" onClick={() => patch({ logo_url: null })}>Remove logo</Button>
                   </>
                 )}
+                  </div>
+                </FeatureGate>
               </TabsContent>
 
               {/* ─────────── Intro / Outro / Scroll-Stopper ─────────── */}
               <TabsContent value="brand" className="p-4 overflow-y-auto max-h-[55vh] mt-0 space-y-5">
-                <BrandingTab clip={clip} state={state} patch={patch} />
+                <FeatureGate feature="intro_outro" label="Upgrade to unlock Intros & Outros">
+                  <BrandingTab clip={clip} state={state} patch={patch} />
+                </FeatureGate>
               </TabsContent>
             </Tabs>
 

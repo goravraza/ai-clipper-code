@@ -37,6 +37,32 @@ const ADMIN_EMAILS = new Set([
   'prathamch37@gmail.com',
 ])
 
+// ============= FEATURE-GATING REGISTRY =============
+// Source of truth for the 8 gate-able premium features. Admin can edit which
+// tier grants which feature via the pricing_features matrix.
+const FEATURE_KEYS = [
+  { key: 'respool',            label: 'Re-generate Clips (Respool)',      description: 'Re-run AI clip detection on a processed video to produce a fresh set of clips.', category: 'ai' },
+  { key: 'animated_captions',  label: 'Animated Word-by-Word Captions',   description: 'Karaoke-style highlighting, bounce, and dynamic caption animations.',           category: 'captions' },
+  { key: 'custom_logo',        label: 'Custom Brand Logo Overlay',        description: 'Overlay your own logo on rendered clips.',                                     category: 'branding' },
+  { key: 'scroll_stopper',     label: 'Scroll-Stopper Media',             description: 'Prepend high-retention scroll-stopper videos to your clips.',                  category: 'branding' },
+  { key: 'hd_export',          label: '1080p HD Export',                  description: 'Export clips in full 1080×1920 HD (vs. 720p on free).',                        category: 'export' },
+  { key: 'custom_fonts',       label: 'Custom Font Families',             description: 'Choose from the full library of caption fonts.',                               category: 'captions' },
+  { key: 'custom_colors',      label: 'Custom Hex Colors',                description: 'Fine-tune caption colors with custom hex values (base, highlight, stroke).',   category: 'captions' },
+  { key: 'intro_outro',        label: 'Custom Intro & Outro',             description: 'Attach your own branded intro or outro clip to every render.',                 category: 'branding' },
+]
+const FEATURE_KEY_SET = new Set(FEATURE_KEYS.map(f => f.key))
+const DEFAULT_TIERS = [
+  { key: 'free',     name: 'Free',     order: 1, price_usd: 0,  price_inr: 0,    is_default: true,  is_active: true, tagline: 'Get started, no credit card needed.' },
+  { key: 'pro',      name: 'Pro',      order: 2, price_usd: 19, price_inr: 1499, is_default: false, is_active: true, tagline: 'For serious creators shipping every week.' },
+  { key: 'business', name: 'Business', order: 3, price_usd: 49, price_inr: 3999, is_default: false, is_active: true, tagline: 'Teams & agencies with brand kits.' },
+]
+// Which features are ON for each default tier. Admin can flip these anytime.
+const DEFAULT_FEATURE_MATRIX = {
+  free:     { respool: false, animated_captions: false, custom_logo: false, scroll_stopper: false, hd_export: false, custom_fonts: false, custom_colors: false, intro_outro: false },
+  pro:      { respool: true,  animated_captions: true,  custom_logo: true,  scroll_stopper: false, hd_export: true,  custom_fonts: true,  custom_colors: true,  intro_outro: true  },
+  business: { respool: true,  animated_captions: true,  custom_logo: true,  scroll_stopper: true,  hd_export: true,  custom_fonts: true,  custom_colors: true,  intro_outro: true  },
+}
+
 async function seedIfEmpty(db) {
   const pkgCount = await db.collection('pricing_packages').countDocuments()
   if (pkgCount === 0) {
@@ -89,6 +115,41 @@ async function seedIfEmpty(db) {
       { id: uuidv4(), code: 'BLACKFRIDAY', discount_percent: 70, max_redemptions: 500, current_redemptions: 0, expires_at: new Date(Date.now() + 365*24*3600*1000), is_active: false, created_at: new Date() },
     ])
   }
+
+  // ============= PRICING TIERS + FEATURE MATRIX =============
+  // Seeds three editable tiers (free/pro/business) and the 8-feature access
+  // matrix. Admin can rename tiers, add new tiers, and flip any feature.
+  await db.collection('pricing_tiers').createIndex({ key: 1 }, { unique: true }).catch(()=>{})
+  await db.collection('pricing_features').createIndex({ tier_key: 1, feature_key: 1 }, { unique: true }).catch(()=>{})
+  const tierCount = await db.collection('pricing_tiers').countDocuments()
+  if (tierCount === 0) {
+    await db.collection('pricing_tiers').insertMany(
+      DEFAULT_TIERS.map(t => ({ id: uuidv4(), ...t, created_at: new Date(), updated_at: new Date() }))
+    )
+  }
+  // Seed / heal the feature matrix — one row per (tier, feature). Idempotent.
+  const existingRows = await db.collection('pricing_features').find({}).toArray()
+  const rowSet = new Set(existingRows.map(r => `${r.tier_key}::${r.feature_key}`))
+  const activeTiers = await db.collection('pricing_tiers').find({}).toArray()
+  const missing = []
+  for (const t of activeTiers) {
+    for (const f of FEATURE_KEYS) {
+      const sig = `${t.key}::${f.key}`
+      if (!rowSet.has(sig)) {
+        const seedVal = DEFAULT_FEATURE_MATRIX[t.key]?.[f.key]
+        missing.push({
+          id: uuidv4(), tier_key: t.key, feature_key: f.key,
+          is_enabled: seedVal === true, created_at: new Date(), updated_at: new Date(),
+        })
+      }
+    }
+  }
+  if (missing.length) await db.collection('pricing_features').insertMany(missing)
+
+  // Ensure every profile has a plan_key (defaults to 'free')
+  await db.collection('profiles').updateMany({ plan_key: { $exists: false } }, { $set: { plan_key: 'free' } }).catch(()=>{})
+  // Admin/seeded admin user gets business plan by default so they can test all features
+  await db.collection('profiles').updateOne({ id: ADMIN_USER_ID }, { $set: { plan_key: 'business' } }).catch(()=>{})
 }
 
 function strip(doc) { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
@@ -160,6 +221,28 @@ async function getUser(request, db, opts = {}) {
     }
   }
   return await db.collection('profiles').findOne({ id: DEFAULT_USER_ID })
+}
+
+/**
+ * Resolves the current user's feature-access map based on their plan_key.
+ * Returns { plan_key, plan_name, features: {respool:true, ...}, tier: {...} }.
+ * Falls back to `free` tier if the profile's plan_key isn't found (safety net).
+ */
+async function getUserFeatures(db, user) {
+  const planKey = (user && user.plan_key) || 'free'
+  let tier = await db.collection('pricing_tiers').findOne({ key: planKey })
+  if (!tier) {
+    tier = await db.collection('pricing_tiers').findOne({ key: 'free' })
+                || await db.collection('pricing_tiers').findOne({ is_default: true })
+                || { key: 'free', name: 'Free' }
+  }
+  const rows = await db.collection('pricing_features').find({ tier_key: tier.key }).toArray()
+  const features = {}
+  for (const f of FEATURE_KEYS) features[f.key] = false
+  for (const r of rows) if (FEATURE_KEY_SET.has(r.feature_key)) features[r.feature_key] = !!r.is_enabled
+  // Admins always get everything on
+  if (isAdminProfile(user)) for (const f of FEATURE_KEYS) features[f.key] = true
+  return { plan_key: tier.key, plan_name: tier.name, features, tier: strip(tier) }
 }
 
 async function callLLM(messages, { json = false, temperature = 0.7, db = null } = {}) {
@@ -400,6 +483,24 @@ async function handle(request, { params }) {
       await db.collection('profiles').updateOne({ id: user.id }, { $set: updates })
       const p = await db.collection('profiles').findOne({ id: user.id })
       return NextResponse.json(strip(p))
+    }
+
+    // ============= FEATURE-GATING (user) =============
+    if (path_ === '/user/features' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      const result = await getUserFeatures(db, user)
+      // include catalog + list of active tiers + full matrix so the upgrade modal can render prices/names and compare plans
+      const tiers = await db.collection('pricing_tiers').find({ is_active: { $ne: false } }).sort({ order: 1 }).toArray()
+      const matrixRows = await db.collection('pricing_features').find({}).toArray()
+      const matrix = {}
+      for (const t of tiers) {
+        matrix[t.key] = {}
+        for (const f of FEATURE_KEYS) matrix[t.key][f.key] = false
+      }
+      for (const r of matrixRows) {
+        if (matrix[r.tier_key] && FEATURE_KEY_SET.has(r.feature_key)) matrix[r.tier_key][r.feature_key] = !!r.is_enabled
+      }
+      return NextResponse.json({ ...result, catalog: FEATURE_KEYS, tiers: tiers.map(strip), matrix })
     }
 
     // ============= PRICING PACKAGES =============
@@ -2978,6 +3079,118 @@ ${eventsBlock}
     }
 
     // ============= USERS (admin) =============
+    // ============= ADMIN: PRICING TIERS + FEATURE MATRIX =============
+    if (path_ === '/admin/pricing-tiers' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const tiers = await db.collection('pricing_tiers').find({}).sort({ order: 1 }).toArray()
+      return NextResponse.json(tiers.map(strip))
+    }
+    if (path_ === '/admin/pricing-tiers' && method === 'POST') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const rawKey = String(body.key || body.name || '').toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40)
+      if (!rawKey) return NextResponse.json({ error: 'key required' }, { status: 400 })
+      const clash = await db.collection('pricing_tiers').findOne({ key: rawKey })
+      if (clash) return NextResponse.json({ error: 'tier key already exists' }, { status: 409 })
+      const maxOrder = await db.collection('pricing_tiers').find({}).sort({ order: -1 }).limit(1).toArray()
+      const doc = {
+        id: uuidv4(), key: rawKey,
+        name: String(body.name || rawKey),
+        order: Number(body.order) || (maxOrder[0]?.order || 0) + 1,
+        price_usd: Number(body.price_usd) || 0,
+        price_inr: Number(body.price_inr) || 0,
+        is_default: !!body.is_default, is_active: body.is_active !== false,
+        tagline: String(body.tagline || ''),
+        created_at: new Date(), updated_at: new Date(),
+      }
+      await db.collection('pricing_tiers').insertOne(doc)
+      // Seed matrix rows for the new tier (all off by default)
+      const rows = FEATURE_KEYS.map(f => ({
+        id: uuidv4(), tier_key: rawKey, feature_key: f.key,
+        is_enabled: false, created_at: new Date(), updated_at: new Date(),
+      }))
+      await db.collection('pricing_features').insertMany(rows).catch(()=>{})
+      await logActivity(db, user.id, 'pricing_tier_created', request, { key: rawKey, name: doc.name })
+      return NextResponse.json(strip(doc))
+    }
+    if (path_.startsWith('/admin/pricing-tiers/') && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const body = await request.json()
+      const allowed = ['name','order','price_usd','price_inr','is_default','is_active','tagline']
+      const updates = { updated_at: new Date() }
+      for (const k of allowed) if (k in body) updates[k] = body[k]
+      await db.collection('pricing_tiers').updateOne({ id }, { $set: updates })
+      const p = await db.collection('pricing_tiers').findOne({ id })
+      await logActivity(db, user.id, 'pricing_tier_updated', request, { id, updates })
+      return NextResponse.json(strip(p))
+    }
+    if (path_.startsWith('/admin/pricing-tiers/') && method === 'DELETE') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const tier = await db.collection('pricing_tiers').findOne({ id })
+      if (!tier) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      if (tier.is_default || tier.key === 'free') return NextResponse.json({ error: 'cannot delete default/free tier' }, { status: 400 })
+      await db.collection('pricing_tiers').deleteOne({ id })
+      await db.collection('pricing_features').deleteMany({ tier_key: tier.key })
+      // Reset any user on this plan back to free
+      await db.collection('profiles').updateMany({ plan_key: tier.key }, { $set: { plan_key: 'free' } })
+      await logActivity(db, user.id, 'pricing_tier_deleted', request, { id, key: tier.key })
+      return NextResponse.json({ ok: true })
+    }
+    if (path_ === '/admin/pricing-features' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const tiers = await db.collection('pricing_tiers').find({}).sort({ order: 1 }).toArray()
+      const rows = await db.collection('pricing_features').find({}).toArray()
+      // Return as a flat matrix: { catalog, tiers, matrix: { [tier_key]: { [feature_key]: bool } } }
+      const matrix = {}
+      for (const t of tiers) {
+        matrix[t.key] = {}
+        for (const f of FEATURE_KEYS) matrix[t.key][f.key] = false
+      }
+      for (const r of rows) {
+        if (matrix[r.tier_key] && FEATURE_KEY_SET.has(r.feature_key)) {
+          matrix[r.tier_key][r.feature_key] = !!r.is_enabled
+        }
+      }
+      return NextResponse.json({ catalog: FEATURE_KEYS, tiers: tiers.map(strip), matrix })
+    }
+    if (path_ === '/admin/pricing-features' && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      // Accept either { updates: [{tier_key, feature_key, is_enabled}, ...] } or full { matrix: {...} }
+      const updates = []
+      if (Array.isArray(body.updates)) {
+        for (const u of body.updates) {
+          if (!u || typeof u.tier_key !== 'string' || !FEATURE_KEY_SET.has(u.feature_key)) continue
+          updates.push({ tier_key: u.tier_key, feature_key: u.feature_key, is_enabled: !!u.is_enabled })
+        }
+      } else if (body.matrix && typeof body.matrix === 'object') {
+        for (const [tk, feats] of Object.entries(body.matrix)) {
+          for (const [fk, val] of Object.entries(feats || {})) {
+            if (!FEATURE_KEY_SET.has(fk)) continue
+            updates.push({ tier_key: tk, feature_key: fk, is_enabled: !!val })
+          }
+        }
+      }
+      for (const u of updates) {
+        await db.collection('pricing_features').updateOne(
+          { tier_key: u.tier_key, feature_key: u.feature_key },
+          { $set: { is_enabled: u.is_enabled, updated_at: new Date() },
+            $setOnInsert: { id: uuidv4(), tier_key: u.tier_key, feature_key: u.feature_key, created_at: new Date() } },
+          { upsert: true }
+        )
+      }
+      await logActivity(db, user.id, 'pricing_features_updated', request, { count: updates.length })
+      return NextResponse.json({ ok: true, updated: updates.length })
+    }
+
     if (path_ === '/admin/users' && method === 'GET') {
       const user = await getUser(request, db, { allowAdminImpersonation: true })
       if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
@@ -2995,11 +3208,15 @@ ${eventsBlock}
       if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
       const id = segments[2]
       const body = await request.json()
-      const allowed = ['credit_balance_minutes','is_admin','role','email','name']
+      const allowed = ['credit_balance_minutes','is_admin','role','email','name','plan_key']
       const updates = {}
       for (const k of allowed) if (k in body) updates[k] = body[k]
       if ('is_admin' in updates) updates.role = updates.is_admin ? 'admin' : 'user'
       if ('role' in updates) updates.is_admin = updates.role === 'admin'
+      if ('plan_key' in updates) {
+        const t = await db.collection('pricing_tiers').findOne({ key: updates.plan_key })
+        if (!t) return NextResponse.json({ error: `unknown plan_key: ${updates.plan_key}` }, { status: 400 })
+      }
       await db.collection('profiles').updateOne({ id }, { $set: updates })
       await logActivity(db, user.id, 'user_updated_by_admin', request, { target_id: id, updates })
       const p = await db.collection('profiles').findOne({ id })

@@ -16,6 +16,7 @@ import CouponsTab from './_components/coupons-tab'
 import UsersTab from './_components/users-tab'
 import NewsletterTab from './_components/newsletter-tab'
 import AnalyticsTab from './_components/analytics-tab'
+import PricingFeaturesTab from './_components/pricing-features-tab'
 
 // Catalog of supported integrations (keys + metadata)
 const INTEGRATIONS = [
@@ -221,6 +222,7 @@ export default function AdminPage() {
           <Tabs defaultValue="analytics">
             <TabsList className="mb-6 flex-wrap h-auto">
               <TabsTrigger value="analytics"><BarChart3 className="h-3.5 w-3.5 mr-1.5" /> Analytics</TabsTrigger>
+              <TabsTrigger value="tiers"><Sparkles className="h-3.5 w-3.5 mr-1.5" /> Tiers & Gating</TabsTrigger>
               <TabsTrigger value="pricing"><Coins className="h-3.5 w-3.5 mr-1.5" /> Pricing ({pkgs.length})</TabsTrigger>
               <TabsTrigger value="coupons"><Ticket className="h-3.5 w-3.5 mr-1.5" /> Coupons</TabsTrigger>
               <TabsTrigger value="users"><Users className="h-3.5 w-3.5 mr-1.5" /> Users</TabsTrigger>
@@ -230,6 +232,7 @@ export default function AdminPage() {
             </TabsList>
 
             <TabsContent value="analytics"><AnalyticsTab /></TabsContent>
+            <TabsContent value="tiers"><PricingFeaturesTab /></TabsContent>
             <TabsContent value="coupons"><CouponsTab /></TabsContent>
             <TabsContent value="users"><UsersTab /></TabsContent>
             <TabsContent value="newsletter"><NewsletterTab /></TabsContent>
