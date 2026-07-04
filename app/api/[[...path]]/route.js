@@ -1659,6 +1659,54 @@ ${transcriptListing}`
         return NextResponse.json({ error: 'No rendered MP4 available — clip must be generated first' }, { status: 410 })
       }
       const body = await request.json().catch(() => ({}))
+
+      // ============= TIMELINE OFFSET RESOLUTION (must happen BEFORE writeAss) =============
+      // If a user intro or an admin scroll-stopper will be prepended during the stitch step, the burned-in
+      // captions must be shifted forward by that anchor's exact duration so they land on the correct frames
+      // once the main video starts inside the concatenated final MP4.
+      //   • No anchor  → timelineOffset = 0.00
+      //   • Intro OR   → timelineOffset = ffprobe(intro).duration
+      //   • Scroll-stopper (only when global toggle is ON AND no intro) → its duration
+      // The offset is:  (a) added to every Dialogue start/end time in the .ass  (b) persisted on the clip so
+      // the frontend preview can align its cue lookup with the concat playhead.
+      const _probeDurLocal = async (p) => {
+        try {
+          const { execFile: ef } = await import('child_process')
+          const { stdout } = await new Promise((r, j) => ef('/usr/bin/ffprobe', ['-v','error','-show_entries','format=duration','-of','default=nokey=1:noprint_wrappers=1', p], (e, o) => e ? j(e) : r({ stdout: o })))
+          return parseFloat(String(stdout).trim()) || 0
+        } catch { return 0 }
+      }
+      let timelineOffset = 0
+      let resolvedStartAnchor = null   // absolute file path used as start anchor (intro or scroll-stopper)
+      let resolvedOutroAnchor = null
+      let resolvedScrollStopperId = null
+      // Intro takes priority over scroll-stopper (spec)
+      if (clip.user_intro_path && await fs.access(clip.user_intro_path).then(() => true).catch(() => false)) {
+        resolvedStartAnchor = clip.user_intro_path
+      } else if (body.scroll_stopper_id) {
+        const _cfg = await db.collection('system_config').findOne({ key: 'global_scroll_stopper_status' })
+        if (_cfg?.value) {
+          let _picked = null
+          if (body.scroll_stopper_id === 'random') {
+            const pool = await db.collection('scroll_stoppers').find({ is_active: true }).toArray()
+            if (pool.length > 0) _picked = pool[Math.floor(Math.random() * pool.length)]
+          } else {
+            _picked = await db.collection('scroll_stoppers').findOne({ id: String(body.scroll_stopper_id), is_active: true })
+          }
+          if (_picked?.file_path && await fs.access(_picked.file_path).then(() => true).catch(() => false)) {
+            resolvedStartAnchor = _picked.file_path
+            resolvedScrollStopperId = _picked.id
+          }
+        }
+      }
+      if (clip.user_outro_path && await fs.access(clip.user_outro_path).then(() => true).catch(() => false)) {
+        resolvedOutroAnchor = clip.user_outro_path
+      }
+      if (resolvedStartAnchor) {
+        timelineOffset = await _probeDurLocal(resolvedStartAnchor)
+      }
+      const hasAnchors = !!(resolvedStartAnchor || resolvedOutroAnchor)
+
       // Probe actual MP4 duration via ffprobe — DB's start/end_time are the ORIGINAL bounds,
       // but the file on disk may already be shorter (e.g. if a previous trim was applied).
       let srcDuration = (clip.end_time_seconds || 0) - (clip.start_time_seconds || 0)
@@ -1820,8 +1868,13 @@ ${transcriptListing}`
         const stripTrailAmp = (c) => c ? String(c).replace(/&$/, '') : c
         // Build .ass file content from chunked cues (≤4 words/line, hard split for very long cues)
         const writeAss = async (cues) => {
+          // TIMELINE SHIFT: shift every Dialogue start/end by the resolved anchor duration so the burned
+          // subtitles land on the correct frames after the intro/scroll-stopper plays. When there are NO
+          // anchors, offset stays 0.00. Silence-gap normalization still evaluates the RAW word timings
+          // (before shift) so the "min word duration" logic isn't corrupted by the anchor offset.
+          const _shift = timelineOffset || 0
           const fmt = (s) => {
-            const sec = Math.max(0, s)
+            const sec = Math.max(0, s + _shift)   // apply timeline offset here (single source of truth)
             const hh = Math.floor(sec / 3600)
             const mm = String(Math.floor((sec % 3600) / 60)).padStart(2, '0')
             const ss = String(Math.floor(sec % 60)).padStart(2, '0')
@@ -2132,7 +2185,12 @@ ${eventsBlock}
         if (assResult?.assPath) {
           const escAss = assResult.assPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
           // ffmpeg's subtitles filter auto-detects .ass extension and uses libass directly.
-          subtitleFilter = `subtitles='${escAss}'`
+          // If anchors exist, we DEFER burning captions until AFTER the stitch step so the timeline-
+          // shifted .ass gets applied to the concatenated MP4 (intro + core + outro), not the bare core.
+          // This is what makes the caption offset work end-to-end.
+          if (!hasAnchors) {
+            subtitleFilter = `subtitles='${escAss}'`
+          }
           try {
             // Persist a back-compat SRT-style record of what was rendered (for the CC tab on next open)
             const srtBack = assResult.chunked.map((c, i) => {
@@ -2292,34 +2350,14 @@ ${eventsBlock}
         await fs.copyFile(tmpOut, srcPath)
 
         // ============= INTRO / SCROLL-STOPPER / OUTRO STITCH (MASTER CONCAT CHOP) =============
-        // Order per spec:  [ user_intro OR selected scroll_stopper ]  →  [ core clip w/ captions ]  →  [ user_outro ]
-        // Each anchor media is normalized to 1080x1920 / 30fps / AAC 44.1kHz stereo (matches core clip codec),
-        // then concat-demuxed. If NO anchors are configured, we skip this whole block and keep the core file.
+        // Order per spec:  [ user_intro OR selected scroll_stopper ]  →  [ core clip ]  →  [ user_outro ]
+        // Note: when hasAnchors is true, the core clip does NOT have captions baked in yet (see subtitleFilter
+        // block above) — we apply the timeline-shifted .ass to the CONCAT output as the very last pass.
         try {
-          const introSrc = clip.user_intro_path && (await fs.access(clip.user_intro_path).then(() => clip.user_intro_path).catch(() => null))
-          const outroSrc = clip.user_outro_path && (await fs.access(clip.user_outro_path).then(() => clip.user_outro_path).catch(() => null))
-          // Scroll-stopper resolution: only used if there is NO user intro AND global toggle is ON.
-          // body.scroll_stopper_id can be a specific id, 'random' (pick from active pool), or null.
-          let scrollStopperSrc = null
-          if (!introSrc && body.scroll_stopper_id) {
-            const cfg = await db.collection('system_config').findOne({ key: 'global_scroll_stopper_status' })
-            if (cfg?.value) {
-              let picked = null
-              if (body.scroll_stopper_id === 'random') {
-                const pool = await db.collection('scroll_stoppers').find({ is_active: true }).toArray()
-                if (pool.length > 0) picked = pool[Math.floor(Math.random() * pool.length)]
-              } else {
-                picked = await db.collection('scroll_stoppers').findOne({ id: String(body.scroll_stopper_id), is_active: true })
-              }
-              if (picked?.file_path && await fs.access(picked.file_path).then(() => true).catch(() => false)) {
-                scrollStopperSrc = picked.file_path
-              }
-            }
-          }
-
-          const startAnchor = introSrc || scrollStopperSrc
-          if (startAnchor || outroSrc) {
-            // Normalize each anchor to match the core clip's codec params so concat-demuxer stream-copy works.
+          const introSrc = resolvedStartAnchor   // may be intro OR scroll_stopper (already resolved above)
+          const outroSrc = resolvedOutroAnchor
+          const scrollStopperSrc = introSrc === clip.user_intro_path ? null : introSrc  // null if intro; else scroll-stopper
+          if (introSrc || outroSrc) {
             const normalizeAnchor = async (inPath, outPath) => {
               await new Promise((resolve, reject) => {
                 const p = spawn('/usr/bin/ffmpeg', [
@@ -2338,16 +2376,15 @@ ${eventsBlock}
             const stitchDir = path.join(tmpDir || '/tmp', `stitch_${uuidv4()}`)
             await fs.mkdir(stitchDir, { recursive: true })
             const parts = []
-            if (startAnchor) {
+            if (introSrc) {
               const p = path.join(stitchDir, 'start.mp4')
-              await normalizeAnchor(startAnchor, p); parts.push(p)
+              await normalizeAnchor(introSrc, p); parts.push(p)
             }
-            parts.push(srcPath)  // core clip is already normalized
+            parts.push(srcPath)  // core clip is already normalized (no captions yet if hasAnchors)
             if (outroSrc) {
               const p = path.join(stitchDir, 'end.mp4')
               await normalizeAnchor(outroSrc, p); parts.push(p)
             }
-            // Concat via demuxer + stream-copy (all parts share codec params)
             const listFile = path.join(stitchDir, 'concat.txt')
             await fs.writeFile(listFile, parts.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'))
             const stitched = path.join(stitchDir, 'stitched.mp4')
@@ -2358,12 +2395,31 @@ ${eventsBlock}
               p.on('close', code => code === 0 ? resolve() : reject(new Error('stitch concat failed: ' + se.slice(-200))))
               p.on('error', reject)
             })
-            await fs.copyFile(stitched, srcPath)
+
+            // FINAL SUBTITLE PASS — burn the TIMELINE-SHIFTED .ass onto the concat output so captions land
+            // exactly on the core section's frames (never during the intro/hook).
+            if (assResult?.assPath) {
+              const finalWithCaps = path.join(stitchDir, 'final.mp4')
+              const escAss2 = assResult.assPath.replace(/\\/g,'/').replace(/:/g,'\\:').replace(/'/g,"\\'")
+              await new Promise((resolve, reject) => {
+                const p = spawn('/usr/bin/ffmpeg', [
+                  '-y', '-i', stitched, '-vf', `subtitles='${escAss2}'`,
+                  '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+                  '-c:a', 'copy', '-movflags', '+faststart', finalWithCaps,
+                ], { stdio: ['ignore', 'pipe', 'pipe'] })
+                let se = ''
+                p.stderr.on('data', d => { se += d.toString() })
+                p.on('close', code => code === 0 ? resolve() : reject(new Error('final subtitle burn failed: ' + se.slice(-200))))
+                p.on('error', reject)
+              })
+              await fs.copyFile(finalWithCaps, srcPath)
+            } else {
+              await fs.copyFile(stitched, srcPath)
+            }
             try { await fs.rm(stitchDir, { recursive: true, force: true }) } catch {}
-            console.log(`[render-stitch] clip ${clipId}: intro=${!!startAnchor} outro=${!!outroSrc} scroll_stopper=${!!scrollStopperSrc}`)
+            console.log(`[render-stitch] clip ${clipId}: intro=${!!clip.user_intro_path} outro=${!!outroSrc} scroll_stopper=${!!scrollStopperSrc} offset=${timelineOffset.toFixed(2)}s`)
           }
         } catch (stitchErr) {
-          // Stitch failures should NOT nuke the core render — log and continue with just the main clip.
           console.error('[render-stitch] failed (non-fatal):', stitchErr.message)
         }
 
@@ -2386,6 +2442,13 @@ ${eventsBlock}
           title_text: titleText || null, title_position: titleText ? titlePosition : null,
           template_id: templateId,
           animation_style: ['static','karaoke','word_bounce'].includes(body.animation_style) ? body.animation_style : (clip.animation_style || 'karaoke'),
+          // TIMELINE SHIFT: record the exact anchor duration so the frontend preview can lock its cue
+          // lookup to the concat playhead. 0.00 when no anchor is prepended.
+          render_timeline_offset: Number.isFinite(timelineOffset) ? Number(timelineOffset.toFixed(3)) : 0,
+          render_start_anchor_type: resolvedStartAnchor
+            ? (resolvedStartAnchor === clip.user_intro_path ? 'intro' : 'scroll_stopper')
+            : null,
+          render_scroll_stopper_id: resolvedScrollStopperId || null,
           // CC-tab custom design fields — persist so reopening the editor restores the user's choices.
           // Only persist if the input is a valid hex (#RRGGBB or #RGB), otherwise keep the previous value.
           ...(function(){

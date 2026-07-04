@@ -328,16 +328,22 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
     const v = videoRef.current
     if (!v) return
     let raf = 0
+    // When the exported MP4 has a prepended intro / scroll-stopper, the video's `currentTime` starts at 0
+    // during the anchor playback while our activeCaptionTrack timings are core-relative (0..core_dur).
+    // Subtract the anchor duration from currentTime so cue lookup lines up with the concat playhead —
+    // captions won't display during the intro / hook, and land on-frame once the core clip begins.
+    const _offset = Number(clip?.render_timeline_offset || 0)
     const tick = () => {
       const t = v.currentTime || 0
       setCurrentTime(t)
-      const { idx } = findActiveCue(activeCaptionTrack, t)
+      const tShift = Math.max(0, t - _offset)
+      const { idx } = findActiveCue(activeCaptionTrack, tShift)
       setActiveCueIdx(prev => prev !== idx ? idx : prev)
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [activeCaptionTrack, clip?.storage_url_mp4, clip?.render_version])
+  }, [activeCaptionTrack, clip?.storage_url_mp4, clip?.render_version, clip?.render_timeline_offset])
 
   // Measure the preview box so caption pixel sizes scale correctly w/ aspect ratio + responsive layout.
   useEffect(() => {
@@ -821,7 +827,9 @@ export default function ClipEditor({ open, clip, onClose, onSaved }) {
                           const accent = state.highlight_text_color || (state.style_ass && (state.style_ass.accent_hex || state.style_ass.accentHex)) || '#FFFF00'
                           // Find the active word index at currentTime — if outside the cue window, default to first word
                           // so ghost/paused previews always show at least the "active word" styling on token[0].
-                          let activeIdx = wordTimings.findIndex(w => currentTime >= w.start - 0.02 && currentTime < w.end + 0.02)
+                          // Shift currentTime by the intro/hook duration so word-highlight lookup lines up with the concat playhead
+                          const _tShift = Math.max(0, currentTime - Number(clip?.render_timeline_offset || 0))
+                          let activeIdx = wordTimings.findIndex(w => _tShift >= w.start - 0.02 && _tShift < w.end + 0.02)
                           if (activeIdx < 0) activeIdx = 0
                           return (
                             <span>
