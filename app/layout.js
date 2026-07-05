@@ -2,6 +2,7 @@ import './globals.css'
 import { ThemeProvider } from 'next-themes'
 import { Toaster } from 'sonner'
 import UpgradeDialog from './_components/UpgradeDialog'
+import SiteChrome from './_components/SiteChrome'
 
 export const metadata = {
   title: 'ClipForge AI — Turn Long Videos into Viral Shorts',
@@ -13,6 +14,7 @@ export default function RootLayout({ children }) {
     <html lang="en" suppressHydrationWarning>
       <body className="antialiased">
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false}>
+          <SiteChrome />
           {children}
           <UpgradeDialog />
           <Toaster position="top-right" richColors />

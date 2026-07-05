@@ -18,7 +18,7 @@ import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Plus, Trash2, Save, DollarSign, Coins, Sparkles } from 'lucide-react'
 
-export default function PricingFeaturesTab() {
+export default function PricingFeaturesTab({ pkgs = [], onCreatePkg, onSavePkg, onDeletePkg, PkgRow }) {
   const [state, setState] = useState({ catalog: [], tiers: [], matrix: {}, loading: true })
   const [pending, setPending] = useState({}) // { "tier_key::feature_key": bool }
   const [dirty, setDirty] = useState(new Set())
@@ -209,6 +209,24 @@ export default function PricingFeaturesTab() {
               </table>
             </CardContent>
           </Card>
+
+          {/* Credit packs (à-la-carte) */}
+          {PkgRow && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2"><Coins className="h-4 w-4" /> Credit packs (à-la-carte, sold via slider)</CardTitle>
+                <p className="text-xs text-muted-foreground">These are one-time credit purchases — separate from the subscription tiers above. Users pick these via the credit slider on the home page.</p>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex justify-end">
+                  <Button size="sm" onClick={onCreatePkg} className="gradient-bg text-white"><Plus className="h-4 w-4 mr-1" /> New pack</Button>
+                </div>
+                <div className="grid gap-3">
+                  {pkgs.map(p => <PkgRow key={p.id} pkg={p} onSave={onSavePkg} onDelete={onDeletePkg} />)}
+                </div>
+              </CardContent>
+            </Card>
+          )}
         </>
       )}
     </div>
@@ -217,12 +235,24 @@ export default function PricingFeaturesTab() {
 
 function TierEditor({ tier, onUpdate, onDelete }) {
   const [name, setName] = useState(tier.name)
-  const [priceUsd, setPriceUsd] = useState(tier.price_usd || 0)
-  const [priceInr, setPriceInr] = useState(tier.price_inr || 0)
+  const [priceUsdM, setPriceUsdM] = useState(tier.price_usd_monthly ?? tier.price_usd ?? 0)
+  const [priceInrM, setPriceInrM] = useState(tier.price_inr_monthly ?? tier.price_inr ?? 0)
+  const [priceUsdY, setPriceUsdY] = useState(tier.price_usd_yearly ?? Math.round((tier.price_usd_monthly ?? tier.price_usd ?? 0) * 10))
+  const [priceInrY, setPriceInrY] = useState(tier.price_inr_yearly ?? Math.round((tier.price_inr_monthly ?? tier.price_inr ?? 0) * 10))
+  const [credits, setCredits] = useState(tier.credits_included_monthly ?? 0)
   const [tagline, setTagline] = useState(tier.tagline || '')
   const [isActive, setIsActive] = useState(tier.is_active !== false)
-  const dirty = name !== tier.name || priceUsd !== (tier.price_usd || 0) || priceInr !== (tier.price_inr || 0) || tagline !== (tier.tagline || '') || isActive !== (tier.is_active !== false)
+  const dirty =
+    name !== tier.name ||
+    priceUsdM !== (tier.price_usd_monthly ?? tier.price_usd ?? 0) ||
+    priceInrM !== (tier.price_inr_monthly ?? tier.price_inr ?? 0) ||
+    priceUsdY !== (tier.price_usd_yearly ?? Math.round((tier.price_usd_monthly ?? tier.price_usd ?? 0) * 10)) ||
+    priceInrY !== (tier.price_inr_yearly ?? Math.round((tier.price_inr_monthly ?? tier.price_inr ?? 0) * 10)) ||
+    credits !== (tier.credits_included_monthly ?? 0) ||
+    tagline !== (tier.tagline || '') ||
+    isActive !== (tier.is_active !== false)
   const isCore = tier.is_default || tier.key === 'free'
+  const yearlySavings = priceUsdM > 0 ? Math.max(0, Math.round((1 - (priceUsdY / (priceUsdM * 12))) * 100)) : 0
 
   return (
     <Card className={dirty ? 'border-primary/60' : ''}>
@@ -238,16 +268,29 @@ function TierEditor({ tier, onUpdate, onDelete }) {
             </Button>
           )}
         </div>
-        <div className="grid grid-cols-2 gap-2">
+        <div>
+          <Label className="text-[10px] text-muted-foreground flex items-center gap-1"><Coins className="h-3 w-3" />Credits / month included</Label>
+          <Input type="number" value={credits} onChange={e => setCredits(Number(e.target.value))} className="h-8 text-sm" />
+        </div>
+        <div className="grid grid-cols-2 gap-2 pt-1">
           <div>
             <Label className="text-[10px] text-muted-foreground flex items-center gap-1"><DollarSign className="h-3 w-3" />USD /mo</Label>
-            <Input type="number" value={priceUsd} onChange={e => setPriceUsd(Number(e.target.value))} className="h-8 text-sm" />
+            <Input type="number" value={priceUsdM} onChange={e => setPriceUsdM(Number(e.target.value))} className="h-8 text-sm" />
           </div>
           <div>
             <Label className="text-[10px] text-muted-foreground flex items-center gap-1"><Coins className="h-3 w-3" />INR /mo</Label>
-            <Input type="number" value={priceInr} onChange={e => setPriceInr(Number(e.target.value))} className="h-8 text-sm" />
+            <Input type="number" value={priceInrM} onChange={e => setPriceInrM(Number(e.target.value))} className="h-8 text-sm" />
+          </div>
+          <div>
+            <Label className="text-[10px] text-muted-foreground flex items-center gap-1"><DollarSign className="h-3 w-3" />USD /yr</Label>
+            <Input type="number" value={priceUsdY} onChange={e => setPriceUsdY(Number(e.target.value))} className="h-8 text-sm" />
+          </div>
+          <div>
+            <Label className="text-[10px] text-muted-foreground flex items-center gap-1"><Coins className="h-3 w-3" />INR /yr</Label>
+            <Input type="number" value={priceInrY} onChange={e => setPriceInrY(Number(e.target.value))} className="h-8 text-sm" />
           </div>
         </div>
+        {yearlySavings > 0 && <div className="text-[10px] text-emerald-500 font-semibold">Yearly saves ~{yearlySavings}% vs monthly</div>}
         <div>
           <Label className="text-[10px] text-muted-foreground">Tagline</Label>
           <Input value={tagline} onChange={e => setTagline(e.target.value)} className="h-8 text-xs" placeholder="Short pitch shown in upgrade modal" />
@@ -256,7 +299,11 @@ function TierEditor({ tier, onUpdate, onDelete }) {
           <label className="flex items-center gap-2 text-xs">
             <Switch checked={isActive} onCheckedChange={setIsActive} /> Active
           </label>
-          <Button size="sm" disabled={!dirty} onClick={() => onUpdate(tier, { name, price_usd: priceUsd, price_inr: priceInr, tagline, is_active: isActive })} className={dirty ? 'gradient-bg text-white h-8' : 'h-8'}>
+          <Button size="sm" disabled={!dirty} onClick={() => onUpdate(tier, {
+            name, price_usd_monthly: priceUsdM, price_inr_monthly: priceInrM,
+            price_usd_yearly: priceUsdY, price_inr_yearly: priceInrY,
+            credits_included_monthly: credits, tagline, is_active: isActive,
+          })} className={dirty ? 'gradient-bg text-white h-8' : 'h-8'}>
             <Save className="h-3.5 w-3.5 mr-1" /> Save
           </Button>
         </div>

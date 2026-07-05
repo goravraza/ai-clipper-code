@@ -102,6 +102,8 @@ const DEFAULT_SITE_SETTINGS = {
   // À-la-carte credit slider — price per credit-minute in each currency.
   credit_price_per_minute_usd: 0.02,
   credit_price_per_minute_inr: 1.5,
+  // Feature flags — admin can disable half-built features until they're production-ready.
+  features_scheduling_enabled: false,   // hides Calendar nav + Schedule buttons on clips
   updated_at: null,
 }
 
@@ -634,6 +636,76 @@ async function handle(request, { params }) {
       return NextResponse.json({ ok: true, url, field })
     }
 
+    // ============= CMS PAGES =============
+    // Custom marketing/legal pages with rich content + SEO metadata + public/private visibility.
+    // Public route: /p/[slug]
+    if (path_ === '/pages' && method === 'GET') {
+      // Public list — only visible pages
+      const list = await db.collection('cms_pages').find({ is_active: { $ne: false }, visibility: 'public' }).project({ id: 1, slug: 1, title: 1, meta_title: 1, meta_description: 1, updated_at: 1 }).sort({ order: 1, title: 1 }).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+    if (path_.startsWith('/pages/') && method === 'GET') {
+      const slug = segments[1]
+      const p = await db.collection('cms_pages').findOne({ slug, is_active: { $ne: false } })
+      if (!p) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      // Private pages require admin
+      if (p.visibility === 'private') {
+        const user = await getUser(request, db, { allowAdminImpersonation: true })
+        if (!isAdminProfile(user)) return NextResponse.json({ error: 'not found' }, { status: 404 })
+      }
+      return NextResponse.json(strip(p))
+    }
+    if (path_ === '/admin/pages' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const list = await db.collection('cms_pages').find({}).sort({ order: 1, created_at: -1 }).toArray()
+      return NextResponse.json(list.map(strip))
+    }
+    if (path_ === '/admin/pages' && method === 'POST') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const rawSlug = String(body.slug || body.title || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+      if (!rawSlug) return NextResponse.json({ error: 'slug required' }, { status: 400 })
+      const clash = await db.collection('cms_pages').findOne({ slug: rawSlug })
+      if (clash) return NextResponse.json({ error: 'slug already exists' }, { status: 409 })
+      const doc = {
+        id: uuidv4(), slug: rawSlug,
+        title: String(body.title || rawSlug).slice(0, 200),
+        content_html: String(body.content_html || ''),
+        meta_title: String(body.meta_title || body.title || '').slice(0, 200),
+        meta_description: String(body.meta_description || '').slice(0, 500),
+        og_image_url: body.og_image_url || null,
+        visibility: body.visibility === 'private' ? 'private' : 'public',
+        is_active: body.is_active !== false,
+        order: Number(body.order) || 0,
+        created_at: new Date(), updated_at: new Date(), created_by: user.id,
+      }
+      await db.collection('cms_pages').insertOne(doc)
+      await logActivity(db, user.id, 'cms_page_created', request, { slug: rawSlug })
+      return NextResponse.json(strip(doc))
+    }
+    if (path_.startsWith('/admin/pages/') && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      const body = await request.json()
+      const allowed = ['title','content_html','meta_title','meta_description','og_image_url','visibility','is_active','order']
+      const updates = { updated_at: new Date() }
+      for (const k of allowed) if (k in body) updates[k] = body[k]
+      if ('visibility' in updates && !['public','private'].includes(updates.visibility)) delete updates.visibility
+      await db.collection('cms_pages').updateOne({ id }, { $set: updates })
+      const p = await db.collection('cms_pages').findOne({ id })
+      return NextResponse.json(strip(p))
+    }
+    if (path_.startsWith('/admin/pages/') && method === 'DELETE') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const id = segments[2]
+      await db.collection('cms_pages').deleteOne({ id })
+      return NextResponse.json({ ok: true })
+    }
+
     // ============= PRICING PACKAGES =============
     if (path_ === '/pricing-packages' && method === 'GET') {
       const list = await db.collection('pricing_packages').find({}).sort({ credit_amount_minutes: 1 }).toArray()
@@ -893,10 +965,15 @@ ${transcriptListing}`
             const relDur = Math.max(0.5, seg.end - seg.start)
             const subPath = path.join(tmpDir, `part_${String(i).padStart(2, '0')}.mp4`)
             // Extract sub-segment DIRECTLY from the full source video.
+            // We store the cut in NATIVE aspect ratio (no letterbox padding). The
+            // ClipCard preview uses object-cover to display as 9:16 in the grid,
+            // and the /render endpoint handles proper 9:16 framing (blur/color fill)
+            // when the user opens the supercut in the ClipEditor — just like a
+            // regular clip. This gives supercuts full parity with normal clips.
             await new Promise((resolve, reject) => {
               const ff = spawn('/usr/bin/ffmpeg', [
                 '-y', '-ss', String(relStart), '-t', String(relDur), '-i', sourcePath,
-                '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30',
+                '-vf', 'setsar=1,fps=30',
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
                 '-vsync', 'cfr', '-async', '1', '-movflags', '+faststart',

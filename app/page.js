@@ -183,6 +183,9 @@ export default function HomePage() {
   const [processing, setProcessing] = useState(null) // { video_id, status, progress }
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
+  const [siteSettings, setSiteSettings] = useState(null)
+  const isAdmin = !!(profile && (profile.is_admin === true || profile.role === 'admin'))
+  const schedulingEnabled = !!(siteSettings?.features_scheduling_enabled)
 
   useEffect(() => {
     Promise.all([
@@ -192,8 +195,10 @@ export default function HomePage() {
       fetch('/api/clips').then(r => r.json()),
       fetch('/api/memes').then(r => r.json()),
       fetch('/api/projects').then(r => r.json()).catch(() => []),
-    ]).then(([g, me, pk, c, m, pj]) => {
+      fetch('/api/site-settings').then(r => r.json()).catch(() => null),
+    ]).then(([g, me, pk, c, m, pj, ss]) => {
       setGeo(g); setProfile(me.user); setIsAuthed(!!me.is_authenticated); setPackages(pk); setClips(c); setMemes(m); setProjects(Array.isArray(pj) ? pj : [])
+      if (ss) setSiteSettings(ss)
     }).catch(() => toast.error('Failed to load workspace'))
   }, [])
 
@@ -490,24 +495,33 @@ export default function HomePage() {
       <header className="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur-xl">
         <div className="container flex h-16 items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg gradient-bg glow">
-              <Sparkles className="h-5 w-5 text-white" />
-            </div>
+            {siteSettings?.logo_url ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={siteSettings.logo_url} alt={siteSettings.site_name || 'Logo'} className="h-9 w-9 object-contain rounded-lg" />
+            ) : (
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg gradient-bg glow">
+                <Sparkles className="h-5 w-5 text-white" />
+              </div>
+            )}
             <div>
-              <div className="text-lg font-bold tracking-tight">ClipForge<span className="gradient-text">AI</span></div>
-              <div className="text-[10px] text-muted-foreground -mt-1">Long videos → viral shorts</div>
+              <div className="text-lg font-bold tracking-tight">{siteSettings?.site_name || 'ClipForge AI'}</div>
+              <div className="text-[10px] text-muted-foreground -mt-1">{siteSettings?.site_tagline || 'Long videos → viral shorts'}</div>
             </div>
           </div>
           <nav className="hidden md:flex items-center gap-6 text-sm">
             <a href="#workspace" className="hover:text-foreground text-muted-foreground transition-colors">{t.workspace}</a>
             <a href="#pricing" className="hover:text-foreground text-muted-foreground transition-colors">{t.pricing}</a>
             <a href="#styling" className="hover:text-foreground text-muted-foreground transition-colors">{t.styling}</a>
-            <Link href="/calendar" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
-              <Calendar className="h-3.5 w-3.5" /> Calendar
-            </Link>
-            <Link href="/admin" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
-              <ShieldCheck className="h-3.5 w-3.5" /> {t.admin}
-            </Link>
+            {schedulingEnabled && (
+              <Link href="/calendar" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
+                <Calendar className="h-3.5 w-3.5" /> Calendar
+              </Link>
+            )}
+            {isAdmin && (
+              <Link href="/admin" className="hover:text-foreground text-muted-foreground transition-colors flex items-center gap-1">
+                <ShieldCheck className="h-3.5 w-3.5" /> {t.admin}
+              </Link>
+            )}
           </nav>
           <div className="flex items-center gap-3">
             <Select value={uiLanguage} onValueChange={setUiLanguage}>
@@ -540,7 +554,7 @@ export default function HomePage() {
                     <div className="text-xs text-muted-foreground">{profile.email}</div>
                   </DropdownMenuLabel>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem asChild><Link href="/admin"><ShieldCheck className="h-3.5 w-3.5 mr-2" /> {t.admin}</Link></DropdownMenuItem>
+                  {isAdmin && <DropdownMenuItem asChild><Link href="/admin"><ShieldCheck className="h-3.5 w-3.5 mr-2" /> {t.admin}</Link></DropdownMenuItem>}
                   <DropdownMenuItem onClick={handleSignOut}><LogOut className="h-3.5 w-3.5 mr-2" /> {t.sign_out}</DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -750,6 +764,7 @@ export default function HomePage() {
                 // Reusable renderer for a ClipCard (used in both normal grid and SupercutView)
                 const renderClipCard = (clip) => (
                   <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                    schedulingEnabled={schedulingEnabled}
                     onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
                     onEdit={(c) => setEditorClip(c)}
                     onRestyle={(c) => {
@@ -847,6 +862,7 @@ export default function HomePage() {
                   <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
                     {clips.map((clip) => (
                       <ClipCard key={clip.id} clip={clip} memes={memes} t={t}
+                        schedulingEnabled={schedulingEnabled}
                         onUpdate={(c)=> setClips(prev => prev.map(x => x.id === c.id ? c : x))}
                         onEdit={(c) => setEditorClip(c)}
                         onRestyle={(c) => {
@@ -1224,7 +1240,7 @@ function ProjectCard({ project, t, onOpen, onRename, onDelete }) {
   )
 }
 
-function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
+function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit, schedulingEnabled = false }) {
   const [title, setTitle] = useState(clip.clip_title)
   const [scheduledTime, setScheduledTime] = useState(clip.scheduled_time || '')
   const [platform, setPlatform] = useState('youtube_shorts')
@@ -1385,6 +1401,7 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
           <Button size="sm" variant="outline" className="flex-1" onClick={download} disabled={!clip.storage_url_mp4?.startsWith('/api/files/')}>
             <Download className="h-3.5 w-3.5 mr-1" /> Get Clip
           </Button>
+          {schedulingEnabled && (
           <Drawer>
             <DrawerTrigger asChild>
               <Button size="sm" className="flex-1 gradient-bg text-white hover:opacity-90">
@@ -1394,7 +1411,7 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
             <DrawerContent>
               <div className="mx-auto w-full max-w-md">
                 <DrawerHeader>
-                  <DrawerTitle>Schedule “{clip.clip_title}”</DrawerTitle>
+                  <DrawerTitle>Schedule &ldquo;{clip.clip_title}&rdquo;</DrawerTitle>
                   <DrawerDescription>Queue this clip to post automatically.</DrawerDescription>
                 </DrawerHeader>
                 <div className="px-4 space-y-4 pb-4">
@@ -1415,6 +1432,7 @@ function ClipCard({ clip, memes, t, onUpdate, onRestyle, onEdit }) {
               </div>
             </DrawerContent>
           </Drawer>
+          )}
         </div>
       </CardContent>
     </Card>

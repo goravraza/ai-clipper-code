@@ -1788,3 +1788,47 @@ agent_communication:
       NO CRITICAL ISSUES FOUND. All Phase 1 UI features are production-ready.
       
       RECOMMENDATION: Main agent can summarize and finish. Phase 1 Feature Gating & Pricing Engine is complete and fully functional.
+
+# ============================================================
+# PHASE 2: Site Settings, Appearance CMS, Pages CMS, Merged Pricing, Feature Flags (2026-07-05)
+# ============================================================
+
+backend:
+  - task: "Site Settings + /api/site-settings + /api/admin/site-settings + upload"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "high"
+  - task: "CMS Pages: /pages, /admin/pages CRUD, /p/[slug] renderer"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js, app/p/[slug]/page.js"
+    priority: "high"
+  - task: "pricing_tiers monthly/yearly + credits_included_monthly"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "high"
+  - task: "Supercut: preserve native aspect (9:16 framing deferred to /render)"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "medium"
+
+frontend:
+  - task: "SiteChrome: announcement bar + dynamic colors + header/footer code injection"
+    implemented: true
+    working: true
+    file: "app/_components/SiteChrome.js, app/layout.js"
+    priority: "high"
+  - task: "Header: hide Admin/Calendar from non-admins; use dynamic logo/name"
+    implemented: true
+    working: true
+    file: "app/page.js"
+    priority: "high"
+  - task: "Admin: Appearance tab, Pages tab, merged Pricing & Gating tab"
+    implemented: true
+    working: true
+    file: "app/admin/_components/appearance-tab.js, pages-tab.js, pricing-features-tab.js, app/admin/page.js"
+    priority: "high"
+
