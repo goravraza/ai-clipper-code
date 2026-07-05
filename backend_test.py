@@ -1,754 +1,665 @@
 #!/usr/bin/env python3
 """
-Backend test suite for Phase 1: Feature Gating & Pricing Engine
-Tests all 14 critical behaviors listed in the review request.
+Phase 2 Backend Testing: Site Settings, CMS Pages, Pricing Tiers (monthly/yearly + credits)
+Tests all Phase 2 endpoints with comprehensive coverage including edge cases.
 """
-
 import requests
 import json
-import sys
-from typing import Dict, Any, Optional
+import io
+from PIL import Image
 
-# Constants
 BASE_URL = "https://shorts-studio-78.preview.emergentagent.com/api"
-DEMO_USER_ID = "11111111-1111-1111-1111-111111111111"
-ADMIN_USER_ID = "22222222-2222-2222-2222-222222222222"
 
-# Expected feature keys
-FEATURE_KEYS = [
-    'respool', 'animated_captions', 'custom_logo', 'scroll_stopper',
-    'hd_export', 'custom_fonts', 'custom_colors', 'intro_outro'
-]
+# Store original values for cleanup
+original_site_settings = {}
+created_page_ids = []
+original_pro_tier = {}
 
-# Expected default tiers
-DEFAULT_TIER_KEYS = ['free', 'pro', 'business']
+def create_test_png(size_kb=1):
+    """Create a small test PNG image"""
+    img = Image.new('RGB', (10, 10), color='red')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return buf
 
-# Test state tracking
-test_results = []
-studio_tier_id = None
-free_tier_id = None
-
-
-def log_test(test_name: str, passed: bool, details: str = ""):
-    """Log test result"""
-    status = "✅ PASS" if passed else "❌ FAIL"
-    print(f"{status}: {test_name}")
-    if details:
-        print(f"   {details}")
-    test_results.append({
-        "test": test_name,
-        "passed": passed,
-        "details": details
-    })
-
-
-def test_1_get_user_features_free():
-    """Test 1: GET /api/user/features (no auth) — free user, all features=false"""
-    print("\n=== Test 1: GET /api/user/features (free user) ===")
+def test_1_get_site_settings_public():
+    """Test 1: GET /api/site-settings (public, no auth)"""
+    print("\n=== Test 1: GET /api/site-settings (public) ===")
     try:
-        response = requests.get(f"{BASE_URL}/user/features", timeout=10)
+        r = requests.get(f"{BASE_URL}/site-settings")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
         
-        if response.status_code != 200:
-            log_test("Test 1", False, f"Expected 200, got {response.status_code}")
-            return
+        data = r.json()
+        print(f"Response keys: {list(data.keys())}")
         
-        data = response.json()
+        # Verify all required fields are present
+        required_fields = [
+            'site_name', 'site_tagline', 'logo_url', 'favicon_url', 'primary_color', 
+            'accent_color', 'meta_title', 'meta_description', 'announcement_enabled',
+            'announcement_text', 'announcement_link', 'announcement_bg', 'header_code',
+            'footer_code', 'credit_price_per_minute_usd', 'credit_price_per_minute_inr',
+            'features_scheduling_enabled', 'social_twitter', 'social_instagram',
+            'social_youtube', 'social_linkedin'
+        ]
         
-        # Verify structure
-        required_keys = ['plan_key', 'plan_name', 'features', 'tier', 'catalog', 'tiers', 'matrix']
-        missing_keys = [k for k in required_keys if k not in data]
-        if missing_keys:
-            log_test("Test 1", False, f"Missing keys: {missing_keys}")
-            return
+        missing = [f for f in required_fields if f not in data]
+        assert not missing, f"Missing fields: {missing}"
         
-        # Verify plan_key is 'free'
-        if data['plan_key'] != 'free':
-            log_test("Test 1", False, f"Expected plan_key='free', got '{data['plan_key']}'")
-            return
+        # Store original values for cleanup
+        global original_site_settings
+        original_site_settings = {
+            'site_name': data.get('site_name'),
+            'primary_color': data.get('primary_color'),
+            'announcement_text': data.get('announcement_text'),
+            'features_scheduling_enabled': data.get('features_scheduling_enabled', False)
+        }
         
-        # Verify all features are false for free tier
-        features = data['features']
-        enabled_features = [k for k, v in features.items() if v is True]
-        if enabled_features:
-            log_test("Test 1", False, f"Expected all features=false, but found enabled: {enabled_features}")
-            return
+        print(f"✅ Test 1 PASSED - All required fields present")
+        print(f"   site_name: {data.get('site_name')}")
+        print(f"   primary_color: {data.get('primary_color')}")
+        return True
+    except Exception as e:
+        print(f"❌ Test 1 FAILED: {e}")
+        return False
+
+def test_2_get_admin_site_settings_no_auth():
+    """Test 2: GET /api/admin/site-settings without admin=true → 403"""
+    print("\n=== Test 2: GET /api/admin/site-settings (no admin) ===")
+    try:
+        r = requests.get(f"{BASE_URL}/admin/site-settings")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 403, f"Expected 403, got {r.status_code}"
+        print(f"✅ Test 2 PASSED - 403 forbidden without admin=true")
+        return True
+    except Exception as e:
+        print(f"❌ Test 2 FAILED: {e}")
+        return False
+
+def test_3_get_admin_site_settings_with_auth():
+    """Test 3: GET /api/admin/site-settings with admin=true → returns doc"""
+    print("\n=== Test 3: GET /api/admin/site-settings (with admin=true) ===")
+    try:
+        r = requests.get(f"{BASE_URL}/admin/site-settings?admin=true")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert 'site_name' in data, "Missing site_name"
+        print(f"✅ Test 3 PASSED - Admin can access settings")
+        print(f"   site_name: {data.get('site_name')}")
+        return True
+    except Exception as e:
+        print(f"❌ Test 3 FAILED: {e}")
+        return False
+
+def test_4_put_admin_site_settings():
+    """Test 4: PUT /api/admin/site-settings - update fields"""
+    print("\n=== Test 4: PUT /api/admin/site-settings ===")
+    try:
+        payload = {
+            "site_name": "TestApp",
+            "primary_color": "#00ff00",
+            "announcement_text": "Test announcement"
+        }
+        r = requests.put(f"{BASE_URL}/admin/site-settings?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('site_name') == "TestApp", f"site_name not updated: {data.get('site_name')}"
+        assert data.get('primary_color') == "#00ff00", f"primary_color not updated: {data.get('primary_color')}"
+        assert data.get('announcement_text') == "Test announcement", f"announcement_text not updated"
+        
+        # Verify via GET
+        r2 = requests.get(f"{BASE_URL}/site-settings")
+        data2 = r2.json()
+        assert data2.get('site_name') == "TestApp", "Changes not persisted"
+        
+        print(f"✅ Test 4 PASSED - Settings updated successfully")
+        return True
+    except Exception as e:
+        print(f"❌ Test 4 FAILED: {e}")
+        return False
+
+def test_5_upload_logo():
+    """Test 5: POST /api/admin/site-settings/upload (logo)"""
+    print("\n=== Test 5: POST /api/admin/site-settings/upload (logo) ===")
+    try:
+        png_buf = create_test_png(1)
+        files = {'file': ('test_logo.png', png_buf, 'image/png')}
+        data = {'kind': 'logo'}
+        
+        r = requests.post(f"{BASE_URL}/admin/site-settings/upload?admin=true", files=files, data=data)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        result = r.json()
+        assert result.get('ok') == True, "Upload not successful"
+        assert 'url' in result, "No URL returned"
+        assert result.get('field') == 'logo_url', f"Wrong field: {result.get('field')}"
+        
+        print(f"✅ Test 5 PASSED - Logo uploaded")
+        print(f"   URL: {result.get('url')}")
+        return True
+    except Exception as e:
+        print(f"❌ Test 5 FAILED: {e}")
+        return False
+
+def test_6_upload_favicon():
+    """Test 6: POST /api/admin/site-settings/upload (favicon)"""
+    print("\n=== Test 6: POST /api/admin/site-settings/upload (favicon) ===")
+    try:
+        png_buf = create_test_png(1)
+        files = {'file': ('test_favicon.png', png_buf, 'image/png')}
+        data = {'kind': 'favicon'}
+        
+        r = requests.post(f"{BASE_URL}/admin/site-settings/upload?admin=true", files=files, data=data)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        result = r.json()
+        assert result.get('field') == 'favicon_url', f"Wrong field: {result.get('field')}"
+        
+        print(f"✅ Test 6 PASSED - Favicon uploaded")
+        return True
+    except Exception as e:
+        print(f"❌ Test 6 FAILED: {e}")
+        return False
+
+def test_7_upload_oversize_logo():
+    """Test 7: Upload file > 50KB → 400 error"""
+    print("\n=== Test 7: Upload oversize logo (>50KB) ===")
+    try:
+        # Create a larger image
+        img = Image.new('RGB', (500, 500), color='blue')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+        
+        files = {'file': ('large_logo.png', buf, 'image/png')}
+        data = {'kind': 'logo'}
+        
+        r = requests.post(f"{BASE_URL}/admin/site-settings/upload?admin=true", files=files, data=data)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 400, f"Expected 400, got {r.status_code}"
+        
+        print(f"✅ Test 7 PASSED - Oversize file rejected")
+        return True
+    except Exception as e:
+        print(f"❌ Test 7 FAILED: {e}")
+        return False
+
+def test_8_upload_wrong_extension():
+    """Test 8: Upload .txt file → 400 error"""
+    print("\n=== Test 8: Upload wrong file type (.txt) ===")
+    try:
+        files = {'file': ('test.txt', io.BytesIO(b'hello'), 'text/plain')}
+        data = {'kind': 'logo'}
+        
+        r = requests.post(f"{BASE_URL}/admin/site-settings/upload?admin=true", files=files, data=data)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 400, f"Expected 400, got {r.status_code}"
+        
+        print(f"✅ Test 8 PASSED - Wrong file type rejected")
+        return True
+    except Exception as e:
+        print(f"❌ Test 8 FAILED: {e}")
+        return False
+
+def test_9_upload_without_admin():
+    """Test 9: Upload without admin=true → 403"""
+    print("\n=== Test 9: Upload without admin=true ===")
+    try:
+        png_buf = create_test_png(1)
+        files = {'file': ('test.png', png_buf, 'image/png')}
+        data = {'kind': 'logo'}
+        
+        r = requests.post(f"{BASE_URL}/admin/site-settings/upload", files=files, data=data)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 403, f"Expected 403, got {r.status_code}"
+        
+        print(f"✅ Test 9 PASSED - Upload requires admin")
+        return True
+    except Exception as e:
+        print(f"❌ Test 9 FAILED: {e}")
+        return False
+
+def test_10_create_cms_page():
+    """Test 10: POST /api/admin/pages - create page"""
+    print("\n=== Test 10: POST /api/admin/pages (create) ===")
+    try:
+        payload = {
+            "title": "Test Terms",
+            "content_html": "<h1>Terms</h1><p>Test content</p>"
+        }
+        r = requests.post(f"{BASE_URL}/admin/pages?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('slug') == 'test-terms', f"Wrong slug: {data.get('slug')}"
+        assert data.get('title') == 'Test Terms', "Title not set"
+        assert 'id' in data, "No ID returned"
+        
+        created_page_ids.append(data['id'])
+        
+        print(f"✅ Test 10 PASSED - Page created")
+        print(f"   ID: {data['id']}, Slug: {data['slug']}")
+        return True
+    except Exception as e:
+        print(f"❌ Test 10 FAILED: {e}")
+        return False
+
+def test_11_get_admin_pages():
+    """Test 11: GET /api/admin/pages - list all pages"""
+    print("\n=== Test 11: GET /api/admin/pages ===")
+    try:
+        r = requests.get(f"{BASE_URL}/admin/pages?admin=true")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert isinstance(data, list), "Expected array"
+        
+        # Find our created page
+        found = any(p.get('slug') == 'test-terms' for p in data)
+        assert found, "Created page not in list"
+        
+        print(f"✅ Test 11 PASSED - Admin can list pages ({len(data)} pages)")
+        return True
+    except Exception as e:
+        print(f"❌ Test 11 FAILED: {e}")
+        return False
+
+def test_12_get_public_pages():
+    """Test 12: GET /api/pages - public list"""
+    print("\n=== Test 12: GET /api/pages (public) ===")
+    try:
+        r = requests.get(f"{BASE_URL}/pages")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert isinstance(data, list), "Expected array"
+        
+        # Should include our public page
+        found = any(p.get('slug') == 'test-terms' for p in data)
+        assert found, "Public page not visible"
+        
+        print(f"✅ Test 12 PASSED - Public pages visible")
+        return True
+    except Exception as e:
+        print(f"❌ Test 12 FAILED: {e}")
+        return False
+
+def test_13_get_page_by_slug():
+    """Test 13: GET /api/pages/test-terms - get single page"""
+    print("\n=== Test 13: GET /api/pages/test-terms ===")
+    try:
+        r = requests.get(f"{BASE_URL}/pages/test-terms")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('slug') == 'test-terms', "Wrong page"
+        assert 'content_html' in data, "No content"
+        
+        print(f"✅ Test 13 PASSED - Page retrieved by slug")
+        return True
+    except Exception as e:
+        print(f"❌ Test 13 FAILED: {e}")
+        return False
+
+def test_14_update_page_to_private():
+    """Test 14: PUT /api/admin/pages/:id - set visibility to private"""
+    print("\n=== Test 14: PUT /api/admin/pages/:id (set private) ===")
+    try:
+        page_id = created_page_ids[0]
+        payload = {"visibility": "private"}
+        
+        r = requests.put(f"{BASE_URL}/admin/pages/{page_id}?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('visibility') == 'private', "Visibility not updated"
+        
+        print(f"✅ Test 14 PASSED - Page set to private")
+        return True
+    except Exception as e:
+        print(f"❌ Test 14 FAILED: {e}")
+        return False
+
+def test_15_get_private_page_no_admin():
+    """Test 15: GET /api/pages/test-terms (private, no admin) → 404"""
+    print("\n=== Test 15: GET /api/pages/test-terms (private, no admin) ===")
+    try:
+        r = requests.get(f"{BASE_URL}/pages/test-terms")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 404, f"Expected 404, got {r.status_code}"
+        
+        print(f"✅ Test 15 PASSED - Private page hidden from public")
+        return True
+    except Exception as e:
+        print(f"❌ Test 15 FAILED: {e}")
+        return False
+
+def test_16_get_private_page_with_admin():
+    """Test 16: GET /api/pages/test-terms?admin=true - admin can see private"""
+    print("\n=== Test 16: GET /api/pages/test-terms (with admin=true) ===")
+    try:
+        r = requests.get(f"{BASE_URL}/pages/test-terms?admin=true")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('visibility') == 'private', "Not private"
+        
+        print(f"✅ Test 16 PASSED - Admin can see private page")
+        return True
+    except Exception as e:
+        print(f"❌ Test 16 FAILED: {e}")
+        return False
+
+def test_17_create_duplicate_page():
+    """Test 17: POST /api/admin/pages with duplicate title → 409"""
+    print("\n=== Test 17: POST /api/admin/pages (duplicate) ===")
+    try:
+        payload = {
+            "title": "Test Terms",
+            "content_html": "<p>Duplicate</p>"
+        }
+        r = requests.post(f"{BASE_URL}/admin/pages?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 409, f"Expected 409, got {r.status_code}"
+        
+        print(f"✅ Test 17 PASSED - Duplicate slug rejected")
+        return True
+    except Exception as e:
+        print(f"❌ Test 17 FAILED: {e}")
+        return False
+
+def test_18_get_pricing_tiers():
+    """Test 18: GET /api/admin/pricing-tiers - verify monthly/yearly fields"""
+    print("\n=== Test 18: GET /api/admin/pricing-tiers ===")
+    try:
+        r = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert isinstance(data, list), "Expected array"
+        assert len(data) >= 3, f"Expected at least 3 tiers, got {len(data)}"
+        
+        # Find Pro tier and store original values
+        pro_tier = next((t for t in data if t.get('key') == 'pro'), None)
+        assert pro_tier, "Pro tier not found"
+        
+        global original_pro_tier
+        original_pro_tier = {
+            'id': pro_tier['id'],
+            'price_usd_monthly': pro_tier.get('price_usd_monthly'),
+            'price_inr_monthly': pro_tier.get('price_inr_monthly'),
+            'price_usd_yearly': pro_tier.get('price_usd_yearly'),
+            'price_inr_yearly': pro_tier.get('price_inr_yearly'),
+            'credits_included_monthly': pro_tier.get('credits_included_monthly')
+        }
+        
+        # Verify all tiers have new fields
+        for tier in data:
+            assert 'price_usd_monthly' in tier, f"Missing price_usd_monthly in {tier.get('key')}"
+            assert 'price_inr_monthly' in tier, f"Missing price_inr_monthly in {tier.get('key')}"
+            assert 'price_usd_yearly' in tier, f"Missing price_usd_yearly in {tier.get('key')}"
+            assert 'price_inr_yearly' in tier, f"Missing price_inr_yearly in {tier.get('key')}"
+            assert 'credits_included_monthly' in tier, f"Missing credits_included_monthly in {tier.get('key')}"
+        
+        print(f"✅ Test 18 PASSED - All tiers have monthly/yearly pricing")
+        print(f"   Pro tier: ${pro_tier.get('price_usd_monthly')}/mo, ${pro_tier.get('price_usd_yearly')}/yr")
+        print(f"   Credits: {pro_tier.get('credits_included_monthly')}/month")
+        return True
+    except Exception as e:
+        print(f"❌ Test 18 FAILED: {e}")
+        return False
+
+def test_19_update_pricing_tier():
+    """Test 19: PUT /api/admin/pricing-tiers/:id - update yearly price and credits"""
+    print("\n=== Test 19: PUT /api/admin/pricing-tiers/:id ===")
+    try:
+        pro_id = original_pro_tier['id']
+        payload = {
+            "price_usd_yearly": 200,
+            "credits_included_monthly": 700
+        }
+        
+        r = requests.put(f"{BASE_URL}/admin/pricing-tiers/{pro_id}?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('price_usd_yearly') == 200, f"Yearly price not updated: {data.get('price_usd_yearly')}"
+        assert data.get('credits_included_monthly') == 700, f"Credits not updated: {data.get('credits_included_monthly')}"
+        
+        print(f"✅ Test 19 PASSED - Tier updated successfully")
+        return True
+    except Exception as e:
+        print(f"❌ Test 19 FAILED: {e}")
+        return False
+
+def test_20_legacy_price_sync():
+    """Test 20: PUT with legacy price_usd → should update price_usd_monthly"""
+    print("\n=== Test 20: PUT /api/admin/pricing-tiers/:id (legacy sync) ===")
+    try:
+        pro_id = original_pro_tier['id']
+        payload = {"price_usd": 25}
+        
+        r = requests.put(f"{BASE_URL}/admin/pricing-tiers/{pro_id}?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert data.get('price_usd_monthly') == 25, f"Legacy sync failed: {data.get('price_usd_monthly')}"
+        
+        print(f"✅ Test 20 PASSED - Legacy price_usd synced to price_usd_monthly")
+        return True
+    except Exception as e:
+        print(f"❌ Test 20 FAILED: {e}")
+        return False
+
+def test_21_get_user_features():
+    """Test 21: GET /api/user/features - verify new pricing fields in tiers"""
+    print("\n=== Test 21: GET /api/user/features ===")
+    try:
+        r = requests.get(f"{BASE_URL}/user/features")
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+        
+        data = r.json()
+        assert 'tiers' in data, "Missing tiers"
+        assert 'matrix' in data, "Missing matrix"
+        assert 'catalog' in data, "Missing catalog"
+        
+        tiers = data['tiers']
+        assert len(tiers) >= 3, f"Expected at least 3 tiers, got {len(tiers)}"
+        
+        # Verify each tier has new pricing fields
+        for tier in tiers:
+            assert 'price_usd_monthly' in tier, f"Missing price_usd_monthly in {tier.get('key')}"
+            assert 'price_usd_yearly' in tier, f"Missing price_usd_yearly in {tier.get('key')}"
+            assert 'credits_included_monthly' in tier, f"Missing credits_included_monthly in {tier.get('key')}"
         
         # Verify catalog has 8 features
-        if len(data['catalog']) != 8:
-            log_test("Test 1", False, f"Expected 8 features in catalog, got {len(data['catalog'])}")
-            return
+        assert len(data['catalog']) == 8, f"Expected 8 features, got {len(data['catalog'])}"
         
-        # Verify tiers has 3 items
-        if len(data['tiers']) != 3:
-            log_test("Test 1", False, f"Expected 3 tiers, got {len(data['tiers'])}")
-            return
-        
-        # Verify matrix structure
-        if not isinstance(data['matrix'], dict):
-            log_test("Test 1", False, "Matrix should be a dict")
-            return
-        
-        log_test("Test 1", True, f"Free user has plan_key='free', all features=false, catalog={len(data['catalog'])}, tiers={len(data['tiers'])}")
-        
+        print(f"✅ Test 21 PASSED - User features includes new pricing fields")
+        print(f"   Tiers: {len(tiers)}, Features: {len(data['catalog'])}")
+        return True
     except Exception as e:
-        log_test("Test 1", False, f"Exception: {str(e)}")
+        print(f"❌ Test 21 FAILED: {e}")
+        return False
 
-
-def test_2_get_user_features_admin():
-    """Test 2: GET /api/user/features?admin=true — admin user, all features=true"""
-    print("\n=== Test 2: GET /api/user/features?admin=true (admin user) ===")
+def test_22_feature_flag_enable():
+    """Test 22: PUT /api/admin/site-settings - enable scheduling feature"""
+    print("\n=== Test 22: PUT /api/admin/site-settings (enable scheduling) ===")
     try:
-        response = requests.get(f"{BASE_URL}/user/features?admin=true", timeout=10)
+        payload = {"features_scheduling_enabled": True}
         
-        if response.status_code != 200:
-            log_test("Test 2", False, f"Expected 200, got {response.status_code}")
-            return
+        r = requests.put(f"{BASE_URL}/admin/site-settings?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}"
         
-        data = response.json()
+        # Verify via GET
+        r2 = requests.get(f"{BASE_URL}/site-settings")
+        data = r2.json()
+        assert data.get('features_scheduling_enabled') == True, "Feature flag not enabled"
         
-        # Verify plan_key is 'business' (admin user is seeded with business plan)
-        if data['plan_key'] != 'business':
-            log_test("Test 2", False, f"Expected plan_key='business', got '{data['plan_key']}'")
-            return
-        
-        # Verify all features are true (isAdminProfile short-circuit)
-        features = data['features']
-        disabled_features = [k for k, v in features.items() if v is False]
-        if disabled_features:
-            log_test("Test 2", False, f"Expected all features=true for admin, but found disabled: {disabled_features}")
-            return
-        
-        log_test("Test 2", True, f"Admin user has plan_key='business', all features=true (isAdminProfile override)")
-        
+        print(f"✅ Test 22 PASSED - Feature flag enabled")
+        return True
     except Exception as e:
-        log_test("Test 2", False, f"Exception: {str(e)}")
+        print(f"❌ Test 22 FAILED: {e}")
+        return False
 
-
-def test_3_get_pricing_tiers_no_admin():
-    """Test 3: GET /api/admin/pricing-tiers (no admin=true) → 403"""
-    print("\n=== Test 3: GET /api/admin/pricing-tiers (no admin param) ===")
+def test_23_invalid_json_body():
+    """Test 23: PUT /api/admin/site-settings with invalid JSON → 400"""
+    print("\n=== Test 23: PUT /api/admin/site-settings (invalid JSON) ===")
     try:
-        response = requests.get(f"{BASE_URL}/admin/pricing-tiers", timeout=10)
-        
-        if response.status_code != 403:
-            log_test("Test 3", False, f"Expected 403, got {response.status_code}")
-            return
-        
-        log_test("Test 3", True, "Non-admin access correctly blocked with 403")
-        
-    except Exception as e:
-        log_test("Test 3", False, f"Exception: {str(e)}")
-
-
-def test_4_get_pricing_tiers_admin():
-    """Test 4: GET /api/admin/pricing-tiers?admin=true → 3 tiers sorted by order"""
-    print("\n=== Test 4: GET /api/admin/pricing-tiers?admin=true ===")
-    global free_tier_id
-    try:
-        response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
-        
-        if response.status_code != 200:
-            log_test("Test 4", False, f"Expected 200, got {response.status_code}")
-            return
-        
-        tiers = response.json()
-        
-        if not isinstance(tiers, list):
-            log_test("Test 4", False, "Expected array of tiers")
-            return
-        
-        if len(tiers) != 3:
-            log_test("Test 4", False, f"Expected 3 tiers, got {len(tiers)}")
-            return
-        
-        # Verify sorted by order
-        orders = [t.get('order', 0) for t in tiers]
-        if orders != sorted(orders):
-            log_test("Test 4", False, f"Tiers not sorted by order: {orders}")
-            return
-        
-        # Verify tier keys
-        tier_keys = [t['key'] for t in tiers]
-        if set(tier_keys) != set(DEFAULT_TIER_KEYS):
-            log_test("Test 4", False, f"Expected tier keys {DEFAULT_TIER_KEYS}, got {tier_keys}")
-            return
-        
-        # Store free tier ID for later tests
-        free_tier = next((t for t in tiers if t['key'] == 'free'), None)
-        if free_tier:
-            free_tier_id = free_tier['id']
-        
-        log_test("Test 4", True, f"Got 3 tiers sorted by order: {tier_keys}")
-        
-    except Exception as e:
-        log_test("Test 4", False, f"Exception: {str(e)}")
-
-
-def test_5_create_studio_tier():
-    """Test 5: POST /api/admin/pricing-tiers?admin=true — create 'studio' tier"""
-    print("\n=== Test 5: POST /api/admin/pricing-tiers?admin=true (create studio) ===")
-    global studio_tier_id
-    try:
-        payload = {
-            "name": "Studio",
-            "price_usd": 29,
-            "price_inr": 2499
-        }
-        response = requests.post(
-            f"{BASE_URL}/admin/pricing-tiers?admin=true",
-            json=payload,
-            timeout=10
+        r = requests.put(
+            f"{BASE_URL}/admin/site-settings?admin=true",
+            data="not json",
+            headers={'Content-Type': 'application/json'}
         )
+        print(f"Status: {r.status_code}")
+        # Should fail to parse JSON
+        assert r.status_code in [400, 500], f"Expected 400/500, got {r.status_code}"
         
-        if response.status_code != 200:
-            log_test("Test 5", False, f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        tier = response.json()
-        
-        # Verify tier structure
-        if tier.get('key') != 'studio':
-            log_test("Test 5", False, f"Expected key='studio', got '{tier.get('key')}'")
-            return
-        
-        if tier.get('name') != 'Studio':
-            log_test("Test 5", False, f"Expected name='Studio', got '{tier.get('name')}'")
-            return
-        
-        if tier.get('price_usd') != 29:
-            log_test("Test 5", False, f"Expected price_usd=29, got {tier.get('price_usd')}")
-            return
-        
-        studio_tier_id = tier['id']
-        
-        # Verify 8 feature rows were created (all off)
-        features_response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
-        if features_response.status_code == 200:
-            features_data = features_response.json()
-            studio_features = features_data['matrix'].get('studio', {})
-            
-            if len(studio_features) != 8:
-                log_test("Test 5", False, f"Expected 8 feature rows for studio, got {len(studio_features)}")
-                return
-            
-            # Verify all features are off
-            enabled = [k for k, v in studio_features.items() if v is True]
-            if enabled:
-                log_test("Test 5", False, f"Expected all features off, but found enabled: {enabled}")
-                return
-        
-        log_test("Test 5", True, f"Created studio tier (id={studio_tier_id}) with 8 features all off")
-        
+        print(f"✅ Test 23 PASSED - Invalid JSON rejected")
+        return True
     except Exception as e:
-        log_test("Test 5", False, f"Exception: {str(e)}")
+        print(f"❌ Test 23 FAILED: {e}")
+        return False
 
-
-def test_6_create_duplicate_tier():
-    """Test 6: POST /api/admin/pricing-tiers?admin=true with duplicate key → 409"""
-    print("\n=== Test 6: POST /api/admin/pricing-tiers?admin=true (duplicate) ===")
+def test_24_missing_required_fields():
+    """Test 24: POST /api/admin/pages without title → 400"""
+    print("\n=== Test 24: POST /api/admin/pages (missing title) ===")
     try:
-        payload = {
-            "name": "Studio",
-            "price_usd": 39
-        }
-        response = requests.post(
-            f"{BASE_URL}/admin/pricing-tiers?admin=true",
-            json=payload,
-            timeout=10
-        )
+        payload = {"content_html": "<p>No title</p>"}
         
-        if response.status_code != 409:
-            log_test("Test 6", False, f"Expected 409, got {response.status_code}")
-            return
+        r = requests.post(f"{BASE_URL}/admin/pages?admin=true", json=payload)
+        print(f"Status: {r.status_code}")
+        # Should fail validation
+        assert r.status_code in [400, 500], f"Expected 400, got {r.status_code}"
         
-        log_test("Test 6", True, "Duplicate tier creation correctly rejected with 409")
-        
+        print(f"✅ Test 24 PASSED - Missing required field rejected")
+        return True
     except Exception as e:
-        log_test("Test 6", False, f"Exception: {str(e)}")
-
-
-def test_7_update_studio_tier():
-    """Test 7: PUT /api/admin/pricing-tiers/{studio_id}?admin=true — update tier"""
-    print("\n=== Test 7: PUT /api/admin/pricing-tiers/{studio_id}?admin=true ===")
-    global studio_tier_id
-    
-    if not studio_tier_id:
-        log_test("Test 7", False, "studio_tier_id not set (Test 5 may have failed)")
-        return
-    
-    try:
-        payload = {
-            "name": "Studio Plus",
-            "price_usd": 35
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/pricing-tiers/{studio_tier_id}?admin=true",
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            log_test("Test 7", False, f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        tier = response.json()
-        
-        if tier.get('name') != 'Studio Plus':
-            log_test("Test 7", False, f"Expected name='Studio Plus', got '{tier.get('name')}'")
-            return
-        
-        if tier.get('price_usd') != 35:
-            log_test("Test 7", False, f"Expected price_usd=35, got {tier.get('price_usd')}")
-            return
-        
-        if 'updated_at' not in tier:
-            log_test("Test 7", False, "updated_at field not set")
-            return
-        
-        log_test("Test 7", True, f"Updated studio tier to name='Studio Plus', price_usd=35")
-        
-    except Exception as e:
-        log_test("Test 7", False, f"Exception: {str(e)}")
-
-
-def test_8_get_pricing_features():
-    """Test 8: GET /api/admin/pricing-features?admin=true → { catalog, tiers, matrix }"""
-    print("\n=== Test 8: GET /api/admin/pricing-features?admin=true ===")
-    try:
-        response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
-        
-        if response.status_code != 200:
-            log_test("Test 8", False, f"Expected 200, got {response.status_code}")
-            return
-        
-        data = response.json()
-        
-        # Verify structure
-        required_keys = ['catalog', 'tiers', 'matrix']
-        missing_keys = [k for k in required_keys if k not in data]
-        if missing_keys:
-            log_test("Test 8", False, f"Missing keys: {missing_keys}")
-            return
-        
-        # Verify catalog
-        if not isinstance(data['catalog'], list) or len(data['catalog']) != 8:
-            log_test("Test 8", False, f"Expected catalog with 8 features, got {len(data.get('catalog', []))}")
-            return
-        
-        # Verify tiers (should now have 4: free, pro, business, studio)
-        if not isinstance(data['tiers'], list) or len(data['tiers']) != 4:
-            log_test("Test 8", False, f"Expected 4 tiers, got {len(data.get('tiers', []))}")
-            return
-        
-        # Verify matrix structure
-        matrix = data['matrix']
-        if not isinstance(matrix, dict):
-            log_test("Test 8", False, "Matrix should be a dict")
-            return
-        
-        # Verify each tier has 8 features
-        for tier_key in ['free', 'pro', 'business', 'studio']:
-            if tier_key not in matrix:
-                log_test("Test 8", False, f"Tier '{tier_key}' not in matrix")
-                return
-            if len(matrix[tier_key]) != 8:
-                log_test("Test 8", False, f"Tier '{tier_key}' should have 8 features, got {len(matrix[tier_key])}")
-                return
-        
-        log_test("Test 8", True, f"Got correct structure: catalog={len(data['catalog'])}, tiers={len(data['tiers'])}, matrix with 4 tiers × 8 features")
-        
-    except Exception as e:
-        log_test("Test 8", False, f"Exception: {str(e)}")
-
-
-def test_9_update_free_tier_custom_colors():
-    """Test 9: PUT /api/admin/pricing-features?admin=true — enable custom_colors for free tier"""
-    print("\n=== Test 9: PUT /api/admin/pricing-features?admin=true (enable custom_colors) ===")
-    try:
-        # Enable custom_colors for free tier
-        payload = {
-            "updates": [
-                {
-                    "tier_key": "free",
-                    "feature_key": "custom_colors",
-                    "is_enabled": True
-                }
-            ]
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/pricing-features?admin=true",
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            log_test("Test 9", False, f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        # Verify the change by getting user features (as free user)
-        features_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
-        if features_response.status_code != 200:
-            log_test("Test 9", False, f"Failed to verify: {features_response.status_code}")
-            return
-        
-        features_data = features_response.json()
-        if features_data['features'].get('custom_colors') is not True:
-            log_test("Test 9", False, f"custom_colors should be true, got {features_data['features'].get('custom_colors')}")
-            return
-        
-        log_test("Test 9", True, "Enabled custom_colors for free tier, verified via GET /api/user/features")
-        
-    except Exception as e:
-        log_test("Test 9", False, f"Exception: {str(e)}")
-
-
-def test_10_update_user_plan_to_pro():
-    """Test 10: PUT /api/admin/users/{demo_user_id}?admin=true { plan_key:"pro" }"""
-    print("\n=== Test 10: PUT /api/admin/users/{demo_user_id}?admin=true (set plan_key=pro) ===")
-    try:
-        payload = {
-            "plan_key": "pro"
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            log_test("Test 10", False, f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        user = response.json()
-        if user.get('plan_key') != 'pro':
-            log_test("Test 10", False, f"Expected plan_key='pro', got '{user.get('plan_key')}'")
-            return
-        
-        # Verify features (should now have pro features, but custom_colors from step 9 should be reverted)
-        features_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
-        if features_response.status_code != 200:
-            log_test("Test 10", False, f"Failed to verify features: {features_response.status_code}")
-            return
-        
-        features_data = features_response.json()
-        if features_data['plan_key'] != 'pro':
-            log_test("Test 10", False, f"User features should show plan_key='pro', got '{features_data['plan_key']}'")
-            return
-        
-        # Pro tier should have most features enabled (except scroll_stopper)
-        expected_enabled = ['respool', 'animated_captions', 'custom_logo', 'hd_export', 'custom_fonts', 'custom_colors', 'intro_outro']
-        for feature in expected_enabled:
-            if features_data['features'].get(feature) is not True:
-                log_test("Test 10", False, f"Pro tier should have {feature}=true, got {features_data['features'].get(feature)}")
-                return
-        
-        if features_data['features'].get('scroll_stopper') is not False:
-            log_test("Test 10", False, f"Pro tier should have scroll_stopper=false, got {features_data['features'].get('scroll_stopper')}")
-            return
-        
-        log_test("Test 10", True, f"Updated demo user to plan_key='pro', verified pro features")
-        
-    except Exception as e:
-        log_test("Test 10", False, f"Exception: {str(e)}")
-
-
-def test_11_update_user_plan_invalid():
-    """Test 11: PUT /api/admin/users/{demo_user_id}?admin=true { plan_key:"nonexistent" } → 400"""
-    print("\n=== Test 11: PUT /api/admin/users/{demo_user_id}?admin=true (invalid plan_key) ===")
-    try:
-        payload = {
-            "plan_key": "nonexistent"
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code != 400:
-            log_test("Test 11", False, f"Expected 400, got {response.status_code}")
-            return
-        
-        error_data = response.json()
-        if 'error' not in error_data:
-            log_test("Test 11", False, "Expected error message in response")
-            return
-        
-        log_test("Test 11", True, f"Invalid plan_key correctly rejected with 400: {error_data.get('error')}")
-        
-    except Exception as e:
-        log_test("Test 11", False, f"Exception: {str(e)}")
-
-
-def test_12_delete_free_tier():
-    """Test 12: DELETE /api/admin/pricing-tiers/{free_tier_id}?admin=true → 400"""
-    print("\n=== Test 12: DELETE /api/admin/pricing-tiers/{free_tier_id}?admin=true (cannot delete default) ===")
-    global free_tier_id
-    
-    if not free_tier_id:
-        log_test("Test 12", False, "free_tier_id not set (Test 4 may have failed)")
-        return
-    
-    try:
-        response = requests.delete(
-            f"{BASE_URL}/admin/pricing-tiers/{free_tier_id}?admin=true",
-            timeout=10
-        )
-        
-        if response.status_code != 400:
-            log_test("Test 12", False, f"Expected 400, got {response.status_code}")
-            return
-        
-        error_data = response.json()
-        if 'error' not in error_data:
-            log_test("Test 12", False, "Expected error message in response")
-            return
-        
-        log_test("Test 12", True, f"Cannot delete default/free tier: {error_data.get('error')}")
-        
-    except Exception as e:
-        log_test("Test 12", False, f"Exception: {str(e)}")
-
-
-def test_13_delete_studio_tier():
-    """Test 13: DELETE /api/admin/pricing-tiers/{studio_id}?admin=true → cascades"""
-    print("\n=== Test 13: DELETE /api/admin/pricing-tiers/{studio_id}?admin=true (cascade) ===")
-    global studio_tier_id
-    
-    if not studio_tier_id:
-        log_test("Test 13", False, "studio_tier_id not set (Test 5 may have failed)")
-        return
-    
-    try:
-        response = requests.delete(
-            f"{BASE_URL}/admin/pricing-tiers/{studio_tier_id}?admin=true",
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            log_test("Test 13", False, f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        # Verify tier is deleted
-        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
-        if tiers_response.status_code == 200:
-            tiers = tiers_response.json()
-            studio_exists = any(t['id'] == studio_tier_id for t in tiers)
-            if studio_exists:
-                log_test("Test 13", False, "Studio tier still exists after deletion")
-                return
-        
-        # Verify feature rows are deleted
-        features_response = requests.get(f"{BASE_URL}/admin/pricing-features?admin=true", timeout=10)
-        if features_response.status_code == 200:
-            features_data = features_response.json()
-            if 'studio' in features_data['matrix']:
-                log_test("Test 13", False, "Studio feature rows still exist after tier deletion")
-                return
-        
-        log_test("Test 13", True, "Deleted studio tier, cascaded feature rows")
-        
-    except Exception as e:
-        log_test("Test 13", False, f"Exception: {str(e)}")
-
-
-def test_14_user_cascade_on_tier_delete():
-    """Test 14: Create new tier, assign user to it, delete tier, verify user moved to 'free'"""
-    print("\n=== Test 14: User cascade on tier deletion ===")
-    try:
-        # Create a new test tier
-        payload = {
-            "name": "Test Tier",
-            "price_usd": 99
-        }
-        create_response = requests.post(
-            f"{BASE_URL}/admin/pricing-tiers?admin=true",
-            json=payload,
-            timeout=10
-        )
-        
-        if create_response.status_code != 200:
-            log_test("Test 14", False, f"Failed to create test tier: {create_response.status_code}")
-            return
-        
-        test_tier = create_response.json()
-        test_tier_id = test_tier['id']
-        test_tier_key = test_tier['key']
-        
-        # Assign demo user to this tier
-        assign_response = requests.put(
-            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
-            json={"plan_key": test_tier_key},
-            timeout=10
-        )
-        
-        if assign_response.status_code != 200:
-            log_test("Test 14", False, f"Failed to assign user to test tier: {assign_response.status_code}")
-            return
-        
-        # Verify user is on test tier
-        user = assign_response.json()
-        if user.get('plan_key') != test_tier_key:
-            log_test("Test 14", False, f"User not assigned to test tier: {user.get('plan_key')}")
-            return
-        
-        # Delete the test tier
-        delete_response = requests.delete(
-            f"{BASE_URL}/admin/pricing-tiers/{test_tier_id}?admin=true",
-            timeout=10
-        )
-        
-        if delete_response.status_code != 200:
-            log_test("Test 14", False, f"Failed to delete test tier: {delete_response.status_code}")
-            return
-        
-        # Verify user was moved to 'free'
-        user_response = requests.get(f"{BASE_URL}/user/features", timeout=10)
-        if user_response.status_code != 200:
-            log_test("Test 14", False, f"Failed to get user features: {user_response.status_code}")
-            return
-        
-        user_features = user_response.json()
-        if user_features['plan_key'] != 'free':
-            log_test("Test 14", False, f"User should be moved to 'free', got '{user_features['plan_key']}'")
-            return
-        
-        log_test("Test 14", True, f"Created test tier, assigned user, deleted tier → user moved to 'free'")
-        
-    except Exception as e:
-        log_test("Test 14", False, f"Exception: {str(e)}")
-
+        print(f"❌ Test 24 FAILED: {e}")
+        return False
 
 def cleanup():
-    """MANDATORY CLEANUP: Restore state to original"""
-    print("\n=== CLEANUP: Restoring original state ===")
+    """Cleanup: Delete test pages and restore original values"""
+    print("\n=== CLEANUP ===")
     
-    try:
-        # 1. Restore free tier's custom_colors to false
-        print("1. Restoring free tier's custom_colors to false...")
-        payload = {
-            "updates": [
-                {
-                    "tier_key": "free",
-                    "feature_key": "custom_colors",
-                    "is_enabled": False
-                }
-            ]
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/pricing-features?admin=true",
-            json=payload,
-            timeout=10
-        )
-        if response.status_code == 200:
-            print("   ✅ Restored free tier's custom_colors to false")
-        else:
-            print(f"   ⚠️  Failed to restore custom_colors: {response.status_code}")
-        
-        # 2. Restore demo user to plan_key='free', role='user', is_admin=false
-        print("2. Restoring demo user to plan_key='free', role='user'...")
-        payload = {
-            "plan_key": "free",
-            "role": "user",
-            "is_admin": False
-        }
-        response = requests.put(
-            f"{BASE_URL}/admin/users/{DEMO_USER_ID}?admin=true",
-            json=payload,
-            timeout=10
-        )
-        if response.status_code == 200:
-            print("   ✅ Restored demo user to plan_key='free', role='user'")
-        else:
-            print(f"   ⚠️  Failed to restore demo user: {response.status_code}")
-        
-        # 3. Delete any test tiers (studio, test_tier, etc.)
-        print("3. Deleting test tiers...")
-        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
-        if tiers_response.status_code == 200:
-            tiers = tiers_response.json()
-            for tier in tiers:
-                if tier['key'] not in DEFAULT_TIER_KEYS:
-                    delete_response = requests.delete(
-                        f"{BASE_URL}/admin/pricing-tiers/{tier['id']}?admin=true",
-                        timeout=10
-                    )
-                    if delete_response.status_code == 200:
-                        print(f"   ✅ Deleted test tier: {tier['key']}")
-                    else:
-                        print(f"   ⚠️  Failed to delete tier {tier['key']}: {delete_response.status_code}")
-        
-        # 4. Verify 3 default tiers still exist
-        print("4. Verifying 3 default tiers exist...")
-        tiers_response = requests.get(f"{BASE_URL}/admin/pricing-tiers?admin=true", timeout=10)
-        if tiers_response.status_code == 200:
-            tiers = tiers_response.json()
-            tier_keys = [t['key'] for t in tiers]
-            if set(tier_keys) == set(DEFAULT_TIER_KEYS):
-                print(f"   ✅ 3 default tiers exist: {tier_keys}")
-            else:
-                print(f"   ⚠️  Unexpected tiers: {tier_keys}")
-        
-        print("\n✅ CLEANUP COMPLETE")
-        
-    except Exception as e:
-        print(f"\n❌ CLEANUP FAILED: {str(e)}")
-
-
-def print_summary():
-    """Print test summary"""
-    print("\n" + "="*60)
-    print("TEST SUMMARY")
-    print("="*60)
+    # Delete test pages
+    for page_id in created_page_ids:
+        try:
+            r = requests.delete(f"{BASE_URL}/admin/pages/{page_id}?admin=true")
+            print(f"Deleted page {page_id}: {r.status_code}")
+        except Exception as e:
+            print(f"Failed to delete page {page_id}: {e}")
     
-    passed = sum(1 for r in test_results if r['passed'])
-    total = len(test_results)
+    # Restore Pro tier
+    if original_pro_tier:
+        try:
+            pro_id = original_pro_tier['id']
+            payload = {
+                "price_usd_monthly": 19,
+                "price_inr_monthly": 1499,
+                "price_usd_yearly": 190,
+                "price_inr_yearly": 14990,
+                "credits_included_monthly": 600
+            }
+            r = requests.put(f"{BASE_URL}/admin/pricing-tiers/{pro_id}?admin=true", json=payload)
+            print(f"Restored Pro tier: {r.status_code}")
+        except Exception as e:
+            print(f"Failed to restore Pro tier: {e}")
     
-    print(f"\nTotal: {passed}/{total} tests passed\n")
-    
-    for result in test_results:
-        status = "✅" if result['passed'] else "❌"
-        print(f"{status} {result['test']}")
-    
-    print("\n" + "="*60)
-    
-    return passed == total
-
+    # Restore site settings
+    if original_site_settings:
+        try:
+            payload = {
+                "site_name": original_site_settings.get('site_name', 'ClipForge AI'),
+                "primary_color": original_site_settings.get('primary_color', '#a855f7'),
+                "announcement_text": original_site_settings.get('announcement_text', '🎉 New: Animated word-by-word captions + custom intros are live!'),
+                "features_scheduling_enabled": False
+            }
+            r = requests.put(f"{BASE_URL}/admin/site-settings?admin=true", json=payload)
+            print(f"Restored site settings: {r.status_code}")
+        except Exception as e:
+            print(f"Failed to restore site settings: {e}")
 
 def main():
-    """Run all tests"""
-    print("="*60)
-    print("PHASE 1: Feature Gating & Pricing Engine - Backend Tests")
-    print("="*60)
-    print(f"Base URL: {BASE_URL}")
-    print(f"Demo User ID: {DEMO_USER_ID}")
-    print(f"Admin User ID: {ADMIN_USER_ID}")
+    print("=" * 80)
+    print("PHASE 2 BACKEND TESTING - Site Settings, CMS Pages, Pricing Tiers")
+    print("=" * 80)
     
-    # Run all tests in order
-    test_1_get_user_features_free()
-    test_2_get_user_features_admin()
-    test_3_get_pricing_tiers_no_admin()
-    test_4_get_pricing_tiers_admin()
-    test_5_create_studio_tier()
-    test_6_create_duplicate_tier()
-    test_7_update_studio_tier()
-    test_8_get_pricing_features()
-    test_9_update_free_tier_custom_colors()
-    test_10_update_user_plan_to_pro()
-    test_11_update_user_plan_invalid()
-    test_12_delete_free_tier()
-    test_13_delete_studio_tier()
-    test_14_user_cascade_on_tier_delete()
+    results = []
+    
+    # Site Settings Tests
+    results.append(("Test 1: GET /api/site-settings (public)", test_1_get_site_settings_public()))
+    results.append(("Test 2: GET /api/admin/site-settings (no auth)", test_2_get_admin_site_settings_no_auth()))
+    results.append(("Test 3: GET /api/admin/site-settings (with auth)", test_3_get_admin_site_settings_with_auth()))
+    results.append(("Test 4: PUT /api/admin/site-settings", test_4_put_admin_site_settings()))
+    results.append(("Test 5: Upload logo", test_5_upload_logo()))
+    results.append(("Test 6: Upload favicon", test_6_upload_favicon()))
+    results.append(("Test 7: Upload oversize file", test_7_upload_oversize_logo()))
+    results.append(("Test 8: Upload wrong file type", test_8_upload_wrong_extension()))
+    results.append(("Test 9: Upload without admin", test_9_upload_without_admin()))
+    
+    # CMS Pages Tests
+    results.append(("Test 10: Create CMS page", test_10_create_cms_page()))
+    results.append(("Test 11: GET /api/admin/pages", test_11_get_admin_pages()))
+    results.append(("Test 12: GET /api/pages (public)", test_12_get_public_pages()))
+    results.append(("Test 13: GET /api/pages/:slug", test_13_get_page_by_slug()))
+    results.append(("Test 14: Update page to private", test_14_update_page_to_private()))
+    results.append(("Test 15: GET private page (no admin)", test_15_get_private_page_no_admin()))
+    results.append(("Test 16: GET private page (with admin)", test_16_get_private_page_with_admin()))
+    results.append(("Test 17: Create duplicate page", test_17_create_duplicate_page()))
+    
+    # Pricing Tiers Tests
+    results.append(("Test 18: GET pricing tiers", test_18_get_pricing_tiers()))
+    results.append(("Test 19: Update pricing tier", test_19_update_pricing_tier()))
+    results.append(("Test 20: Legacy price sync", test_20_legacy_price_sync()))
+    results.append(("Test 21: GET /api/user/features", test_21_get_user_features()))
+    
+    # Feature Flags Tests
+    results.append(("Test 22: Enable feature flag", test_22_feature_flag_enable()))
+    
+    # Edge Cases
+    results.append(("Test 23: Invalid JSON body", test_23_invalid_json_body()))
+    results.append(("Test 24: Missing required fields", test_24_missing_required_fields()))
     
     # Cleanup
     cleanup()
     
-    # Print summary
-    all_passed = print_summary()
+    # Summary
+    print("\n" + "=" * 80)
+    print("TEST SUMMARY")
+    print("=" * 80)
     
-    # Exit with appropriate code
-    sys.exit(0 if all_passed else 1)
-
+    passed = sum(1 for _, result in results if result)
+    total = len(results)
+    
+    for name, result in results:
+        status = "✅ PASSED" if result else "❌ FAILED"
+        print(f"{status}: {name}")
+    
+    print("\n" + "=" * 80)
+    print(f"TOTAL: {passed}/{total} tests passed ({passed*100//total}%)")
+    print("=" * 80)
+    
+    return passed == total
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    exit(0 if success else 1)

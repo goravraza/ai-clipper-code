@@ -184,6 +184,10 @@ export default function HomePage() {
   const [t, setT] = useState(BASE_STRINGS)
   const [isTranslating, setIsTranslating] = useState(false)
   const [siteSettings, setSiteSettings] = useState(null)
+  const [tiers, setTiers] = useState([])
+  const [featureMatrix, setFeatureMatrix] = useState({})
+  const [featureCatalog, setFeatureCatalog] = useState([])
+  const [pricingCycle, setPricingCycle] = useState('month') // 'month' | 'year'
   const isAdmin = !!(profile && (profile.is_admin === true || profile.role === 'admin'))
   const schedulingEnabled = !!(siteSettings?.features_scheduling_enabled)
 
@@ -196,9 +200,15 @@ export default function HomePage() {
       fetch('/api/memes').then(r => r.json()),
       fetch('/api/projects').then(r => r.json()).catch(() => []),
       fetch('/api/site-settings').then(r => r.json()).catch(() => null),
-    ]).then(([g, me, pk, c, m, pj, ss]) => {
+      fetch('/api/user/features').then(r => r.json()).catch(() => null),
+    ]).then(([g, me, pk, c, m, pj, ss, uf]) => {
       setGeo(g); setProfile(me.user); setIsAuthed(!!me.is_authenticated); setPackages(pk); setClips(c); setMemes(m); setProjects(Array.isArray(pj) ? pj : [])
       if (ss) setSiteSettings(ss)
+      if (uf) {
+        setTiers(Array.isArray(uf.tiers) ? uf.tiers : [])
+        setFeatureMatrix(uf.matrix || {})
+        setFeatureCatalog(Array.isArray(uf.catalog) ? uf.catalog : [])
+      }
     }).catch(() => toast.error('Failed to load workspace'))
   }, [])
 
@@ -944,91 +954,163 @@ export default function HomePage() {
         <div className="container py-16 md:py-24">
           <div className="text-center max-w-2xl mx-auto mb-12">
             <Badge className="mb-4 bg-primary/10 text-primary border-primary/20">{t.pricing}</Badge>
-            <h2 className="text-3xl md:text-5xl font-bold tracking-tight mb-3">{t.pay_only}</h2>
-            <p className="text-muted-foreground">{geo?.country_code === 'IN' ? 'Showing INR prices — secure checkout via Razorpay.' : 'Showing USD prices — secure checkout via Lemon Squeezy.'}</p>
+            <h2 className="text-3xl md:text-5xl font-bold tracking-tight mb-3">Pick a plan that scales with you</h2>
+            <p className="text-muted-foreground">{geo?.country_code === 'IN' ? 'Prices in INR — secure checkout via Razorpay.' : 'Prices in USD — secure checkout via Lemon Squeezy.'}</p>
           </div>
-          <Card className="max-w-3xl mx-auto mb-12">
-            <CardContent className="pt-6 space-y-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm text-muted-foreground">{t.monthly_credits}</div>
-                  <div className="text-3xl font-bold">{sliderMinutes[0]} <span className="text-base font-normal text-muted-foreground">{t.minutes}</span></div>
-                </div>
-                <Tabs value={billingCycle} onValueChange={setBillingCycle}>
-                  <TabsList>
-                    <TabsTrigger value="month">{t.monthly}</TabsTrigger>
-                    <TabsTrigger value="year">{t.yearly} <Badge className="ml-1.5 h-4 px-1 text-[10px] bg-primary/15 text-primary border-transparent">-20%</Badge></TabsTrigger>
-                  </TabsList>
-                </Tabs>
-              </div>
-              <Slider min={300} max={3000} step={100} value={sliderMinutes} onValueChange={setSliderMinutes} />
-              <div className="flex justify-between text-xs text-muted-foreground"><span>300 min</span><span>1500 min</span><span>3000 min</span></div>
 
-              {/* Coupon input */}
-              <div className="flex gap-2 items-end pt-1">
-                <div className="flex-1 space-y-1">
-                  <Label className="text-xs">Have a coupon code?</Label>
-                  <Input value={couponCode} onChange={(e)=>setCouponCode(e.target.value.toUpperCase())} placeholder="LAUNCH25" className="font-mono uppercase h-9" />
-                </div>
-                <Button variant="outline" onClick={validateCoupon} disabled={validatingCoupon} className="h-9">
-                  {validatingCoupon ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Apply'}
-                </Button>
-                {couponData?.valid && (
-                  <Button variant="ghost" size="sm" onClick={() => { setCouponData(null); setCouponCode('') }} className="h-9 text-destructive">Remove</Button>
-                )}
-              </div>
+          {/* Monthly / Yearly billing toggle */}
+          <div className="flex justify-center mb-10">
+            <div className="inline-flex items-center rounded-full border border-border bg-background p-1">
+              <button
+                onClick={() => setPricingCycle('month')}
+                className={`px-5 py-1.5 rounded-full text-sm font-medium transition-colors ${pricingCycle === 'month' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              >Monthly</button>
+              <button
+                onClick={() => setPricingCycle('year')}
+                className={`px-5 py-1.5 rounded-full text-sm font-medium transition-colors inline-flex items-center gap-2 ${pricingCycle === 'year' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              >
+                Yearly
+                <Badge className="bg-emerald-500/15 text-emerald-500 border-transparent text-[10px] px-1.5">Save ~17%</Badge>
+              </button>
+            </div>
+          </div>
 
-              {dynamicPrice && selectedPack && (
-                <div className="flex items-center justify-between rounded-xl border border-border bg-background p-4">
-                  <div>
-                    <div className="text-sm text-muted-foreground">{t.closest_plan} <span className="font-medium text-foreground">{selectedPack.name}</span></div>
-                    <div className="flex items-baseline gap-2">
-                      <div className="text-2xl font-bold">{dynamicPrice.formatted}<span className="text-sm text-muted-foreground font-normal">/{billingCycle === 'year' ? 'year' : 'mo'}</span></div>
-                      {dynamicPrice.couponDiscount > 0 && <span className="text-sm text-muted-foreground line-through">{dynamicPrice.original}</span>}
-                    </div>
-                    <div className="flex flex-wrap gap-1 mt-1">
-                      {selectedPack.discount_percentage > 0 && <Badge className="bg-emerald-500/15 text-emerald-500 border-transparent">{t.save} {selectedPack.discount_percentage}%</Badge>}
-                      {dynamicPrice.couponDiscount > 0 && <Badge className="gradient-bg text-white border-transparent">+{dynamicPrice.couponDiscount}% coupon</Badge>}
-                    </div>
-                  </div>
-                  <Button size="lg" disabled={purchasing === selectedPack.id} className="gradient-bg text-white hover:opacity-90" onClick={() => handleBuy(selectedPack)}>
-                    {purchasing === selectedPack.id ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
-                    {t.buy} {selectedPack.name}
-                  </Button>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-          <div className="grid md:grid-cols-3 gap-6 max-w-5xl mx-auto">
-            {packages.map((pkg) => {
-              const isSelected = selectedPack?.id === pkg.id
+          {/* Tier subscription cards */}
+          <div className={`grid gap-6 max-w-5xl mx-auto ${tiers.length >= 3 ? 'md:grid-cols-3' : 'md:grid-cols-2'}`}>
+            {tiers.length === 0 ? (
+              <div className="col-span-full text-center text-muted-foreground py-12">Loading plans…</div>
+            ) : tiers.map((tier, idx) => {
               const isIndia = geo?.country_code === 'IN'
-              const price = isIndia ? pkg.price_inr : pkg.price_usd
               const symbol = isIndia ? '₹' : '$'
+              const priceM = isIndia ? (tier.price_inr_monthly ?? tier.price_inr ?? 0) : (tier.price_usd_monthly ?? tier.price_usd ?? 0)
+              const priceY = isIndia ? (tier.price_inr_yearly ?? Math.round(priceM * 10)) : (tier.price_usd_yearly ?? Math.round(priceM * 10))
+              const display = pricingCycle === 'year' ? priceY : priceM
+              const perMonthEquivalent = pricingCycle === 'year' && priceY > 0 ? Math.round((priceY / 12) * 100) / 100 : null
+              const yearlySavings = pricingCycle === 'year' && priceM > 0 ? Math.max(0, Math.round((1 - (priceY / (priceM * 12))) * 100)) : 0
+              const isFeatured = idx === 1 // middle tier is highlighted
+              const enabledFeatures = featureCatalog.filter(f => featureMatrix[tier.key]?.[f.key])
+              const disabledFeatures = featureCatalog.filter(f => !featureMatrix[tier.key]?.[f.key])
+              const isCurrent = profile?.plan_key === tier.key
               return (
-                <Card key={pkg.id} className={`relative transition-all ${isSelected ? 'border-primary glow scale-[1.02]' : ''} ${pkg.is_featured ? 'border-primary/40' : ''}`}>
-                  {pkg.is_featured && <Badge className="absolute -top-3 left-1/2 -translate-x-1/2 gradient-bg text-white border-transparent">{t.most_popular}</Badge>}
-                  {isSelected && !pkg.is_featured && <Badge className="absolute -top-3 left-1/2 -translate-x-1/2 bg-primary text-primary-foreground border-transparent">{t.slider_match}</Badge>}
+                <Card key={tier.id || tier.key} className={`relative transition-all ${isFeatured ? 'border-primary/60 shadow-lg shadow-primary/10 scale-[1.02]' : ''}`}>
+                  {isFeatured && <Badge className="absolute -top-3 left-1/2 -translate-x-1/2 gradient-bg text-white border-transparent whitespace-nowrap">Most popular</Badge>}
+                  {isCurrent && <Badge className="absolute -top-3 right-4 bg-emerald-500 text-white border-transparent">Your plan</Badge>}
                   <CardHeader>
-                    <CardTitle>{pkg.name}</CardTitle>
-                    <div className="mt-2"><span className="text-4xl font-bold">{formatPrice(price, symbol)}</span><span className="text-muted-foreground text-sm">/mo</span></div>
-                    {pkg.discount_percentage > 0 && <Badge className="mt-1 w-fit bg-emerald-500/15 text-emerald-500 border-transparent">{pkg.discount_percentage}% off</Badge>}
+                    <CardTitle className="text-xl">{tier.name}</CardTitle>
+                    {tier.tagline && <div className="text-xs text-muted-foreground mt-0.5">{tier.tagline}</div>}
+                    <div className="mt-4 flex items-baseline gap-1">
+                      <span className="text-4xl font-bold">{symbol}{display}</span>
+                      <span className="text-muted-foreground text-sm">/{pricingCycle === 'year' ? 'yr' : 'mo'}</span>
+                    </div>
+                    {perMonthEquivalent !== null && perMonthEquivalent > 0 && (
+                      <div className="text-xs text-muted-foreground mt-0.5">
+                        = {symbol}{perMonthEquivalent}/mo billed yearly
+                      </div>
+                    )}
+                    {yearlySavings > 0 && (
+                      <Badge className="mt-2 w-fit bg-emerald-500/15 text-emerald-500 border-transparent">Save {yearlySavings}% vs monthly</Badge>
+                    )}
                   </CardHeader>
-                  <CardContent className="space-y-3">
-                    <ul className="text-sm space-y-2">
-                      <li className="flex items-center gap-2"><Coins className="h-4 w-4 text-primary" /> {pkg.credit_amount_minutes} min processing</li>
-                      <li className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" /> AI virality scoring</li>
-                      <li className="flex items-center gap-2"><Languages className="h-4 w-4 text-primary" /> 40+ subtitle languages</li>
-                      <li className="flex items-center gap-2"><Calendar className="h-4 w-4 text-primary" /> Social scheduling</li>
+                  <CardContent className="space-y-4">
+                    <div className="rounded-lg bg-muted/50 px-3 py-2 text-sm flex items-center gap-2">
+                      <Coins className="h-4 w-4 text-primary shrink-0" />
+                      <span className="font-semibold">{tier.credits_included_monthly || 0}</span>
+                      <span className="text-muted-foreground text-xs">credit minutes / month</span>
+                    </div>
+                    <ul className="text-xs space-y-1.5">
+                      {enabledFeatures.map(f => (
+                        <li key={f.key} className="flex items-start gap-2">
+                          <Check className="h-3.5 w-3.5 text-emerald-500 shrink-0 mt-0.5" />
+                          <span>{f.label}</span>
+                        </li>
+                      ))}
+                      {disabledFeatures.map(f => (
+                        <li key={f.key} className="flex items-start gap-2 text-muted-foreground/60">
+                          <X className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                          <span>{f.label}</span>
+                        </li>
+                      ))}
                     </ul>
-                    <Button onClick={() => handleBuy(pkg)} disabled={purchasing === pkg.id} className={`w-full ${pkg.is_featured ? 'gradient-bg text-white' : ''}`} variant={pkg.is_featured ? 'default' : 'outline'}>
-                      {purchasing === pkg.id ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
-                      {isIndia ? 'Pay via Razorpay' : 'Pay via Lemon Squeezy'}
+                    <Button
+                      onClick={() => {
+                        if (isCurrent) return
+                        toast.message(`Checkout for ${tier.name} coming soon`, { description: 'Payment gateway integration is next up.' })
+                      }}
+                      disabled={isCurrent || display === 0}
+                      className={`w-full ${isFeatured ? 'gradient-bg text-white' : ''}`}
+                      variant={isFeatured ? 'default' : 'outline'}
+                    >
+                      {isCurrent ? 'Current plan' : display === 0 ? 'Start free' : `Upgrade to ${tier.name}`}
                     </Button>
                   </CardContent>
                 </Card>
               )
             })}
+          </div>
+
+          {/* À-la-carte credit packs — separate slider section */}
+          <div className="max-w-3xl mx-auto mt-16">
+            <div className="text-center mb-6">
+              <h3 className="text-2xl font-bold tracking-tight mb-1">Need more credits?</h3>
+              <p className="text-sm text-muted-foreground">Buy add-on minutes any time — no subscription change.</p>
+            </div>
+            <Card>
+              <CardContent className="pt-6 space-y-6">
+                {(() => {
+                  const isIndia = geo?.country_code === 'IN'
+                  const symbol = isIndia ? '₹' : '$'
+                  const pricePerMin = isIndia
+                    ? Number(siteSettings?.credit_price_per_minute_inr ?? 1.5)
+                    : Number(siteSettings?.credit_price_per_minute_usd ?? 0.02)
+                  const minutes = sliderMinutes[0]
+                  const total = Math.round(minutes * pricePerMin * 100) / 100
+                  const totalFmt = isIndia ? total.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : total.toFixed(2)
+                  return (
+                    <>
+                      <div className="flex items-center justify-between gap-4 flex-wrap">
+                        <div>
+                          <div className="text-sm text-muted-foreground">Add-on credits</div>
+                          <div className="text-3xl font-bold">
+                            {minutes} <span className="text-base font-normal text-muted-foreground">minutes</span>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <div className="text-sm text-muted-foreground">One-time price</div>
+                          <div className="text-3xl font-bold gradient-text">{symbol}{totalFmt}</div>
+                          <div className="text-[10px] text-muted-foreground">{symbol}{pricePerMin.toFixed(2)}/min</div>
+                        </div>
+                      </div>
+                      <Slider min={100} max={5000} step={50} value={sliderMinutes} onValueChange={setSliderMinutes} />
+                      <div className="flex justify-between text-xs text-muted-foreground">
+                        <span>100 min</span><span>2500 min</span><span>5000 min</span>
+                      </div>
+
+                      {/* Coupon input */}
+                      <div className="flex gap-2 items-end pt-1">
+                        <div className="flex-1 space-y-1">
+                          <Label className="text-xs">Have a coupon code?</Label>
+                          <Input value={couponCode} onChange={(e)=>setCouponCode(e.target.value.toUpperCase())} placeholder="LAUNCH25" className="font-mono uppercase h-9" />
+                        </div>
+                        <Button variant="outline" onClick={validateCoupon} disabled={validatingCoupon} className="h-9">
+                          {validatingCoupon ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Apply'}
+                        </Button>
+                        {couponData?.valid && (
+                          <Button variant="ghost" size="sm" onClick={() => { setCouponData(null); setCouponCode('') }} className="h-9 text-destructive">Remove</Button>
+                        )}
+                      </div>
+
+                      <Button
+                        size="lg"
+                        className="w-full gradient-bg text-white"
+                        onClick={() => toast.message('Credit purchase coming soon', { description: `${minutes} minutes for ${symbol}${totalFmt}` })}
+                      >
+                        <Coins className="h-4 w-4 mr-2" /> Buy {minutes} credits for {symbol}{totalFmt}
+                      </Button>
+                    </>
+                  )
+                })()}
+              </CardContent>
+            </Card>
           </div>
         </div>
       </section>

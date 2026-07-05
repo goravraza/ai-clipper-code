@@ -965,6 +965,8 @@ ${transcriptListing}`
             const relDur = Math.max(0.5, seg.end - seg.start)
             const subPath = path.join(tmpDir, `part_${String(i).padStart(2, '0')}.mp4`)
             // Extract sub-segment DIRECTLY from the full source video.
+            // Frame-accurate seek: -ss AFTER -i (slower but avoids keyframe-snap drift
+            // that was causing captions to lag behind audio in longer supercuts).
             // We store the cut in NATIVE aspect ratio (no letterbox padding). The
             // ClipCard preview uses object-cover to display as 9:16 in the grid,
             // and the /render endpoint handles proper 9:16 framing (blur/color fill)
@@ -972,24 +974,43 @@ ${transcriptListing}`
             // regular clip. This gives supercuts full parity with normal clips.
             await new Promise((resolve, reject) => {
               const ff = spawn('/usr/bin/ffmpeg', [
-                '-y', '-ss', String(relStart), '-t', String(relDur), '-i', sourcePath,
+                '-y', '-i', sourcePath, '-ss', String(relStart), '-t', String(relDur),
                 '-vf', 'setsar=1,fps=30',
+                '-af', 'aresample=async=1:first_pts=0',
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-                '-vsync', 'cfr', '-async', '1', '-movflags', '+faststart',
+                '-vsync', 'cfr', '-movflags', '+faststart',
                 subPath,
               ], { stdio: ['ignore', 'pipe', 'pipe'] })
               let stderr = ''
               ff.stderr.on('data', d => { stderr += d.toString() })
               ff.on('close', code => code === 0 ? resolve() : reject(new Error('sub-cut ffmpeg failed: ' + stderr.slice(-300))))
             })
+            // Probe the ACTUAL duration of the sub-cut. Frame-alignment, audio-sample
+            // rounding, and codec padding can each cause the real output to differ
+            // from `relDur` by a few tens of milliseconds. Left uncorrected these
+            // errors accumulate across N segments and push captions out of sync.
+            let actualDur = relDur
+            try {
+              const probe = await new Promise((resolve, reject) => {
+                const ff = spawn('/usr/bin/ffprobe', [
+                  '-v', 'error', '-show_entries', 'format=duration',
+                  '-of', 'default=noprint_wrappers=1:nokey=1', subPath,
+                ], { stdio: ['ignore', 'pipe', 'pipe'] })
+                let out = ''
+                ff.stdout.on('data', d => { out += d.toString() })
+                ff.on('close', code => code === 0 ? resolve(out.trim()) : reject(new Error('probe failed')))
+              })
+              const parsed = parseFloat(probe)
+              if (Number.isFinite(parsed) && parsed > 0.05) actualDur = parsed
+            } catch { /* fall back to requested duration */ }
             subPaths.push(subPath)
             captionOffsets.push({
-              concat_start: cursorSec, concat_end: cursorSec + relDur,
-              source_start: seg.start, source_end: seg.end,
+              concat_start: cursorSec, concat_end: cursorSec + actualDur,
+              source_start: seg.start, source_end: seg.start + actualDur,
               text: seg.text, beat_index: seg.beat_index,
             })
-            cursorSec += relDur
+            cursorSec += actualDur
           }
 
           if (subPaths.length < 2) throw new Error('Fewer than 2 usable segments found')
