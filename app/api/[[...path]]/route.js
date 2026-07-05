@@ -51,16 +51,58 @@ const FEATURE_KEYS = [
   { key: 'intro_outro',        label: 'Custom Intro & Outro',             description: 'Attach your own branded intro or outro clip to every render.',                 category: 'branding' },
 ]
 const FEATURE_KEY_SET = new Set(FEATURE_KEYS.map(f => f.key))
+// Unified pricing tiers: each tier is a subscription plan with monthly + yearly pricing
+// and bundled credit-minutes per month. Add-on credits are sold à-la-carte via the
+// credit slider (see site_settings.credit_price_per_minute_*).
 const DEFAULT_TIERS = [
-  { key: 'free',     name: 'Free',     order: 1, price_usd: 0,  price_inr: 0,    is_default: true,  is_active: true, tagline: 'Get started, no credit card needed.' },
-  { key: 'pro',      name: 'Pro',      order: 2, price_usd: 19, price_inr: 1499, is_default: false, is_active: true, tagline: 'For serious creators shipping every week.' },
-  { key: 'business', name: 'Business', order: 3, price_usd: 49, price_inr: 3999, is_default: false, is_active: true, tagline: 'Teams & agencies with brand kits.' },
+  { key: 'free',     name: 'Free',     order: 1, is_default: true,  is_active: true, tagline: 'Get started, no credit card needed.',
+    credits_included_monthly: 30,    price_usd_monthly: 0,  price_inr_monthly: 0,     price_usd_yearly: 0,   price_inr_yearly: 0 },
+  { key: 'pro',      name: 'Pro',      order: 2, is_default: false, is_active: true, tagline: 'For serious creators shipping every week.',
+    credits_included_monthly: 600,   price_usd_monthly: 19, price_inr_monthly: 1499,  price_usd_yearly: 190, price_inr_yearly: 14990 }, // 2 months free
+  { key: 'business', name: 'Business', order: 3, is_default: false, is_active: true, tagline: 'Teams & agencies with brand kits.',
+    credits_included_monthly: 2400,  price_usd_monthly: 49, price_inr_monthly: 3999,  price_usd_yearly: 490, price_inr_yearly: 39990 }, // 2 months free
 ]
 // Which features are ON for each default tier. Admin can flip these anytime.
 const DEFAULT_FEATURE_MATRIX = {
   free:     { respool: false, animated_captions: false, custom_logo: false, scroll_stopper: false, hd_export: false, custom_fonts: false, custom_colors: false, intro_outro: false },
   pro:      { respool: true,  animated_captions: true,  custom_logo: true,  scroll_stopper: false, hd_export: true,  custom_fonts: true,  custom_colors: true,  intro_outro: true  },
   business: { respool: true,  animated_captions: true,  custom_logo: true,  scroll_stopper: true,  hd_export: true,  custom_fonts: true,  custom_colors: true,  intro_outro: true  },
+}
+
+// Default site-wide settings. Persisted as a single document in `site_settings`
+// with a stable id ("global"). Editable from the Admin > Appearance tab.
+const DEFAULT_SITE_SETTINGS = {
+  id: 'global',
+  site_name: 'ClipForge AI',
+  site_tagline: 'Long videos → viral shorts',
+  logo_url: null,             // uploaded image path (/api/files/...) or absolute URL
+  favicon_url: null,
+  og_image_url: null,
+  meta_title: 'ClipForge AI — Turn Long Videos into Viral Shorts',
+  meta_description: 'AI-powered short-form video clipping platform. Convert YouTube, TikTok and Instagram videos into viral clips in minutes.',
+  // Brand colors — used to override --primary and --accent CSS vars.
+  primary_color: '#a855f7',   // purple-500
+  accent_color:  '#ec4899',   // pink-500
+  default_theme: 'dark',      // 'dark' | 'light' | 'system'
+  // Announcement bar (top of every page). Empty text hides it.
+  announcement_enabled: true,
+  announcement_text: '🎉 New: Animated word-by-word captions + custom intros are live!',
+  announcement_link: '/#pricing',
+  announcement_link_label: 'See plans',
+  announcement_dismissable: true,
+  announcement_bg: '#a855f7',
+  // Social links (footer)
+  social_twitter: '',
+  social_instagram: '',
+  social_youtube: '',
+  social_linkedin: '',
+  // Arbitrary code injection (GTM, Tidio chat, etc.). Trusted admin input; injected raw.
+  header_code: '',            // rendered inside <head>
+  footer_code: '',            // rendered right before </body>
+  // À-la-carte credit slider — price per credit-minute in each currency.
+  credit_price_per_minute_usd: 0.02,
+  credit_price_per_minute_inr: 1.5,
+  updated_at: null,
 }
 
 async function seedIfEmpty(db) {
@@ -126,6 +168,22 @@ async function seedIfEmpty(db) {
     await db.collection('pricing_tiers').insertMany(
       DEFAULT_TIERS.map(t => ({ id: uuidv4(), ...t, created_at: new Date(), updated_at: new Date() }))
     )
+  } else {
+    // Backfill new fields on tiers that pre-date the monthly/yearly + credits refactor
+    const existingTiers = await db.collection('pricing_tiers').find({}).toArray()
+    for (const t of existingTiers) {
+      const defaults = DEFAULT_TIERS.find(dt => dt.key === t.key)
+      const patch = {}
+      // Bring legacy price_usd/price_inr forward as price_*_monthly if not set
+      if (t.price_usd_monthly === undefined) patch.price_usd_monthly = t.price_usd_monthly ?? t.price_usd ?? defaults?.price_usd_monthly ?? 0
+      if (t.price_inr_monthly === undefined) patch.price_inr_monthly = t.price_inr_monthly ?? t.price_inr ?? defaults?.price_inr_monthly ?? 0
+      if (t.price_usd_yearly  === undefined) patch.price_usd_yearly  = defaults?.price_usd_yearly  ?? Math.round((patch.price_usd_monthly ?? t.price_usd ?? 0) * 10)
+      if (t.price_inr_yearly  === undefined) patch.price_inr_yearly  = defaults?.price_inr_yearly  ?? Math.round((patch.price_inr_monthly ?? t.price_inr ?? 0) * 10)
+      if (t.credits_included_monthly === undefined) patch.credits_included_monthly = defaults?.credits_included_monthly ?? 0
+      if (Object.keys(patch).length) {
+        await db.collection('pricing_tiers').updateOne({ id: t.id }, { $set: patch })
+      }
+    }
   }
   // Seed / heal the feature matrix — one row per (tier, feature). Idempotent.
   const existingRows = await db.collection('pricing_features').find({}).toArray()
@@ -150,6 +208,20 @@ async function seedIfEmpty(db) {
   await db.collection('profiles').updateMany({ plan_key: { $exists: false } }, { $set: { plan_key: 'free' } }).catch(()=>{})
   // Admin/seeded admin user gets business plan by default so they can test all features
   await db.collection('profiles').updateOne({ id: ADMIN_USER_ID }, { $set: { plan_key: 'business' } }).catch(()=>{})
+
+  // ============= SITE SETTINGS (global) =============
+  // Single-document collection. Seeded with defaults on first boot; admin-editable.
+  const existingSettings = await db.collection('site_settings').findOne({ id: 'global' })
+  if (!existingSettings) {
+    await db.collection('site_settings').insertOne({ ...DEFAULT_SITE_SETTINGS, created_at: new Date(), updated_at: new Date() })
+  } else {
+    // Backfill any newly-added default keys so old installs pick up new fields (e.g. header_code)
+    const patch = {}
+    for (const [k, v] of Object.entries(DEFAULT_SITE_SETTINGS)) {
+      if (k !== 'updated_at' && existingSettings[k] === undefined) patch[k] = v
+    }
+    if (Object.keys(patch).length) await db.collection('site_settings').updateOne({ id: 'global' }, { $set: patch })
+  }
 }
 
 function strip(doc) { if (!doc) return doc; const { _id, ...rest } = doc; return rest }
@@ -501,6 +573,65 @@ async function handle(request, { params }) {
         if (matrix[r.tier_key] && FEATURE_KEY_SET.has(r.feature_key)) matrix[r.tier_key][r.feature_key] = !!r.is_enabled
       }
       return NextResponse.json({ ...result, catalog: FEATURE_KEYS, tiers: tiers.map(strip), matrix })
+    }
+
+    // ============= SITE SETTINGS =============
+    // Public: read-only site-wide branding + injected code. Fetched by every page.
+    if (path_ === '/site-settings' && method === 'GET') {
+      const s = await db.collection('site_settings').findOne({ id: 'global' })
+      return NextResponse.json(strip(s) || { ...DEFAULT_SITE_SETTINGS })
+    }
+    // Admin: update settings + upload logo/favicon
+    if (path_ === '/admin/site-settings' && method === 'GET') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const s = await db.collection('site_settings').findOne({ id: 'global' })
+      return NextResponse.json(strip(s) || { ...DEFAULT_SITE_SETTINGS })
+    }
+    if (path_ === '/admin/site-settings' && method === 'PUT') {
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const body = await request.json()
+      const allowed = [
+        'site_name','site_tagline','logo_url','favicon_url','og_image_url',
+        'meta_title','meta_description',
+        'primary_color','accent_color','default_theme',
+        'announcement_enabled','announcement_text','announcement_link','announcement_link_label','announcement_dismissable','announcement_bg',
+        'social_twitter','social_instagram','social_youtube','social_linkedin',
+        'header_code','footer_code',
+        'credit_price_per_minute_usd','credit_price_per_minute_inr',
+      ]
+      const updates = { updated_at: new Date() }
+      for (const k of allowed) if (k in body) updates[k] = body[k]
+      await db.collection('site_settings').updateOne({ id: 'global' }, { $set: updates }, { upsert: true })
+      const s = await db.collection('site_settings').findOne({ id: 'global' })
+      await logActivity(db, user.id, 'site_settings_updated', request, { keys: Object.keys(updates) })
+      return NextResponse.json(strip(s))
+    }
+    if (path_ === '/admin/site-settings/upload' && method === 'POST') {
+      // Body: multipart/form-data with fields: file, kind ('logo'|'favicon'|'og')
+      const user = await getUser(request, db, { allowAdminImpersonation: true })
+      if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      const form = await request.formData()
+      const file = form.get('file')
+      const kind = String(form.get('kind') || 'logo')
+      if (!file || !(file instanceof Blob)) return NextResponse.json({ error: 'file required' }, { status: 400 })
+      const maxSize = kind === 'og' ? 500 * 1024 : 50 * 1024 // 50KB for logo/favicon, 500KB for OG image
+      if (file.size > maxSize) return NextResponse.json({ error: `File too large. Max: ${Math.round(maxSize/1024)}KB` }, { status: 400 })
+      const ext = ((file.name || '').split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '')
+      const allowedExt = new Set(['png','jpg','jpeg','webp','svg','ico','gif'])
+      if (!allowedExt.has(ext)) return NextResponse.json({ error: 'unsupported file type' }, { status: 400 })
+      const dir = path.join(UPLOAD_DIR, 'site')
+      await fs.mkdir(dir, { recursive: true })
+      const fname = `${kind}_${Date.now()}.${ext}`
+      const dest = path.join(dir, fname)
+      const buf = Buffer.from(await file.arrayBuffer())
+      await fs.writeFile(dest, buf)
+      const url = `/api/files/site/${fname}`
+      const field = kind === 'favicon' ? 'favicon_url' : (kind === 'og' ? 'og_image_url' : 'logo_url')
+      await db.collection('site_settings').updateOne({ id: 'global' }, { $set: { [field]: url, updated_at: new Date() } }, { upsert: true })
+      await logActivity(db, user.id, 'site_settings_upload', request, { kind, size: file.size })
+      return NextResponse.json({ ok: true, url, field })
     }
 
     // ============= PRICING PACKAGES =============
@@ -3095,12 +3226,18 @@ ${eventsBlock}
       const clash = await db.collection('pricing_tiers').findOne({ key: rawKey })
       if (clash) return NextResponse.json({ error: 'tier key already exists' }, { status: 409 })
       const maxOrder = await db.collection('pricing_tiers').find({}).sort({ order: -1 }).limit(1).toArray()
+      const priceUsdM = Number(body.price_usd_monthly ?? body.price_usd) || 0
+      const priceInrM = Number(body.price_inr_monthly ?? body.price_inr) || 0
       const doc = {
         id: uuidv4(), key: rawKey,
         name: String(body.name || rawKey),
         order: Number(body.order) || (maxOrder[0]?.order || 0) + 1,
-        price_usd: Number(body.price_usd) || 0,
-        price_inr: Number(body.price_inr) || 0,
+        // Monthly + yearly pricing per currency
+        price_usd_monthly: priceUsdM,
+        price_inr_monthly: priceInrM,
+        price_usd_yearly: Number(body.price_usd_yearly) || Math.round(priceUsdM * 10),
+        price_inr_yearly: Number(body.price_inr_yearly) || Math.round(priceInrM * 10),
+        credits_included_monthly: Number(body.credits_included_monthly) || 0,
         is_default: !!body.is_default, is_active: body.is_active !== false,
         tagline: String(body.tagline || ''),
         created_at: new Date(), updated_at: new Date(),
@@ -3120,9 +3257,13 @@ ${eventsBlock}
       if (!isAdminProfile(user)) return NextResponse.json({ error: 'forbidden' }, { status: 403 })
       const id = segments[2]
       const body = await request.json()
-      const allowed = ['name','order','price_usd','price_inr','is_default','is_active','tagline']
+      // Accept both legacy (price_usd, price_inr) and new (price_usd_monthly, ...) keys for backward compat
+      const allowed = ['name','order','price_usd','price_inr','price_usd_monthly','price_inr_monthly','price_usd_yearly','price_inr_yearly','credits_included_monthly','is_default','is_active','tagline']
       const updates = { updated_at: new Date() }
       for (const k of allowed) if (k in body) updates[k] = body[k]
+      // Mirror legacy → new so both fields stay in sync
+      if ('price_usd' in updates && !('price_usd_monthly' in updates)) updates.price_usd_monthly = updates.price_usd
+      if ('price_inr' in updates && !('price_inr_monthly' in updates)) updates.price_inr_monthly = updates.price_inr
       await db.collection('pricing_tiers').updateOne({ id }, { $set: updates })
       const p = await db.collection('pricing_tiers').findOne({ id })
       await logActivity(db, user.id, 'pricing_tier_updated', request, { id, updates })

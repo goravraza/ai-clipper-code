@@ -85,7 +85,7 @@ function TierCard({ tier, catalog, data, isCurrent, triggerFeature, onClose }) {
         {tier.tagline && <div className="text-xs text-muted-foreground mt-0.5">{tier.tagline}</div>}
       </div>
       <div className="flex items-baseline gap-1">
-        <span className="text-3xl font-bold">${tier.price_usd || 0}</span>
+        <span className="text-3xl font-bold">${tier.price_usd_monthly ?? tier.price_usd ?? 0}</span>
         <span className="text-xs text-muted-foreground">/mo</span>
       </div>
 
